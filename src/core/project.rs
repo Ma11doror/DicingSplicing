@@ -1,3 +1,4 @@
+use egui;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -19,6 +20,10 @@ pub struct ProjectData {
     pub duration: u32,
     pub source_path: Option<String>,
     pub filename_base: String,
+
+    pub crop_x: f32,
+    pub crop_y: f32,
+    pub crop_zoom: f32,
 }
 
 #[derive(Clone)]
@@ -26,6 +31,7 @@ pub struct Project {
     pub id: Uuid,
     pub data: Arc<Mutex<ProjectData>>,
     pub status: Arc<Mutex<ProjectStatus>>,
+    pub preview_frame: Arc<Mutex<Option<egui::ColorImage>>>,
 }
 
 impl Project {
@@ -38,8 +44,13 @@ impl Project {
                 duration: 30,
                 source_path: None,
                 filename_base: String::new(),
+                crop_x: 0.0,
+                crop_y: 0.0,
+                crop_zoom: 1.0,
             })),
             status: Arc::new(Mutex::new(ProjectStatus::Idle)),
+
+            preview_frame: Arc::new(Mutex::new(None)),
         }
     }
 
