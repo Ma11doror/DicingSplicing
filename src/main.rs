@@ -1,25 +1,23 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod app;
 mod core;
-mod gui;
-
-use eframe::egui;
+mod media;
+mod ui;
 
 fn main() -> eframe::Result<()> {
-    // Initialize Tokio runtime
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-    let _enter = rt.enter(); // Keep runtime active for the duration of the app
-
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([600.0, 450.0])
-            .with_min_inner_size([300.0, 200.0]),
+            .with_title("Simple Editor")
+            .with_inner_size([1280.0, 820.0])
+            .with_min_inner_size([900.0, 560.0])
+            .with_drag_and_drop(true),
         ..Default::default()
     };
 
     eframe::run_native(
-        "TG Circle Editor",
+        "Simple Editor",
         native_options,
-        Box::new(|cc| Ok(Box::new(gui::EditorApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(app::EditorApp::new(cc)))),
     )
 }
