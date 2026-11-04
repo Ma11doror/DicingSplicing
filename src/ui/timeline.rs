@@ -112,8 +112,13 @@ impl Layout {
 }
 
 impl Timeline {
-    pub fn new() -> Self {
-        Self { pps: None, drag: None, fling: 0.0, grab: 0.0, press_x: 0.0, snapped: None }
+    /// `scale` is the pixels per second to start with, if they are known from before.
+    pub fn new(scale: Option<f32>) -> Self {
+        Self { pps: scale, drag: None, fling: 0.0, grab: 0.0, press_x: 0.0, snapped: None }
+    }
+
+    pub fn scale(&self) -> Option<f32> {
+        self.pps
     }
 
     /// Draws the timeline and applies input to the playhead and the sequence.

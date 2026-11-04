@@ -1,5 +1,10 @@
 pub mod edit;
 pub mod export;
+pub mod files;
 pub mod history;
+pub mod plugins;
 pub mod preset;
+pub mod project;
+pub mod settings;
 pub mod tools;
+pub mod workspace;

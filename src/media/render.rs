@@ -374,7 +374,7 @@ impl Shared {
     fn kill(&self) {
         if let Ok(mut child) = self.child.lock() {
             if let Some(child) = child.as_mut() {
-                let _ = child.kill();
+                tools::kill_tree(child);
             }
         }
     }
@@ -1023,18 +1023,21 @@ mod tests {
             return;
         }
         let dir = temp_dir("cancel");
-        let source = make_source(&dir, 8);
+        // Long enough that finishing by itself could not pass for stopping.
+        let source = make_source(&dir, 60);
         let output = dir.join("cancelled.mp4");
-        let mut s = sequence(8.0);
+        let mut s = sequence(60.0);
         s.settings.speed = Speed::Veryslow;
         s.settings.size = OutputSize::LongSide(1920);
         s.output = Output { preset: PresetId::Landscape, ..Output::default() };
         let notify: Notify = Arc::new(|| {});
 
-        let job = RenderJob::start(video_task(&source, &info(8.0), &s, &output), notify);
+        let job = RenderJob::start(video_task(&source, &info(60.0), &s, &output), notify);
         thread::sleep(Duration::from_millis(300));
+        let cancelled_at = Instant::now();
         job.cancel();
         assert_eq!(wait_for_end(&job), RenderStatus::Cancelled);
+        assert!(cancelled_at.elapsed() < Duration::from_secs(5), "cancelling took {:?}", cancelled_at.elapsed());
         assert!(!output.exists());
         assert!(!part_path(&output).exists());
         let _ = fs::remove_dir_all(&dir);

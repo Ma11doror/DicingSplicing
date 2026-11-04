@@ -1,1 +1,4 @@
 /target
+
+# The bot token of the Telegram plugin. Never in the repository.
+credentials.json

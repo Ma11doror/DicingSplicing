@@ -144,6 +144,23 @@ pub fn get(id: PresetId) -> &'static Preset {
     PRESETS.iter().find(|p| p.id == id).unwrap_or(&PRESETS[0])
 }
 
+/// How a frame is shown. These are view settings: they do not change the result.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FrameOptions {
+    /// Shown for comparison while another frame is the main one.
+    pub shown: bool,
+    pub thirds: bool,
+    pub center: bool,
+    pub safe: bool,
+}
+
+impl FrameOptions {
+    pub fn for_preset(preset: &Preset) -> Self {
+        let round = preset.mask == Mask::Circle;
+        Self { shown: false, thirds: !round, center: round, safe: false }
+    }
+}
+
 /// What the edit is made for: the main frame.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Output {

@@ -62,10 +62,15 @@ impl Span {
     }
 }
 
+/// Which of a project's sources something comes from.
+pub type SourceId = u32;
+
 /// A piece of a source on a track.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Clip {
     pub name: String,
+    #[serde(default)]
+    pub source: SourceId,
     /// Where the clip starts on the timeline.
     pub start: f64,
     /// The part of the source that plays, in source seconds.
@@ -89,6 +94,7 @@ impl Clip {
     pub fn new(name: String, source_duration: f64) -> Self {
         Self {
             name,
+            source: 0,
             start: 0.0,
             source_in: 0.0,
             source_out: source_duration,
@@ -97,6 +103,17 @@ impl Clip {
             volume: full_volume(),
             muted: false,
         }
+    }
+
+    /// The source turned out to have another length: its file was replaced. The trim stays as far as
+    /// it can; if nothing of it is left, the clip takes the whole source.
+    pub fn refit_source(&mut self, duration: f64) {
+        self.source_duration = duration;
+        if self.source_in >= duration {
+            self.source_in = 0.0;
+            self.source_out = duration;
+        }
+        self.source_out = self.source_out.min(duration);
     }
 
     /// What the clip's sound is multiplied by.
@@ -340,6 +357,22 @@ mod tests {
         assert_eq!(track.clips[0].end(), 10.0);
         track.trim_start(1, 0.0, 0.5);
         assert_eq!(track.clips[1].start, 10.0);
+    }
+
+    #[test]
+    fn a_replaced_source_keeps_what_it_can_of_the_trim() {
+        let mut longer = placed_clip();
+        longer.refit_source(60.0);
+        assert_eq!((longer.source_in, longer.source_out, longer.source_duration), (2.0, 12.0, 60.0));
+
+        let mut shorter = placed_clip();
+        shorter.refit_source(5.0);
+        assert_eq!((shorter.source_in, shorter.source_out), (2.0, 5.0));
+
+        // The whole trim is past the end of the new file.
+        let mut gone = placed_clip();
+        gone.refit_source(1.0);
+        assert_eq!((gone.source_in, gone.source_out), (0.0, 1.0));
     }
 
     #[test]

@@ -2,5 +2,8 @@ pub mod editor;
 pub mod export;
 pub mod flash;
 pub mod framing;
+pub mod plugins;
+pub mod settings;
+pub mod start;
 pub mod timeline;
 pub mod viewer;

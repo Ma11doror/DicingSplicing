@@ -1,30 +1,13 @@
 //! The frames menu and the ratio controls: which output frame is the main one, which others are
 //! shown on the source, and whether the main frame's proportions can change.
 
-use crate::core::preset::{Output, Preset, PresetId, Ratio, PRESETS};
+use crate::core::preset::{FrameOptions, Output, Preset, PresetId, Ratio, PRESETS};
 use crate::media::geometry::Mask;
 use crate::ui::flash;
 use crate::ui::viewer::{self, FrameOverlay};
 use egui::{vec2, Color32, RichText, Sense};
 
 const LOCK_SIZE: f32 = 15.0;
-
-/// How a frame is shown. These are view settings: they do not change the result.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct FrameOptions {
-    /// Shown for comparison while another frame is the main one.
-    shown: bool,
-    thirds: bool,
-    center: bool,
-    safe: bool,
-}
-
-impl FrameOptions {
-    fn for_preset(preset: &Preset) -> Self {
-        let round = preset.mask == Mask::Circle;
-        Self { shown: false, thirds: !round, center: round, safe: false }
-    }
-}
 
 pub struct Framing {
     /// In the order of `PRESETS`.
@@ -60,6 +43,26 @@ fn lock_button(ui: &mut egui::Ui, free: bool, enabled: bool) -> egui::Response {
 }
 
 impl Framing {
+    /// Comes back to how a project left things. Frames it doesn't mention keep their defaults.
+    pub fn restored(frames: &[(PresetId, FrameOptions)], ratio_locked: bool) -> Self {
+        let mut framing = Self { ratio_locked, ..Self::default() };
+        for (preset, options) in PRESETS.iter().zip(&mut framing.options) {
+            if let Some((_, saved)) = frames.iter().find(|(id, _)| *id == preset.id) {
+                *options = *saved;
+            }
+        }
+        framing
+    }
+
+    /// What a project keeps of this.
+    pub fn saved_frames(&self) -> Vec<(PresetId, FrameOptions)> {
+        PRESETS.iter().zip(&self.options).map(|(preset, options)| (preset.id, *options)).collect()
+    }
+
+    pub fn ratio_locked(&self) -> bool {
+        self.ratio_locked
+    }
+
     /// Dragging a side of the main frame changes its proportions.
     pub fn ratio_is_free(&self, output: Output) -> bool {
         output.preset == PresetId::Custom && !self.ratio_locked
@@ -260,6 +263,22 @@ mod tests {
         framing.options[1].shown = true;
         framing.options[2].shown = true;
         assert_eq!(labels(&framing), ["9:16", "1:1 circle", "16:9"]);
+    }
+
+    #[test]
+    fn a_project_gets_its_frames_back() {
+        let mut framing = Framing { ratio_locked: true, ..Framing::default() };
+        framing.options[1].shown = true;
+        framing.options[1].safe = true;
+        framing.options[2].thirds = false;
+
+        let restored = Framing::restored(&framing.saved_frames(), framing.ratio_locked());
+        assert_eq!(restored.options, framing.options);
+        assert!(restored.ratio_locked);
+
+        // A frame the project has not heard of starts as usual.
+        let partial = Framing::restored(&framing.saved_frames()[..1], false);
+        assert_eq!(partial.options[1], FrameOptions::for_preset(&PRESETS[1]));
     }
 
     #[test]

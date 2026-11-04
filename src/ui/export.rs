@@ -1,24 +1,35 @@
-//! The export window: presets on top, the detailed settings under them, then the render itself.
+//! The export tab: presets on top, the detailed settings under them. At the bottom, always in
+//! sight, the render itself and what can be done with its result.
 
 use crate::core::edit::Sequence;
 use crate::core::export::{
     AudioCodec, Container, ExportPreset, FrameRate, H264Profile, OutputSize, Rate, Setting, Speed, VideoCodec, EXPORT_PRESETS, PRESET_GROUPS,
 };
+use crate::core::plugins::{Plugin, PluginKind};
 use crate::core::preset::Preset;
+use crate::core::settings::Settings;
 use crate::core::tools;
+use crate::core::workspace::folder_name;
 use crate::media::geometry::Mask;
 use crate::media::probe::MediaInfo;
 use crate::media::render::{self, RenderJob, RenderStatus, RenderTask};
 use crate::media::Notify;
 use crate::ui::flash;
-use egui::{Color32, RichText};
-use std::collections::VecDeque;
+use crate::ui::plugins::{Offer, PublishEnv, PublishSection};
+use egui::{Color32, NumExt, RichText};
+use std::collections::{BTreeMap, VecDeque};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const WARNING: Color32 = Color32::from_rgb(230, 170, 70);
 const ERROR: Color32 = Color32::from_rgb(230, 80, 70);
-const COMBO_WIDTH: f32 = 170.0;
+const COMBO_WIDTH: f32 = 140.0;
+const LABEL_COLUMN: f32 = 76.0;
+const COLUMN_GAP: f32 = 12.0;
+const CANCEL_WIDTH: f32 = 70.0;
+/// The settings keep this much however large what is under them gets.
+const MIN_SETTINGS_HEIGHT: f32 = 120.0;
 const START_CRF: u8 = 23;
 const START_KBPS: u32 = 4000;
 
@@ -35,25 +46,52 @@ struct Run {
     for_telegram: bool,
     pending: VecDeque<Target>,
     total: usize,
+    /// What a video is made from. A frame has none: nothing else depends on it.
+    made_from: Option<Sequence>,
+    /// The videos of this run written so far.
+    saved: Vec<Saved>,
 }
 
+#[derive(Clone)]
 struct Saved {
     path: PathBuf,
     bytes: u64,
     for_telegram: bool,
 }
 
-/// How the last run went.
+/// The video that is ready, and what it shows.
+struct Exported {
+    files: Vec<Saved>,
+    sequence: Sequence,
+    /// Tells this export from the ones before: the same file can be written again.
+    version: u64,
+}
+
+/// How the last run went, apart from the files it wrote.
 #[derive(Default)]
 struct Outcome {
-    saved: Vec<Saved>,
     error: Option<String>,
     cancelled: bool,
 }
 
+/// What the tab needs from the editor.
+pub struct ExportEnv<'a> {
+    pub source: &'a Path,
+    pub info: &'a MediaInfo,
+    pub shown: &'a [&'static Preset],
+    /// The playhead, for saving a frame.
+    pub position: f64,
+    pub plugins: &'a [Plugin],
+    /// Nothing can be sent without a workspace, where plugins keep their notes.
+    pub publish: Option<PublishEnv<'a>>,
+}
+
 #[derive(Default)]
-pub struct ExportWindow {
-    open: bool,
+pub struct ExportPanel {
+    project_name: String,
+    /// The project's folder for results.
+    renders: PathBuf,
+    /// The file to export to, if the user chose one. Otherwise it goes to `renders`.
     path: Option<PathBuf>,
     /// Also render the frames shown for comparison.
     with_shown: bool,
@@ -64,13 +102,23 @@ pub struct ExportWindow {
     highlighted: Vec<Setting>,
     highlighted_at: Option<f64>,
     encoders: Option<Vec<String>>,
+    exported: Option<Exported>,
+    /// How many videos have been written so far.
+    exports: u64,
+    /// The picture saved last.
+    frame: Option<Saved>,
+    /// The menus of the plugins that send files, by plugin.
+    sections: BTreeMap<String, PublishSection>,
+    /// How tall the block under the settings was last time.
+    actions_height: f32,
 }
 
 /// One line of the settings, flashing if `started` says so.
-fn row(ui: &mut egui::Ui, started: Option<f64>, label: &str, contents: impl FnOnce(&mut egui::Ui)) {
+fn row(ui: &mut egui::Ui, width: f32, started: Option<f64>, label: &str, contents: impl FnOnce(&mut egui::Ui)) {
     ui.label(label);
     flash::frame(ui, started, false).show(ui, |ui| {
-        ui.horizontal(contents);
+        ui.set_max_width(width);
+        ui.horizontal_wrapped(contents);
     });
     ui.end_row();
 }
@@ -100,11 +148,6 @@ fn file_label(name: &str) -> String {
     name.replace(", ", " ")
 }
 
-fn suggested_path(source: &Path, sequence: &Sequence) -> PathBuf {
-    let stem = source.file_stem().unwrap_or_default().to_string_lossy();
-    let frame = file_label(sequence.output.preset().name);
-    source.with_file_name(format!("{stem} - {frame}.{}", sequence.settings.container.extension()))
-}
 
 /// Where another frame goes next to `main`. If `main` is named after its frame, this replaces that.
 fn variant_path(main: &Path, main_frame: &str, frame: &str) -> PathBuf {
@@ -124,13 +167,63 @@ fn notifier(ctx: &egui::Context) -> Notify {
     Arc::new(move || ctx.request_repaint())
 }
 
-impl ExportWindow {
-    pub fn open(&mut self) {
-        self.open = true;
+/// What a plugin can send right now, or why nothing.
+fn offer(plugin: &Plugin, running: bool, exported: Option<&Exported>, current: &Sequence) -> Offer {
+    if running {
+        return Offer::Nothing("Exporting…".to_owned());
+    }
+    let Some(exported) = exported else {
+        return Offer::Nothing("Export the video first".to_owned());
+    };
+    if exported.sequence != *current {
+        return Offer::Nothing("Export again".to_owned());
+    }
+    let files: Vec<PathBuf> = exported.files.iter().map(|saved| saved.path.clone()).filter(|path| plugin.can_publish(path)).collect();
+    if files.is_empty() {
+        return Offer::Nothing(format!("Only for {}", plugin.extensions.join(", ")));
+    }
+    Offer::Files { files, version: exported.version }
+}
+
+/// A written file, and how to get to it.
+fn saved_line(ui: &mut egui::Ui, saved: &Saved, problem: &mut Option<anyhow::Error>) {
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("Show in folder").clicked() {
+                *problem = tools::reveal_file(&saved.path).err();
+            }
+            if ui.button("Open").clicked() {
+                *problem = tools::open_file(&saved.path).err();
+            }
+            ui.label(RichText::new(format!("{:.1} MB", megabytes(saved.bytes))).weak());
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                let name = saved.path.file_name().unwrap_or_default().to_string_lossy();
+                ui.add(egui::Label::new(format!("Saved {name}")).truncate()).on_hover_text(saved.path.display().to_string());
+            });
+        });
+    });
+}
+
+impl ExportPanel {
+    pub fn for_project(name: &str, renders: PathBuf, path: Option<PathBuf>, with_shown: bool) -> Self {
+        Self { project_name: name.to_owned(), renders, path, with_shown, ..Self::default() }
     }
 
-    pub fn is_busy(&self) -> bool {
-        self.run.is_some()
+    /// What a project keeps of this: the file, if the user chose one.
+    pub fn saved_path(&self) -> Option<PathBuf> {
+        self.path.clone()
+    }
+
+    pub fn with_shown(&self) -> bool {
+        self.with_shown
+    }
+
+    /// Where the main frame goes: the chosen file, or one named after the project and the frame.
+    fn main_path(&self, sequence: &Sequence) -> PathBuf {
+        self.path.clone().unwrap_or_else(|| {
+            let frame = file_label(sequence.output.preset().name);
+            self.renders.join(format!("{} - {frame}.{}", folder_name(&self.project_name), sequence.settings.container.extension()))
+        })
     }
 
     /// How far the whole run has come, from 0 to 1.
@@ -140,15 +233,14 @@ impl ExportWindow {
             RenderStatus::Running(progress) => progress,
             _ => 1.0,
         };
-        let finished = run.total - run.pending.len() - 1;
-        Some((finished as f32 + current) / run.total as f32)
+        Some((run.saved.len() as f32 + current) / run.total as f32)
     }
 
-    /// What the button that opens the window should say.
-    pub fn button_text(&self) -> String {
+    /// What the tab is called.
+    pub fn tab_text(&self) -> String {
         match self.progress() {
-            Some(progress) => format!("Exporting {:.0}%", progress * 100.0),
-            None => "Export…".to_owned(),
+            Some(progress) => format!("Export {:.0}%", progress * 100.0),
+            None => "Export".to_owned(),
         }
     }
 
@@ -161,82 +253,121 @@ impl ExportWindow {
         self.highlighted_at.filter(|_| self.highlighted.contains(&line))
     }
 
-    fn start(&mut self, ctx: &egui::Context, targets: Vec<Target>) {
+    fn start(&mut self, ctx: &egui::Context, targets: Vec<Target>, made_from: Option<Sequence>) {
         let mut pending = VecDeque::from(targets);
         let Some(first) = pending.pop_front() else { return };
         self.message = None;
         self.outcome = Outcome::default();
+        self.frame = None;
         let total = pending.len() + 1;
-        self.run = Some(Run { job: RenderJob::start(first.task, notifier(ctx)), for_telegram: first.for_telegram, pending, total });
+        self.run = Some(Run { job: RenderJob::start(first.task, notifier(ctx)), for_telegram: first.for_telegram, pending, total, made_from, saved: Vec::new() });
+    }
+
+    /// From now on the video is these files: the ones it had before may have just been replaced.
+    fn video_saved(&mut self, files: Vec<Saved>, sequence: &Sequence) {
+        self.exports += 1;
+        self.exported = Some(Exported { files, sequence: sequence.clone(), version: self.exports });
     }
 
     /// Moves on to the next file, or ends the run, once a job has ended.
-    fn poll(&mut self, ctx: &egui::Context) {
-        let Some(run) = &mut self.run else { return };
+    fn poll_run(&mut self, ctx: &egui::Context) {
+        let Some(mut run) = self.run.take() else { return };
         match run.job.status() {
-            RenderStatus::Running(_) => return,
+            RenderStatus::Running(_) => self.run = Some(run),
             RenderStatus::Done { path, bytes } => {
-                self.outcome.saved.push(Saved { path, bytes, for_telegram: run.for_telegram });
+                let saved = Saved { path, bytes, for_telegram: run.for_telegram };
+                match &run.made_from {
+                    Some(sequence) => {
+                        run.saved.push(saved);
+                        self.video_saved(run.saved.clone(), sequence);
+                    }
+                    None => self.frame = Some(saved),
+                }
                 if let Some(next) = run.pending.pop_front() {
                     run.job = RenderJob::start(next.task, notifier(ctx));
                     run.for_telegram = next.for_telegram;
-                    return;
+                    self.run = Some(run);
                 }
             }
             RenderStatus::Failed(error) => self.outcome.error = Some(error),
             RenderStatus::Cancelled => self.outcome.cancelled = true,
         }
-        self.run = None;
     }
 
-    /// Saves the output's picture at `time` as an image; the window shows how that goes.
-    pub fn save_frame(&mut self, ctx: &egui::Context, sequence: &Sequence, source: &Path, info: &MediaInfo, time: f64) {
-        let stem = source.file_stem().unwrap_or_default().to_string_lossy();
+    /// Called whatever the panel shows: what is running goes on while the other tab is open.
+    pub fn poll(&mut self, ctx: &egui::Context, settings: &Settings) {
+        self.poll_run(ctx);
+        for section in self.sections.values_mut() {
+            section.poll(ctx, settings);
+        }
+    }
+
+    /// Saves the output's picture at `time` as an image.
+    fn save_frame(&mut self, ctx: &egui::Context, sequence: &Sequence, source: &Path, info: &MediaInfo, time: f64) {
         let mut dialog = rfd::FileDialog::new()
             .set_title("Save the frame")
             .add_filter("PNG", &["png"])
-            .set_file_name(format!("{stem} - frame {time:.2}s.png"));
-        if let Some(folder) = self.path.as_deref().and_then(Path::parent).or(source.parent()) {
+            .set_file_name(format!("{} - frame {time:.2}s.png", folder_name(&self.project_name)));
+        let _ = fs::create_dir_all(&self.renders);
+        if let Some(folder) = self.path.as_deref().and_then(Path::parent).or(Some(&self.renders)) {
             dialog = dialog.set_directory(folder);
         }
         if let Some(path) = dialog.save_file() {
-            self.open = true;
-            self.start(ctx, vec![Target { task: render::frame_task(source, info, sequence, time, &path), for_telegram: false }]);
+            self.start(ctx, vec![Target { task: render::frame_task(source, info, sequence, time, &path), for_telegram: false }], None);
         }
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, sequence: &mut Sequence, source: &Path, info: &MediaInfo, shown: &[&'static Preset]) {
-        self.poll(ctx);
-        if !self.open {
-            return;
-        }
+    pub fn show(&mut self, ui: &mut egui::Ui, sequence: &mut Sequence, env: &ExportEnv) {
         let encoders = self.encoders.get_or_insert_with(tools::encoders).clone();
         let running = self.run.is_some();
-        let mut open = self.open;
-        egui::Window::new("Export").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+
+        // The settings take what the block under them leaves.
+        let total = ui.available_height();
+        let most_for_actions = (total - MIN_SETTINGS_HEIGHT).at_least(MIN_SETTINGS_HEIGHT);
+        let settings_height = (total - self.actions_height.at_most(most_for_actions)).at_least(MIN_SETTINGS_HEIGHT);
+        let settings = egui::ScrollArea::vertical().id_salt("export_settings").auto_shrink([false, false]).max_height(settings_height).show(ui, |ui| {
             ui.add_enabled_ui(!running, |ui| {
                 self.presets(ui, sequence, &encoders);
                 ui.separator();
                 self.settings(ui, sequence, &encoders);
-                ui.separator();
-                self.destination(ui, sequence, source, shown);
             });
-            for warning in render::warnings(sequence, info) {
-                ui.colored_label(WARNING, warning);
-            }
-            ui.add_space(4.0);
-            self.action(ui, sequence, source, info, shown);
         });
-        self.open = open;
+        ui.separator();
+        let actions = egui::ScrollArea::vertical().id_salt("export_actions").auto_shrink([false, true]).max_height(most_for_actions).show(ui, |ui| self.actions(ui, sequence, env));
+        // What it needs, not what it got: it can't get more than the settings leave.
+        let height = actions.inner_rect.top() - settings.inner_rect.bottom() + actions.content_size.y;
+        if (height - self.actions_height).abs() > 0.5 {
+            self.actions_height = height;
+            ui.ctx().request_repaint();
+        }
+    }
+
+    fn actions(&mut self, ui: &mut egui::Ui, sequence: &Sequence, env: &ExportEnv) {
+        let running = self.run.is_some();
+        ui.add_enabled_ui(!running, |ui| self.destination(ui, sequence, env.shown));
+        for warning in render::warnings(sequence, env.info) {
+            ui.colored_label(WARNING, warning);
+        }
+        ui.add_space(4.0);
+        self.controls(ui, sequence, env);
+        if !running {
+            self.results(ui, sequence);
+        }
+        self.publishing(ui, sequence, env);
     }
 
     fn presets(&mut self, ui: &mut egui::Ui, sequence: &mut Sequence, encoders: &[String]) {
         let now = ui.input(|i| i.time);
-        egui::Grid::new("export_presets").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-            for group in PRESET_GROUPS {
-                ui.label(RichText::new(group).weak());
+        // Not a grid: the chips of a group can take several lines, and a grid row wouldn't grow with them.
+        for group in PRESET_GROUPS {
+            ui.horizontal_top(|ui| {
+                let label = egui::vec2(LABEL_COLUMN, ui.spacing().interact_size.y);
+                ui.allocate_ui_with_layout(label, egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.set_min_width(LABEL_COLUMN);
+                    ui.label(RichText::new(group).weak());
+                });
+                ui.add_space(COLUMN_GAP - ui.spacing().item_spacing.x);
                 ui.horizontal_wrapped(|ui| {
-                    ui.set_max_width(440.0);
                     for preset in EXPORT_PRESETS.iter().filter(|p| p.group == group) {
                         let applied = preset.is_applied(sequence.output, &sequence.settings);
                         let lines: Vec<&str> = preset.settings().into_iter().map(Setting::label).collect();
@@ -249,9 +380,8 @@ impl ExportWindow {
                         }
                     }
                 });
-                ui.end_row();
-            }
-        });
+            });
+        }
     }
 
     fn settings(&mut self, ui: &mut egui::Ui, sequence: &mut Sequence, encoders: &[String]) {
@@ -261,27 +391,29 @@ impl ExportWindow {
         let has_video_encoder = |codec: VideoCodec| has(encoders, codec.encoder());
         let has_audio_encoder = |codec: AudioCodec| codec.encoder().is_none_or(|encoder| has(encoders, encoder));
 
-        egui::Grid::new("export_settings").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
-            row(ui, self.started(Setting::Frame), Setting::Frame.label(), |ui| {
+        // The frame around a line takes a little.
+        let width = (ui.available_width() - LABEL_COLUMN - COLUMN_GAP - 8.0).at_least(COMBO_WIDTH);
+        egui::Grid::new("export_settings").num_columns(2).spacing([COLUMN_GAP, 4.0]).min_col_width(LABEL_COLUMN).show(ui, |ui| {
+            row(ui, width, self.started(Setting::Frame), Setting::Frame.label(), |ui| {
                 let text = format!("{} · {}", output.preset().name, output.ratio().label());
                 ui.label(text).on_hover_text("Choose it in the Frames menu above the picture");
             });
-            row(ui, self.started(Setting::Format), Setting::Format.label(), |ui| {
+            row(ui, width, self.started(Setting::Format), Setting::Format.label(), |ui| {
                 combo(ui, "container", &mut settings.container, &Container::ALL, Container::label, |_| true);
             });
-            row(ui, self.started(Setting::VideoCodec), Setting::VideoCodec.label(), |ui| {
+            row(ui, width, self.started(Setting::VideoCodec), Setting::VideoCodec.label(), |ui| {
                 combo(ui, "video_codec", &mut settings.video_codec, &VideoCodec::ALL, VideoCodec::label, |c| container.allows_video(c) && has_video_encoder(c));
             });
-            row(ui, self.started(Setting::Profile), Setting::Profile.label(), |ui| {
+            row(ui, width, self.started(Setting::Profile), Setting::Profile.label(), |ui| {
                 ui.add_enabled_ui(settings.video_codec == VideoCodec::H264, |ui| {
                     combo(ui, "profile", &mut settings.profile, &H264Profile::ALL, H264Profile::label, |_| true);
                 });
             });
-            row(ui, self.started(Setting::Speed), Setting::Speed.label(), |ui| {
+            row(ui, width, self.started(Setting::Speed), Setting::Speed.label(), |ui| {
                 combo(ui, "speed", &mut settings.speed, &Speed::ALL, Speed::label, |_| true);
             });
-            row(ui, self.started(Setting::Quality), Setting::Quality.label(), |ui| quality(ui, &mut settings.rate));
-            row(ui, self.started(Setting::Size), Setting::Size.label(), |ui| {
+            row(ui, width, self.started(Setting::Quality), Setting::Quality.label(), |ui| quality(ui, &mut settings.rate));
+            row(ui, width, self.started(Setting::Size), Setting::Size.label(), |ui| {
                 let [px, py] = settings.pixels(output);
                 let mut from_frame = settings.size == OutputSize::FromFrame;
                 combo(ui, "size", &mut from_frame, &[true, false], |frame| if frame { "From the frame" } else { "Long side" }, |_| true);
@@ -296,7 +428,7 @@ impl ExportWindow {
                 let [px, py] = settings.pixels(output);
                 ui.label(RichText::new(format!("{px}×{py}")).weak());
             });
-            row(ui, self.started(Setting::FrameRate), Setting::FrameRate.label(), |ui| {
+            row(ui, width, self.started(Setting::FrameRate), Setting::FrameRate.label(), |ui| {
                 let mut source = settings.frame_rate == FrameRate::Source;
                 combo(ui, "frame_rate", &mut source, &[true, false], |source| if source { "As source" } else { "Fixed" }, |_| true);
                 settings.frame_rate = match (source, settings.frame_rate) {
@@ -308,14 +440,14 @@ impl ExportWindow {
                     ui.add(egui::DragValue::new(fps).speed(0.1).range(1.0..=240.0).max_decimals(3).suffix(" fps"));
                 }
             });
-            row(ui, self.started(Setting::AudioCodec), Setting::AudioCodec.label(), |ui| {
+            row(ui, width, self.started(Setting::AudioCodec), Setting::AudioCodec.label(), |ui| {
                 combo(ui, "audio_codec", &mut settings.audio_codec, &AudioCodec::ALL, AudioCodec::label, |c| container.allows_audio(c) && has_audio_encoder(c));
             });
             let with_sound = settings.audio_codec != AudioCodec::None;
-            row(ui, self.started(Setting::AudioBitrate), Setting::AudioBitrate.label(), |ui| {
+            row(ui, width, self.started(Setting::AudioBitrate), Setting::AudioBitrate.label(), |ui| {
                 ui.add_enabled(with_sound, egui::DragValue::new(&mut settings.audio_kbps).speed(1.0).range(32..=512).suffix(" kbit/s"));
             });
-            row(ui, self.started(Setting::Fades), Setting::Fades.label(), |ui| {
+            row(ui, width, self.started(Setting::Fades), Setting::Fades.label(), |ui| {
                 ui.add_enabled_ui(with_sound, |ui| {
                     let seconds = |value| egui::DragValue::new(value).speed(0.05).range(0.0..=30.0).max_decimals(2).suffix(" s");
                     ui.label("in");
@@ -337,16 +469,16 @@ impl ExportWindow {
 
     /// Where the files go, the main one first.
     fn paths(&self, sequence: &Sequence, shown: &[&'static Preset]) -> Vec<PathBuf> {
-        let Some(main) = &self.path else { return Vec::new() };
+        let main = self.main_path(sequence);
         let mut paths = vec![main.clone()];
         if self.with_shown {
             let main_frame = sequence.output.preset().name;
-            paths.extend(shown.iter().map(|preset| variant_path(main, main_frame, preset.name)));
+            paths.extend(shown.iter().map(|preset| variant_path(&main, main_frame, preset.name)));
         }
         paths
     }
 
-    fn destination(&mut self, ui: &mut egui::Ui, sequence: &Sequence, source: &Path, shown: &[&'static Preset]) {
+    fn destination(&mut self, ui: &mut egui::Ui, sequence: &Sequence, shown: &[&'static Preset]) {
         // The file follows the format.
         let extension = sequence.settings.container.extension();
         if let Some(path) = &mut self.path {
@@ -356,24 +488,24 @@ impl ExportWindow {
         }
         ui.horizontal(|ui| {
             if ui.button("File…").clicked() {
-                self.choose_file(sequence, source);
+                self.choose_file(sequence);
             }
-            match &self.path {
-                Some(path) => {
-                    let name = path.file_name().unwrap_or_default().to_string_lossy();
-                    ui.label(name).on_hover_text(path.display().to_string());
-                }
-                None => {
-                    ui.label(RichText::new("Not chosen yet").weak());
+            if self.path.is_some() {
+                let default = ui.button("Project folder").on_hover_text("Back to the file in the project's own folder");
+                if default.clicked() {
+                    self.path = None;
                 }
             }
+            let path = self.main_path(sequence);
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            ui.add(egui::Label::new(name).truncate()).on_hover_text(path.display().to_string());
         });
         if !shown.is_empty() {
             let ratios: Vec<String> = shown.iter().map(|preset| sequence.output.ratio_of(preset).label()).collect();
             let hint = "Each one in its own file, with the same center and angle, the way it is drawn inside the main frame";
             ui.checkbox(&mut self.with_shown, format!("Also export the frames shown for comparison: {}", ratios.join(", "))).on_hover_text(hint);
         }
-        let saved_just_now = |path: &PathBuf| self.outcome.saved.iter().any(|saved| &saved.path == path);
+        let saved_just_now = |path: &PathBuf| self.exported.iter().flat_map(|exported| &exported.files).any(|saved| &saved.path == path);
         let replaced = self.paths(sequence, shown).iter().filter(|path| path.exists() && !saved_just_now(path)).count();
         if replaced > 0 {
             let text = if replaced == 1 { "A file exists and will be replaced.".to_owned() } else { format!("{replaced} files exist and will be replaced.") };
@@ -381,11 +513,12 @@ impl ExportWindow {
         }
     }
 
-    fn choose_file(&mut self, sequence: &Sequence, source: &Path) {
-        let suggested = self.path.clone().unwrap_or_else(|| suggested_path(source, sequence));
+    fn choose_file(&mut self, sequence: &Sequence) {
+        let suggested = self.main_path(sequence);
         let container = sequence.settings.container;
         let mut dialog = rfd::FileDialog::new().set_title("Export to").add_filter(container.label(), &[container.extension()]);
         if let Some(folder) = suggested.parent() {
+            let _ = fs::create_dir_all(folder);
             dialog = dialog.set_directory(folder);
         }
         if let Some(name) = suggested.file_name() {
@@ -402,6 +535,10 @@ impl ExportWindow {
             self.message = Some("The source video can't be replaced with its own export.".to_owned());
             return;
         }
+        if let Some(Err(error)) = paths.first().and_then(|path| path.parent()).map(fs::create_dir_all) {
+            self.message = Some(format!("Can't create the folder for the file: {error}"));
+            return;
+        }
         let circle = |sequence: &Sequence| sequence.output.outline().mask == Mask::Circle;
         let sequences = std::iter::once(sequence.clone()).chain(shown.iter().map(|preset| render::variant(sequence, info, preset)));
         let targets = paths
@@ -409,13 +546,15 @@ impl ExportWindow {
             .zip(sequences)
             .map(|(path, sequence)| Target { task: render::video_task(source, info, &sequence, path), for_telegram: circle(&sequence) })
             .collect();
-        self.start(ctx, targets);
+        self.start(ctx, targets, Some(sequence.clone()));
     }
 
-    fn action(&mut self, ui: &mut egui::Ui, sequence: &Sequence, source: &Path, info: &MediaInfo, shown: &[&'static Preset]) {
+    /// The button that writes the file, or how far that has come.
+    fn controls(&mut self, ui: &mut egui::Ui, sequence: &Sequence, env: &ExportEnv) {
         if let Some(progress) = self.progress() {
             ui.horizontal(|ui| {
-                ui.add(egui::ProgressBar::new(progress).desired_width(300.0).show_percentage());
+                let width = ui.available_width() - CANCEL_WIDTH;
+                ui.add(egui::ProgressBar::new(progress).desired_width(width).show_percentage());
                 if ui.button("Cancel").clicked() {
                     if let Some(run) = &mut self.run {
                         run.pending.clear();
@@ -425,22 +564,36 @@ impl ExportWindow {
             });
             return;
         }
-
-        let mut problem = None;
-        for saved in &self.outcome.saved {
-            let name = saved.path.file_name().unwrap_or_default().to_string_lossy();
-            ui.horizontal(|ui| {
-                ui.label(format!("Saved {name}, {:.1} MB", megabytes(saved.bytes)));
-                if ui.button("Open").clicked() {
-                    problem = tools::open_file(&saved.path).err();
-                }
-                if ui.button("Show in folder").clicked() {
-                    problem = tools::reveal_file(&saved.path).err();
-                }
-            });
-            if saved.for_telegram && saved.bytes > render::TELEGRAM_MAX_BYTES {
-                ui.colored_label(WARNING, format!("Telegram's limit for a bot is {:.0} MB.", megabytes(render::TELEGRAM_MAX_BYTES)));
+        ui.horizontal(|ui| {
+            let sending = self.sections.values().any(PublishSection::is_sending);
+            let export = ui.add_enabled(!sending, egui::Button::new(RichText::new("Export").strong()));
+            if export.on_disabled_hover_text("A video is going out, and this would replace it").clicked() {
+                self.start_export(ui.ctx(), sequence, env.source, env.info, env.shown);
             }
+            let hint = "Save the picture at the playhead as a PNG, in the output's size";
+            let frame = ui.add_enabled(sequence.clip_at(env.position).is_some(), egui::Button::new("Save frame…"));
+            if frame.on_hover_text(hint).clicked() {
+                self.save_frame(ui.ctx(), sequence, env.source, env.info, env.position);
+            }
+        });
+    }
+
+    /// What the last runs left.
+    fn results(&mut self, ui: &mut egui::Ui, sequence: &Sequence) {
+        let mut problem = None;
+        if let Some(exported) = &self.exported {
+            for saved in &exported.files {
+                saved_line(ui, saved, &mut problem);
+                if saved.for_telegram && saved.bytes > render::TELEGRAM_MAX_BYTES {
+                    ui.colored_label(WARNING, format!("Telegram's limit for a bot is {:.0} MB.", megabytes(render::TELEGRAM_MAX_BYTES)));
+                }
+            }
+            if exported.sequence != *sequence {
+                ui.colored_label(WARNING, "Changed since this export.");
+            }
+        }
+        if let Some(saved) = &self.frame {
+            saved_line(ui, saved, &mut problem);
         }
         if let Some(problem) = problem {
             self.message = Some(format!("{problem:#}"));
@@ -454,12 +607,15 @@ impl ExportWindow {
         if let Some(message) = &self.message {
             ui.colored_label(ERROR, message);
         }
+    }
 
-        if ui.button(RichText::new("Export").strong()).clicked() {
-            if self.path.is_none() {
-                self.choose_file(sequence, source);
-            }
-            self.start_export(ui.ctx(), sequence, source, info, shown);
+    /// One menu for each plugin that sends files somewhere.
+    fn publishing(&mut self, ui: &mut egui::Ui, sequence: &Sequence, env: &ExportEnv) {
+        let Some(publish) = &env.publish else { return };
+        for plugin in env.plugins.iter().filter(|plugin| plugin.kind == PluginKind::Publish) {
+            let offer = offer(plugin, self.run.is_some(), self.exported.as_ref(), sequence);
+            let section = self.sections.entry(plugin.id.clone()).or_insert_with(|| PublishSection::new(plugin.clone()));
+            section.show(ui, &offer, publish);
         }
     }
 }
@@ -489,15 +645,120 @@ mod tests {
     use crate::core::edit::Clip;
     use crate::core::preset::{get, PresetId};
 
+    fn window() -> ExportPanel {
+        ExportPanel::for_project("my clip: 1", PathBuf::from("p/renders"), None, false)
+    }
+
+    fn plugin(extensions: &[&str]) -> Plugin {
+        Plugin {
+            id: "p".to_owned(),
+            program: PathBuf::from("p"),
+            kind: PluginKind::Publish,
+            name: "P".to_owned(),
+            prompt: String::new(),
+            hint: String::new(),
+            options: Vec::new(),
+            extensions: extensions.iter().map(|&extension| extension.to_owned()).collect(),
+        }
+    }
+
+    fn saved(path: &str) -> Saved {
+        Saved { path: PathBuf::from(path), bytes: 1, for_telegram: false }
+    }
+
+    fn nothing(reason: &str) -> Offer {
+        Offer::Nothing(reason.to_owned())
+    }
+
     #[test]
-    fn the_suggested_file_goes_next_to_the_source() {
+    fn nothing_can_be_sent_until_the_video_is_ready() {
+        let sequence = Sequence::new(Clip::new("a".into(), 1.0));
+        let mut panel = window();
+        assert_eq!(offer(&plugin(&["mp4"]), false, panel.exported.as_ref(), &sequence), nothing("Export the video first"));
+
+        panel.video_saved(vec![saved("a.mp4")], &sequence);
+        let ready = offer(&plugin(&["mp4"]), false, panel.exported.as_ref(), &sequence);
+        assert_eq!(ready, Offer::Files { files: vec![PathBuf::from("a.mp4")], version: 1 });
+
+        // While the file is being replaced it can't go anywhere.
+        assert_eq!(offer(&plugin(&["mp4"]), true, panel.exported.as_ref(), &sequence), nothing("Exporting…"));
+    }
+
+    #[test]
+    fn a_change_after_the_export_stops_it_until_it_is_undone() {
+        let sequence = Sequence::new(Clip::new("a".into(), 1.0));
+        let mut panel = window();
+        panel.video_saved(vec![saved("a.mp4")], &sequence);
+
+        let mut changed = sequence.clone();
+        changed.settings.container = Container::WebM;
+        assert_eq!(offer(&plugin(&["mp4"]), false, panel.exported.as_ref(), &changed), nothing("Export again"));
+
+        changed.settings.container = sequence.settings.container;
+        assert!(matches!(offer(&plugin(&["mp4"]), false, panel.exported.as_ref(), &changed), Offer::Files { .. }));
+    }
+
+    #[test]
+    fn a_plugin_gets_only_the_files_it_takes_the_main_one_first() {
+        let sequence = Sequence::new(Clip::new("a".into(), 1.0));
+        let mut panel = window();
+        panel.video_saved(vec![saved("a.webm"), saved("b.mp4"), saved("c.MP4")], &sequence);
+        let files = vec![PathBuf::from("b.mp4"), PathBuf::from("c.MP4")];
+        assert_eq!(offer(&plugin(&["mp4"]), false, panel.exported.as_ref(), &sequence), Offer::Files { files, version: 1 });
+
+        panel.video_saved(vec![saved("a.webm")], &sequence);
+        assert_eq!(offer(&plugin(&["mp4", "mov"]), false, panel.exported.as_ref(), &sequence), nothing("Only for mp4, mov"));
+        assert!(matches!(offer(&plugin(&[]), false, panel.exported.as_ref(), &sequence), Offer::Files { .. }));
+    }
+
+    #[test]
+    fn writing_the_same_file_again_is_another_export() {
+        let sequence = Sequence::new(Clip::new("a".into(), 1.0));
+        let mut panel = window();
+        panel.video_saved(vec![saved("a.mp4")], &sequence);
+        panel.video_saved(vec![saved("a.mp4")], &sequence);
+        assert_eq!(panel.exported.as_ref().map(|exported| exported.version), Some(2));
+    }
+
+    #[test]
+    fn a_run_that_writes_nothing_leaves_the_video_ready() {
+        let sequence = Sequence::new(Clip::new("a".into(), 1.0));
+        let info = MediaInfo { duration: 1.0, width: 16, height: 16, fps: crate::media::probe::Rational { num: 25, den: 1 }, has_audio: false };
+        let output = std::env::temp_dir().join(format!("simple_editor_export_{}.png", std::process::id()));
+        let task = render::frame_task(Path::new("there is no such video.mp4"), &info, &sequence, 0.0, &output);
+        let ctx = egui::Context::default();
+        let mut panel = window();
+        panel.video_saved(vec![saved("a.mp4")], &sequence);
+
+        // Saving a frame is not an export, and this one fails.
+        panel.start(&ctx, vec![Target { task, for_telegram: false }], None);
+        let started = std::time::Instant::now();
+        while panel.run.is_some() {
+            assert!(started.elapsed().as_secs() < 30, "the job does not end");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            panel.poll(&ctx, &Settings::default());
+        }
+        assert!(panel.outcome.error.is_some());
+        assert!(panel.frame.is_none());
+        assert_eq!(panel.exported.as_ref().map(|exported| exported.files.len()), Some(1));
+        assert!(matches!(offer(&plugin(&["mp4"]), false, panel.exported.as_ref(), &sequence), Offer::Files { .. }));
+    }
+
+    #[test]
+    fn the_file_goes_to_the_project_folder_unless_told_otherwise() {
         let mut sequence = Sequence::new(Clip::new("a".into(), 1.0));
-        let path = suggested_path(Path::new("C:/videos/my clip.mkv"), &sequence);
-        assert_eq!(path, Path::new("C:/videos/my clip - Telegram circle.mp4"));
+        let mut window = window();
+        assert_eq!(window.main_path(&sequence), Path::new("p/renders/my clip 1 - Telegram circle.mp4"));
+        assert_eq!(window.saved_path(), None);
+
+        // It follows the frame and the format.
         sequence.settings.container = Container::WebM;
         sequence.output.preset = PresetId::Vertical;
-        let path = suggested_path(Path::new("clip.mp4"), &sequence);
-        assert_eq!(path, Path::new("clip - Reels Shorts TikTok.webm"));
+        assert_eq!(window.main_path(&sequence), Path::new("p/renders/my clip 1 - Reels Shorts TikTok.webm"));
+
+        window.path = Some(PathBuf::from("d/final.mp4"));
+        assert_eq!(window.main_path(&sequence), Path::new("d/final.mp4"));
+        assert_eq!(window.saved_path(), Some(PathBuf::from("d/final.mp4")));
     }
 
     #[test]
@@ -512,9 +773,7 @@ mod tests {
     fn shown_frames_are_exported_only_when_asked() {
         let sequence = Sequence::new(Clip::new("a".into(), 1.0));
         let shown = [get(PresetId::Square), get(PresetId::Landscape)];
-        let mut window = ExportWindow::default();
-        assert!(window.paths(&sequence, &shown).is_empty());
-
+        let mut window = window();
         window.path = Some(PathBuf::from("final.mp4"));
         assert_eq!(window.paths(&sequence, &shown), [PathBuf::from("final.mp4")]);
 

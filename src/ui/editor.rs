@@ -2,22 +2,37 @@
 
 use crate::core::edit::{Bounds, Clip, ClipId, Sequence, Span};
 use crate::core::history::History;
+use crate::core::plugins::Plugin;
+use crate::core::project::{self, Project, Source, ViewState, RENDERS_FOLDER};
+use crate::core::settings::Settings;
+use crate::core::workspace::Workspace;
 use crate::media::audio::{PlayRange, Segment};
 use crate::media::cache::MediaCache;
 use crate::media::frames::FrameDecoder;
 use crate::media::geometry::{self, Transform};
 use crate::media::player::Player;
 use crate::media::{timecode, Notify};
-use crate::ui::export::ExportWindow;
+use crate::ui::export::{ExportEnv, ExportPanel};
 use crate::ui::framing::Framing;
+use crate::ui::plugins::PublishEnv;
 use crate::ui::timeline::Timeline;
 use crate::ui::viewer::{OutputView, SourceView};
 use egui::{Color32, Key, Modifiers, RichText, TextureOptions};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// The output preview's largest height: a tall frame should not push the controls out of the panel.
 const OUTPUT_MAX_HEIGHT: f64 = 340.0;
+const SIDE_PANEL_WIDTH: f32 = 380.0;
+/// The export settings need this much to show without cutting anything.
+const SIDE_PANEL_MIN_WIDTH: f32 = 340.0;
+const TAB_TEXT_SIZE: f32 = 17.0;
+/// How long after a change the project is saved, so that a series of changes is written once.
+const AUTOSAVE_SECONDS: f64 = 0.5;
+/// How much a source's length may differ from what the project remembers: rounding, not a new file.
+const SAME_DURATION: f64 = 1e-3;
 
 #[derive(Clone, Copy, PartialEq)]
 enum PlayMode {
@@ -27,9 +42,25 @@ enum PlayMode {
     Export,
 }
 
+/// What the side panel shows: setting up the result, then writing it.
+#[derive(Clone, Copy, Default, PartialEq)]
+enum SideTab {
+    #[default]
+    Output,
+    Export,
+}
+
 pub struct Editor {
     // Dropped first: stops a cache build that is still running.
     pub cache: MediaCache,
+    pub name: String,
+    dir: PathBuf,
+    sources: Vec<Source>,
+    /// The project as it is on the disk.
+    saved: Project,
+    /// Since when there are changes that are not on the disk.
+    changed_since: Option<f64>,
+    pub save_error: Option<String>,
     decoder: FrameDecoder,
     player: Player,
     texture: Option<egui::TextureHandle>,
@@ -46,45 +77,125 @@ pub struct Editor {
     selected: ClipId,
     history: History<Sequence>,
     framing: Framing,
-    export: ExportWindow,
+    side_tab: SideTab,
+    export: ExportPanel,
     timeline: Timeline,
     source_view: SourceView,
     output_view: OutputView,
 }
 
 impl Editor {
-    pub fn new(cache: MediaCache, ctx: &egui::Context) -> Self {
+    /// Opens the project in the folder `dir`, with the cache of its video.
+    pub fn new(cache: MediaCache, project: Project, dir: PathBuf, ctx: &egui::Context) -> Self {
         let notify: Notify = {
             let ctx = ctx.clone();
             Arc::new(move || ctx.request_repaint())
         };
         let decoder = FrameDecoder::new(cache.frames_path(), cache.frames.clone(), notify);
         let player = Player::new(cache.audio.clone());
-        let name = cache.source.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned());
-        let sequence = Sequence::new(Clip::new(name, cache.info.duration));
+
+        let saved = project.clone();
+        let Project { name, sources, mut sequence, view, .. } = project;
+        for track in &mut sequence.tracks {
+            for clip in &mut track.clips {
+                if (clip.source_duration - cache.info.duration).abs() > SAME_DURATION {
+                    clip.refit_source(cache.info.duration);
+                }
+            }
+        }
+        let export = ExportPanel::for_project(&name, dir.join(RENDERS_FOLDER), view.export_path, view.export_shown_frames);
         Self {
             cache,
+            name,
+            dir,
+            sources,
+            saved,
+            changed_since: None,
+            save_error: None,
             decoder,
             player,
             texture: None,
             requested_frame: None,
-            position: 0.0,
+            position: view.playhead.clamp(0.0, sequence.end()),
             peek: None,
             playing: false,
             play_mode: PlayMode::Timeline,
-            loop_export: false,
+            loop_export: view.loop_export,
             history: History::new(sequence.clone()),
             sequence,
             selected: ClipId { track: 0, index: 0 },
-            framing: Framing::default(),
-            export: ExportWindow::default(),
-            timeline: Timeline::new(),
+            framing: Framing::restored(&view.frames, view.ratio_locked),
+            side_tab: SideTab::default(),
+            export,
+            timeline: Timeline::new(view.timeline_scale),
             source_view: SourceView::default(),
             output_view: OutputView,
         }
     }
 
-    pub fn ui(&mut self, ctx: &egui::Context) {
+    /// The project as it is now.
+    fn snapshot(&self) -> Project {
+        Project {
+            version: project::VERSION,
+            name: self.name.clone(),
+            sources: self.sources.clone(),
+            sequence: self.sequence.clone(),
+            view: ViewState {
+                playhead: self.position,
+                timeline_scale: self.timeline.scale(),
+                frames: self.framing.saved_frames(),
+                ratio_locked: self.framing.ratio_locked(),
+                export_path: self.export.saved_path(),
+                export_shown_frames: self.export.with_shown(),
+                loop_export: self.loop_export,
+            },
+        }
+    }
+
+    fn save(&mut self, project: Project) {
+        match project.save(&self.dir) {
+            Ok(()) => {
+                self.saved = project;
+                self.changed_since = None;
+                self.save_error = None;
+            }
+            Err(error) => self.save_error = Some(format!("The project can't be saved: {error:#}")),
+        }
+    }
+
+    /// Saves a while after a change, once no gesture is going on.
+    fn autosave(&mut self, ctx: &egui::Context, now: f64, busy: bool) {
+        let mut current = self.snapshot();
+        if self.playing {
+            // Not every frame just because the playhead moves.
+            current.view.playhead = self.saved.view.playhead;
+        }
+        if current == self.saved {
+            self.changed_since = None;
+            return;
+        }
+        let since = *self.changed_since.get_or_insert(now);
+        if busy || now - since < AUTOSAVE_SECONDS {
+            ctx.request_repaint_after(Duration::from_secs_f64(AUTOSAVE_SECONDS / 2.0));
+            return;
+        }
+        self.save(current);
+        if self.save_error.is_some() {
+            // Try again in a while: the disk may be back by then.
+            self.changed_since = Some(now);
+            ctx.request_repaint_after(Duration::from_secs_f64(AUTOSAVE_SECONDS));
+        }
+    }
+
+    /// Saves what is not saved yet, before the project closes.
+    pub fn flush(&mut self) {
+        let current = self.snapshot();
+        if current != self.saved {
+            self.save(current);
+        }
+    }
+
+    pub fn ui(&mut self, ctx: &egui::Context, plugins: &[Plugin], workspace: Option<&Workspace>, settings: &Settings) {
         if self.playing {
             let (t, still_playing) = self.player.poll();
             self.position = t.clamp(0.0, self.sequence.end());
@@ -98,17 +209,17 @@ impl Editor {
         }
 
         self.handle_keys(ctx);
+        self.export.poll(ctx, settings);
         self.timeline_panel(ctx);
-        self.output_panel(ctx);
+        self.side_panel(ctx, plugins, workspace, settings);
         self.source_panel(ctx);
-        let shown = self.framing.shown_presets(self.sequence.output);
-        self.export.show(ctx, &mut self.sequence, &self.cache.source, &self.cache.info, &shown);
 
         let busy = ctx.input(|i| i.pointer.any_down()) || ctx.wants_keyboard_input();
         let now = ctx.input(|i| i.time);
         if self.history.track(&self.sequence, now, busy) {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
+        self.autosave(ctx, now, busy);
 
         if self.playing {
             self.player.set_range(self.play_range(self.play_mode));
@@ -422,139 +533,148 @@ impl Editor {
         });
     }
 
-    fn output_panel(&mut self, ctx: &egui::Context) {
+    fn side_panel(&mut self, ctx: &egui::Context, plugins: &[Plugin], workspace: Option<&Workspace>, settings: &Settings) {
+        let shown = self.framing.shown_presets(self.sequence.output);
+        egui::SidePanel::right("output").resizable(true).default_width(SIDE_PANEL_WIDTH).min_width(SIDE_PANEL_MIN_WIDTH).show(ctx, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.side_tab, SideTab::Output, RichText::new("Output").size(TAB_TEXT_SIZE));
+                ui.selectable_value(&mut self.side_tab, SideTab::Export, RichText::new(self.export.tab_text()).size(TAB_TEXT_SIZE));
+            });
+            ui.separator();
+            match self.side_tab {
+                SideTab::Output => {
+                    egui::ScrollArea::vertical().show(ui, |ui| self.output_tab(ui));
+                }
+                SideTab::Export => {
+                    let no_meta = BTreeMap::new();
+                    let meta = self.sources.first().map_or(&no_meta, |source| &source.meta);
+                    let publish = workspace.map(|workspace| PublishEnv { workspace, settings, name: &self.name, meta });
+                    let env = ExportEnv { source: &self.cache.source, info: &self.cache.info, shown: &shown, position: self.position, plugins, publish };
+                    self.export.show(ui, &mut self.sequence, &env);
+                }
+            }
+        });
+
+        // Whatever the tab: a preset on the other one can change the frame the picture has to fill.
+        let (size, outline) = (self.frame_size(), self.sequence.output.outline());
+        let t = &mut self.sequence.clip_mut(self.selected).transform;
+        t.angle_deg = geometry::normalize_angle(t.angle_deg);
+        *t = t.clamped(size[0], size[1], outline);
+    }
+
+    fn output_tab(&mut self, ui: &mut egui::Ui) {
         let output = self.sequence.output;
         let settings = self.sequence.settings;
         let outline = output.outline();
         let size = self.frame_size();
         // Between clips there is nothing in the output.
         let texture = self.texture.as_ref().filter(|_| self.sequence.clip_at(self.shown_time()).is_some());
-        egui::SidePanel::right("output").resizable(true).default_width(380.0).min_width(280.0).show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.add_space(6.0);
-                let can_save_frame = self.sequence.clip_at(self.position).is_some() && !self.export.is_busy();
-                ui.horizontal(|ui| {
-                    ui.heading("Output");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(self.export.button_text()).clicked() {
-                            self.export.open();
-                        }
-                        let hint = "Save the picture at the playhead as a PNG, in the output's size";
-                        let save_frame = ui.add_enabled(can_save_frame, egui::Button::new("Save frame…"));
-                        if save_frame.on_hover_text(hint).clicked() {
-                            self.export.save_frame(ctx, &self.sequence, &self.cache.source, &self.cache.info, self.position);
-                        }
-                    });
-                });
-                let t = &mut self.sequence.clip_mut(self.selected).transform;
-                let [box_w, box_h] = outline.fit(ui.available_width() as f64, OUTPUT_MAX_HEIGHT);
-                let box_size = egui::vec2(box_w as f32, box_h as f32);
-                ui.vertical_centered(|ui| {
-                    self.output_view.show(ui, texture, size, outline, t, box_size);
-                    let [px_w, px_h] = settings.pixels(output);
-                    let caption = format!("{} · {} · {px_w}×{px_h}", output.preset().name, output.ratio().label());
-                    ui.label(RichText::new(caption).weak());
-                });
-                ui.separator();
+        let t = &mut self.sequence.clip_mut(self.selected).transform;
+        let [box_w, box_h] = outline.fit(ui.available_width() as f64, OUTPUT_MAX_HEIGHT);
+        let box_size = egui::vec2(box_w as f32, box_h as f32);
+        ui.vertical_centered(|ui| {
+            self.output_view.show(ui, texture, size, outline, t, box_size);
+            let [px_w, px_h] = settings.pixels(output);
+            let caption = format!("{} · {} · {px_w}×{px_h}", output.preset().name, output.ratio().label());
+            ui.label(RichText::new(caption).weak());
+        });
+        ui.separator();
 
-                ui.heading("Transform");
-                let (mut x, mut y) = (t.cx * 100.0, t.cy * 100.0);
-                egui::Grid::new("transform").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                    ui.label("X");
-                    if ui.add(egui::DragValue::new(&mut x).speed(0.1).fixed_decimals(1).suffix(" %")).changed() {
-                        t.cx = x / 100.0;
-                    }
-                    ui.end_row();
-                    ui.label("Y");
-                    if ui.add(egui::DragValue::new(&mut y).speed(0.1).fixed_decimals(1).suffix(" %")).changed() {
-                        t.cy = y / 100.0;
-                    }
-                    ui.end_row();
-                    ui.label("Zoom");
-                    ui.add(egui::DragValue::new(&mut t.zoom).speed(0.01).range(geometry::MIN_ZOOM_WITH_BARS..=geometry::MAX_ZOOM).fixed_decimals(2).prefix("×"));
-                    ui.end_row();
-                    ui.label("Angle");
-                    ui.add(egui::DragValue::new(&mut t.angle_deg).speed(0.2).fixed_decimals(1).suffix("°"));
-                    ui.end_row();
-                });
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Center").clicked() {
-                        t.cx = 0.5;
-                        t.cy = 0.5;
-                    }
-                    if ui.button("−90°").clicked() {
-                        t.angle_deg -= 90.0;
-                    }
-                    if ui.button("+90°").clicked() {
-                        t.angle_deg += 90.0;
-                    }
-                    if ui.button("0°").clicked() {
-                        t.angle_deg = 0.0;
-                    }
-                    let mirror = ui.add(egui::Button::new("Mirror").selected(t.mirror));
-                    if mirror.on_hover_text("Flip the output left to right").clicked() {
-                        t.mirror = !t.mirror;
-                    }
-                    if ui.button("Reset").clicked() {
-                        *t = Transform::default();
-                    }
-                });
-                t.angle_deg = geometry::normalize_angle(t.angle_deg);
-                *t = t.clamped(size[0], size[1], outline);
-                ui.label(
-                    RichText::new(
-                        "Drag inside the frame to move it (Alt: no snapping). Drag a side to resize it \
-                         (Ctrl: the opposite side stays); with the lock open that changes the proportions \
-                         (Shift: the opposite of the lock). Drag an arrow to rotate it (Shift: 15° steps). \
-                         Rest on the mark at its top for Fit, Fill, Bars and Reset; click it for 0°. Wheel to zoom.",
-                    )
-                    .weak()
-                    .small(),
-                );
-                ui.separator();
+        ui.heading("Transform");
+        let (mut x, mut y) = (t.cx * 100.0, t.cy * 100.0);
+        egui::Grid::new("transform").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+            ui.label("X");
+            if ui.add(egui::DragValue::new(&mut x).speed(0.1).fixed_decimals(1).suffix(" %")).changed() {
+                t.cx = x / 100.0;
+            }
+            ui.end_row();
+            ui.label("Y");
+            if ui.add(egui::DragValue::new(&mut y).speed(0.1).fixed_decimals(1).suffix(" %")).changed() {
+                t.cy = y / 100.0;
+            }
+            ui.end_row();
+            ui.label("Zoom");
+            ui.add(egui::DragValue::new(&mut t.zoom).speed(0.01).range(geometry::MIN_ZOOM_WITH_BARS..=geometry::MAX_ZOOM).fixed_decimals(2).prefix("×"));
+            ui.end_row();
+            ui.label("Angle");
+            ui.add(egui::DragValue::new(&mut t.angle_deg).speed(0.2).fixed_decimals(1).suffix("°"));
+            ui.end_row();
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Center").clicked() {
+                t.cx = 0.5;
+                t.cy = 0.5;
+            }
+            if ui.button("−90°").clicked() {
+                t.angle_deg -= 90.0;
+            }
+            if ui.button("+90°").clicked() {
+                t.angle_deg += 90.0;
+            }
+            if ui.button("0°").clicked() {
+                t.angle_deg = 0.0;
+            }
+            let mirror = ui.add(egui::Button::new("Mirror").selected(t.mirror));
+            if mirror.on_hover_text("Flip the output left to right").clicked() {
+                t.mirror = !t.mirror;
+            }
+            if ui.button("Reset").clicked() {
+                *t = Transform::default();
+            }
+        });
+        ui.label(
+            RichText::new(
+                "Drag inside the frame to move it (Alt: no snapping). Drag a side to resize it \
+                 (Ctrl: the opposite side stays); with the lock open that changes the proportions \
+                 (Shift: the opposite of the lock). Drag an arrow to rotate it (Shift: 15° steps). \
+                 Rest on the mark at its top for Fit, Fill, Bars and Reset; click it for 0°. Wheel to zoom.",
+            )
+            .weak()
+            .small(),
+        );
+        ui.separator();
 
-                if self.cache.info.has_audio {
-                    ui.heading("Sound");
-                    let clip = self.sequence.clip_mut(self.selected);
-                    ui.horizontal(|ui| {
-                        let mut percent = clip.volume * 100.0;
-                        ui.label("Volume");
-                        if ui.add(egui::Slider::new(&mut percent, 0.0..=200.0).fixed_decimals(0).suffix(" %")).changed() {
-                            clip.volume = percent / 100.0;
-                        }
-                        if ui.add(egui::Button::new("Mute").selected(clip.muted)).clicked() {
-                            clip.muted = !clip.muted;
-                        }
-                    });
-                    ui.separator();
+        if self.cache.info.has_audio {
+            ui.heading("Sound");
+            let clip = self.sequence.clip_mut(self.selected);
+            ui.horizontal(|ui| {
+                let mut percent = clip.volume * 100.0;
+                ui.label("Volume");
+                if ui.add(egui::Slider::new(&mut percent, 0.0..=200.0).fixed_decimals(0).suffix(" %")).changed() {
+                    clip.volume = percent / 100.0;
                 }
-
-                ui.heading("Source");
-                let info = &self.cache.info;
-                egui::Grid::new("source").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
-                    ui.label("Size");
-                    ui.label(format!("{}×{}", info.width, info.height));
-                    ui.end_row();
-                    ui.label("Frame rate");
-                    let preview_fps = self.cache.format.fps.as_f64();
-                    if self.cache.format.fps == info.fps {
-                        ui.label(format!("{:.2} fps", info.fps.as_f64()));
-                    } else {
-                        ui.label(format!("{:.2} fps (preview {:.2})", info.fps.as_f64(), preview_fps));
-                    }
-                    ui.end_row();
-                    ui.label("Duration");
-                    ui.label(timecode::format(info.duration, preview_fps));
-                    ui.end_row();
-                    ui.label("Audio");
-                    ui.label(if info.has_audio { "yes" } else { "no" });
-                    ui.end_row();
-                });
-                if let Some(error) = &self.player.audio_error {
-                    ui.colored_label(Color32::from_rgb(230, 120, 60), format!("No sound: {error}"));
+                if ui.add(egui::Button::new("Mute").selected(clip.muted)).clicked() {
+                    clip.muted = !clip.muted;
                 }
             });
+            ui.separator();
+        }
+
+        ui.heading("Source");
+        let info = &self.cache.info;
+        egui::Grid::new("source").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+            ui.label("Size");
+            ui.label(format!("{}×{}", info.width, info.height));
+            ui.end_row();
+            ui.label("Frame rate");
+            let preview_fps = self.cache.format.fps.as_f64();
+            if self.cache.format.fps == info.fps {
+                ui.label(format!("{:.2} fps", info.fps.as_f64()));
+            } else {
+                ui.label(format!("{:.2} fps (preview {:.2})", info.fps.as_f64(), preview_fps));
+            }
+            ui.end_row();
+            ui.label("Duration");
+            ui.label(timecode::format(info.duration, preview_fps));
+            ui.end_row();
+            ui.label("Audio");
+            ui.label(if info.has_audio { "yes" } else { "no" });
+            ui.end_row();
         });
+        if let Some(error) = &self.player.audio_error {
+            ui.colored_label(Color32::from_rgb(230, 120, 60), format!("No sound: {error}"));
+        }
     }
 
     fn source_panel(&mut self, ctx: &egui::Context) {

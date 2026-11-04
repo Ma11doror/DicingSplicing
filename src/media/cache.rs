@@ -119,12 +119,9 @@ struct BuildState {
 }
 
 impl MediaCache {
-    /// Opens the cache for `source`, starting a background build if there is no complete one.
-    pub fn open(source: &Path, notify: Notify) -> Result<Self> {
-        Self::open_in(&default_root(), source, notify)
-    }
-
-    fn open_in(root: &Path, source: &Path, notify: Notify) -> Result<Self> {
+    /// Opens the cache for `source` in the folder `root`, starting a background build if there is
+    /// no complete one.
+    pub fn open_in(root: &Path, source: &Path, notify: Notify) -> Result<Self> {
         let info = probe::probe(source)?;
         let dir = root.join(cache_key(source)?);
         match Self::load(source, &dir, &info) {
@@ -402,14 +399,6 @@ fn read_index(path: &Path) -> Result<Vec<(u64, u32)>> {
 }
 
 /// Until projects live in a workspace, caches go to the user's local app data.
-fn default_root() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("simple_editor")
-        .join("cache")
-}
-
 /// Cache folder name for a local file; it changes when the file is replaced or modified.
 fn cache_key(source: &Path) -> Result<String> {
     let path = fs::canonicalize(source).with_context(|| format!("can't open {}", source.display()))?;

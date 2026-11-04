@@ -2,15 +2,35 @@
 
 use anyhow::{bail, Context, Result};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::RwLock;
 
 pub const FFMPEG: &str = "ffmpeg";
 pub const FFPROBE: &str = "ffprobe";
 
+/// Programs that are not called by their plain name: (name, path).
+static PROGRAMS: RwLock<Vec<(String, String)>> = RwLock::new(Vec::new());
+
+/// Sets where a program is. An empty path means looking for it on the PATH.
+pub fn set_program(name: &str, path: &str) {
+    if let Ok(mut programs) = PROGRAMS.write() {
+        programs.retain(|(known, _)| known != name);
+        if !path.trim().is_empty() {
+            programs.push((name.to_owned(), path.trim().to_owned()));
+        }
+    }
+}
+
+pub fn program_path(name: &str) -> String {
+    let programs = PROGRAMS.read();
+    let known = programs.as_ref().ok().and_then(|programs| programs.iter().find(|(known, _)| known == name).map(|(_, path)| path.clone()));
+    known.unwrap_or_else(|| name.to_owned())
+}
+
 /// A command for an external tool. On Windows it never opens a console window,
 /// which would otherwise flash for every call in release builds.
 pub fn command(program: &str) -> Command {
-    let mut cmd = Command::new(program);
+    let mut cmd = Command::new(program_path(program));
     cmd.stdin(Stdio::null());
     #[cfg(windows)]
     {
@@ -21,12 +41,28 @@ pub fn command(program: &str) -> Command {
     cmd
 }
 
+/// Stops a program with everything it started. What is found on the PATH may be only a launcher
+/// that waits for the real program (Chocolatey's `ffmpeg.exe` is one): ending just the launcher
+/// would leave the work going, and it would be holding the pipes we read.
+pub fn kill_tree(child: &mut Child) {
+    #[cfg(windows)]
+    {
+        // It finds the rest through the parent, so the parent has to be alive at this moment.
+        let pid = child.id().to_string();
+        let stopped = command("taskkill").args(["/T", "/F", "/PID", &pid]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        if stopped.is_ok_and(|status| status.success()) {
+            return;
+        }
+    }
+    let _ = child.kill();
+}
+
 /// Checks that a tool runs and returns the first line of its version output.
 pub fn check(program: &str) -> Result<String> {
     let output = command(program)
         .arg("-version")
         .output()
-        .with_context(|| format!("{program} was not found: install it and add it to PATH"))?;
+        .with_context(|| format!("{program} was not found: install it and add it to PATH, or say where it is in Settings"))?;
     if !output.status.success() {
         bail!("{program} -version failed");
     }
@@ -87,6 +123,34 @@ pub fn reveal_file(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_set_path_is_used_until_it_is_cleared() {
+        assert_eq!(program_path("some_tool"), "some_tool");
+        set_program("some_tool", " C:/bin/some_tool.exe ");
+        assert_eq!(program_path("some_tool"), "C:/bin/some_tool.exe");
+        set_program("some_tool", "");
+        assert_eq!(program_path("some_tool"), "some_tool");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stopping_a_program_stops_what_it_started() {
+        use std::io::Read;
+        use std::time::{Duration, Instant};
+
+        // `cmd` waits for `ping` the way a launcher waits for the real program, and `ping` holds the pipe.
+        let mut child = command("cmd").args(["/c", "ping -n 60 127.0.0.1"]).stdout(Stdio::piped()).spawn().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        stdout.read_exact(&mut [0; 1]).unwrap();
+
+        let started = Instant::now();
+        kill_tree(&mut child);
+        // This ends only when nothing holds the pipe anymore.
+        stdout.read_to_end(&mut Vec::new()).unwrap();
+        let _ = child.wait();
+        assert!(started.elapsed() < Duration::from_secs(10), "it took {:?}", started.elapsed());
+    }
 
     #[test]
     fn finds_the_encoders_after_the_legend() {

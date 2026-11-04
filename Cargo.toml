@@ -2,6 +2,7 @@
 name = "simple_editor"
 version = "0.1.0"
 edition = "2021"
+default-run = "simple_editor"
 
 [dependencies]
 eframe = "0.29.1"
@@ -14,6 +15,12 @@ anyhow = "1.0"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 cpal = "0.18.2"
 rfd = "0.17.2"
+
+# Plugins are separate programs, and the editor finds them next to itself. `cargo build` builds them
+# too; `cargo run` builds only the editor, so after changing a plugin it takes `cargo build`.
+[workspace]
+members = ["plugins/link", "plugins/telegram"]
+default-members = [".", "plugins/link", "plugins/telegram"]
 
 # JPEG decoding and audio mixing are too slow without optimizations; keep our own code debuggable.
 [profile.dev]
