@@ -3,13 +3,11 @@
 
 use crate::core::preset::{Output, Preset, PresetId, Ratio, PRESETS};
 use crate::media::geometry::Mask;
+use crate::ui::flash;
 use crate::ui::viewer::{self, FrameOverlay};
-use egui::{vec2, Color32, RichText, Sense, Stroke};
-use std::f64::consts::TAU;
+use egui::{vec2, Color32, RichText, Sense};
 
 const LOCK_SIZE: f32 = 15.0;
-const FLASH_SECONDS: f64 = 1.2;
-const FLASH_PULSES: f64 = 2.0;
 
 /// How a frame is shown. These are view settings: they do not change the result.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -61,14 +59,6 @@ fn lock_button(ui: &mut egui::Ui, free: bool, enabled: bool) -> egui::Response {
     response
 }
 
-/// How bright the flash is `elapsed` seconds after it began: `FLASH_PULSES` pulses from 0 to 1 and back.
-fn flash_strength(elapsed: f64) -> f32 {
-    if !(0.0..FLASH_SECONDS).contains(&elapsed) {
-        return 0.0;
-    }
-    ((1.0 - (elapsed / FLASH_SECONDS * FLASH_PULSES * TAU).cos()) / 2.0) as f32
-}
-
 impl Framing {
     /// Dragging a side of the main frame changes its proportions.
     pub fn ratio_is_free(&self, output: Output) -> bool {
@@ -112,6 +102,11 @@ impl Framing {
         }
         output.preset = PresetId::Custom;
         output.custom = Ratio::from_aspect(aspect);
+    }
+
+    /// The frames shown for comparison.
+    pub fn shown_presets(&self, output: Output) -> Vec<&'static Preset> {
+        PRESETS.iter().zip(&self.options).filter(|(preset, options)| preset.id != output.preset && options.shown).map(|(preset, _)| preset).collect()
     }
 
     /// The frames to draw: the main one first, then the ones shown for comparison.
@@ -187,20 +182,8 @@ impl Framing {
     /// With the `source_aspect`, also the buttons that set the ratio at once.
     fn controls(&mut self, ui: &mut egui::Ui, output: &mut Output, source_aspect: Option<f64>) {
         let now = ui.input(|i| i.time);
-        let flashing = self.unlocked_at.is_some_and(|at| now - at < FLASH_SECONDS);
-        if flashing {
-            ui.ctx().request_repaint();
-        }
-        let strength = self.unlocked_at.map_or(0.0, |at| flash_strength(now - at));
         let free = self.ratio_is_free(*output);
-        let bright = viewer::lock_color(true);
-        let border = if free { Stroke::new(1.0, bright.gamma_multiply(0.7)) } else { Stroke::NONE };
-        let frame = egui::Frame::none()
-            .fill(bright.gamma_multiply(0.6 * strength))
-            .stroke(border)
-            .rounding(4.0)
-            .inner_margin(vec2(4.0, 1.0));
-        frame.show(ui, |ui| {
+        flash::frame(ui, self.unlocked_at, free).show(ui, |ui| {
             ui.horizontal(|ui| {
                 // Menus draw their buttons flat; these have to look like something to press.
                 ui.visuals_mut().button_frame = true;
@@ -362,13 +345,4 @@ mod tests {
         assert!(framing.ratio_is_free(out));
     }
 
-    #[test]
-    fn the_flash_pulses_and_ends() {
-        assert_eq!(flash_strength(-0.1), 0.0);
-        assert!(flash_strength(0.0).abs() < 1e-6);
-        assert!((flash_strength(0.3) - 1.0).abs() < 1e-6);
-        assert!(flash_strength(0.6).abs() < 1e-6);
-        assert!((flash_strength(0.9) - 1.0).abs() < 1e-6);
-        assert_eq!(flash_strength(FLASH_SECONDS), 0.0);
-    }
 }

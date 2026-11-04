@@ -2,6 +2,7 @@
 
 use crate::core::preset::{self, SafeZone};
 use crate::media::geometry::{self, Mask, Outline, Transform};
+use crate::ui::flash;
 use egui::epaint::Vertex;
 use egui::{pos2, vec2, Align2, Color32, CursorIcon, FontId, Mesh, Painter, Pos2, Rect, Sense, Shape, Stroke, TextureHandle};
 use std::f32::consts::{FRAC_PI_2, TAU};
@@ -20,6 +21,130 @@ const SNAP_LINE: Color32 = Color32::from_rgb(255, 200, 40);
 /// Room for the lock in front of the main frame's label.
 const LABEL_LOCK_ROOM: f32 = 15.0;
 const WHEEL_ZOOM_SPEED: f64 = 0.003;
+/// How far the menu's items stand from the top mark, and how large they are.
+const MENU_RADIUS: f32 = 54.0;
+const MENU_ITEM_RADIUS: f32 = 20.0;
+/// Where the items go, in radians from the direction away from the frame's center.
+const MENU_ANGLES: [f32; 4] = [-1.36, -0.45, 0.45, 1.36];
+/// The pointer rests on the mark this long before the menu opens: reaching for the top side should
+/// not open it. And it may wander off this long before the menu closes.
+const MENU_OPEN_DELAY: f64 = 0.2;
+const MENU_CLOSE_DELAY: f64 = 0.3;
+const MENU_FADE_SECONDS: f32 = 0.1;
+
+/// What the menu around the top mark offers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MenuItem {
+    Fit,
+    Fill,
+    Bars,
+    Reset,
+}
+
+impl MenuItem {
+    const ALL: [Self; 4] = [Self::Fit, Self::Fill, Self::Bars, Self::Reset];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fit => "Fit",
+            Self::Fill => "Fill",
+            Self::Bars => "Bars",
+            Self::Reset => "Reset",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Fit => "The whole picture in the frame, with black bars around it",
+            Self::Fill => "The largest frame inside the picture, no bars",
+            Self::Bars => "Let the frame go past the picture: the result is black there",
+            Self::Reset => "Back to the start: centered, no zoom, no turn, no mirror, no bars",
+        }
+    }
+
+    /// Returns whether the menu stays open: not when the frame goes somewhere else.
+    fn apply(self, t: &mut Transform, w: f64, h: f64, outline: Outline) -> bool {
+        match self {
+            Self::Fit => *t = t.showing_whole_picture(w, h, outline),
+            Self::Fill => *t = t.filling_frame(),
+            Self::Bars => {
+                t.bars = !t.bars;
+                return true;
+            }
+            Self::Reset => *t = Transform::default(),
+        }
+        false
+    }
+}
+
+/// Whether the menu around the top mark is open.
+#[derive(Debug, Default)]
+struct FrameMenu {
+    open: bool,
+    /// Since when the pointer rests on the closed menu's mark.
+    resting_since: Option<f64>,
+    /// Since when the pointer is away from the open menu.
+    away_since: Option<f64>,
+    /// After an action or a drag the pointer is still there: the menu opens only once it has left.
+    wait_for_leaving: bool,
+}
+
+impl FrameMenu {
+    /// Follows the pointer: `on_mark` and `near` say where it is, `near` meaning near the open menu.
+    /// Returns how long to wait until the next change is due, if one is coming.
+    fn update(&mut self, now: f64, on_mark: bool, near: bool, dragging: bool) -> Option<f64> {
+        if dragging {
+            self.close();
+            return None;
+        }
+        if self.open {
+            if near {
+                self.away_since = None;
+                return None;
+            }
+            let since = *self.away_since.get_or_insert(now);
+            if now - since >= MENU_CLOSE_DELAY {
+                *self = Self::default();
+                return None;
+            }
+            return Some(MENU_CLOSE_DELAY - (now - since));
+        }
+        if !on_mark {
+            *self = Self::default();
+            return None;
+        }
+        if self.wait_for_leaving {
+            return None;
+        }
+        let since = *self.resting_since.get_or_insert(now);
+        if now - since >= MENU_OPEN_DELAY {
+            *self = Self { open: true, ..Self::default() };
+            return None;
+        }
+        Some(MENU_OPEN_DELAY - (now - since))
+    }
+
+    fn close(&mut self) {
+        *self = Self { wait_for_leaving: true, ..Self::default() };
+    }
+}
+
+/// A fan of items around `mark`, pointing away from `center`, moved as a whole to stay inside `area`.
+/// Returns the point it fans out from, and the items.
+fn menu_layout(mark: Pos2, center: Pos2, area: Rect) -> (Pos2, [Pos2; 4]) {
+    let outwards = mark - center;
+    let facing = if outwards.length() < 1.0 { -FRAC_PI_2 } else { outwards.y.atan2(outwards.x) };
+    let items = MENU_ANGLES.map(|turn| mark + MENU_RADIUS * vec2((facing + turn).cos(), (facing + turn).sin()));
+
+    let inner = area.shrink(MENU_ITEM_RADIUS + 4.0);
+    let (mut lo, mut hi) = (items[0], items[0]);
+    for item in items {
+        lo = lo.min(item);
+        hi = hi.max(item);
+    }
+    let shift = vec2((inner.left() - lo.x).max(0.0) + (inner.right() - hi.x).min(0.0), (inner.top() - lo.y).max(0.0) + (inner.bottom() - hi.y).min(0.0));
+    (mark + shift, items.map(|item| item + shift))
+}
 
 /// A frame to draw on the source.
 #[derive(Clone)]
@@ -210,8 +335,26 @@ fn snap_axis(value: f64, targets: [(f64, f64); 3], tolerance: f64) -> (f64, Opti
 #[derive(Default)]
 pub struct SourceView {
     drag: Option<SourceDrag>,
+    /// The picture on the screen and its scale, kept for the time of a drag.
+    view: Option<(Rect, f64)>,
     /// Snap lines of the current move: x and y in source pixels.
     snapped: [Option<f64>; 2],
+    menu: FrameMenu,
+}
+
+/// Where the picture goes in `area`, with room for the arrows, and with bars also for the frame.
+fn fit_view(area: Rect, size: [f64; 2], t: &Transform, outline: Outline) -> (Rect, f64) {
+    let [w, h] = size;
+    let (mut x0, mut y0, mut x1, mut y1) = (0.0, 0.0, w, h);
+    if t.bars {
+        let [cx, cy] = t.center(w, h);
+        let [ex, ey] = outline.extents(t.size(w, h, outline), t.angle_deg);
+        (x0, y0, x1, y1) = (f64::min(x0, cx - ex), f64::min(y0, cy - ey), f64::max(x1, cx + ex), f64::max(y1, cy + ey));
+    }
+    let margin = 2.0 * MARGIN as f64;
+    let scale = ((area.width() as f64 - margin) / (x1 - x0)).min((area.height() as f64 - margin) / (y1 - y0)).max(0.01);
+    let middle = vec2(((x0 + x1) / 2.0 * scale) as f32, ((y0 + y1) / 2.0 * scale) as f32);
+    (Rect::from_min_size(area.center() - middle, vec2((w * scale) as f32, (h * scale) as f32)), scale)
 }
 
 impl SourceView {
@@ -220,8 +363,8 @@ impl SourceView {
     /// Drag to move the frame (it snaps to the center and edges of the picture, Alt: no snapping),
     /// drag a side to resize it (Ctrl: the opposite side stays; it keeps the proportions unless the
     /// main frame has a free ratio, Shift: the other way round), drag an arrow to rotate it (Shift:
-    /// 15° steps), click the top mark for 0°, wheel to zoom. A `note` dims the frame and says why.
-    /// Returns the new proportions while they are being changed.
+    /// 15° steps), click the top mark for 0°, rest on it for a menu, wheel to zoom. A `note` dims the
+    /// frame and says why. Returns the new proportions while they are being changed.
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -234,18 +377,25 @@ impl SourceView {
         let [w, h] = size;
         let area = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(area, Sense::click_and_drag());
-        let margin = MARGIN as f64;
-        let scale = ((area.width() as f64 - 2.0 * margin) / w).min((area.height() as f64 - 2.0 * margin) / h).max(0.01);
-        let image = Rect::from_center_size(area.center(), vec2((w * scale) as f32, (h * scale) as f32));
+        // During a drag the view stays put: a frame growing past the picture would otherwise shrink
+        // the view, which moves the picture under the pointer, which grows the frame further.
+        let (image, scale) = self.view.filter(|_| self.drag.is_some()).unwrap_or_else(|| fit_view(area, size, t, frames[0].outline));
         let mut stage = Stage { image, scale, w, h, outline: frames[0].outline };
         let modifiers = ui.input(|i| i.modifiers);
+        let now = ui.input(|i| i.time);
         let mut aspect = None;
+
+        let menu_visibility = ui.ctx().animate_bool_with_time(ui.id().with("frame_menu"), self.menu.open, MENU_FADE_SECONDS);
+        let (_, menu_items) = menu_layout(stage.top(t), stage.screen(t.center(w, h)), area);
+        let menu_shown = self.menu.open && menu_visibility > 0.5;
+        let item_at = |p: Pos2| menu_items.iter().position(|item| menu_shown && item.distance(p) <= MENU_ITEM_RADIUS);
 
         // Input first, so that the overlay shows this frame's result.
         if response.drag_started() {
             let press = ui.input(|i| i.pointer.press_origin());
             let reshape = frames[0].free_ratio != modifiers.shift;
-            self.drag = press.map(|p| stage.begin_drag(*t, p, reshape));
+            self.drag = press.filter(|p| item_at(*p).is_none()).map(|p| stage.begin_drag(*t, p, reshape));
+            self.view = Some((image, scale));
         }
         self.snapped = [None; 2];
         if let (true, Some(drag), Some(p)) = (response.dragged(), self.drag, response.interact_pointer_pos()) {
@@ -288,11 +438,17 @@ impl SourceView {
         }
         if response.drag_stopped() {
             self.drag = None;
+            self.view = None;
         }
         if response.clicked() {
-            let on_top = response.interact_pointer_pos().is_some_and(|p| stage.part_at(t, p) == Part::Top);
-            if on_top {
-                t.angle_deg = 0.0;
+            if let Some(p) = response.interact_pointer_pos() {
+                if let Some(i) = item_at(p) {
+                    if !MenuItem::ALL[i].apply(t, w, h, stage.outline) {
+                        self.menu.close();
+                    }
+                } else if stage.part_at(t, p) == Part::Top {
+                    t.angle_deg = 0.0;
+                }
             }
         }
         if response.hovered() {
@@ -301,12 +457,44 @@ impl SourceView {
         }
         *t = t.clamped(w, h, stage.outline);
 
-        let hot = self.drag.map(|drag| drag.part()).or_else(|| response.hover_pos().map(|p| stage.part_at(t, p)));
+        // The frame may have just changed: from here on the menu goes by where it is now.
+        let mark = stage.top(t);
+        let (menu_origin, menu_items) = menu_layout(mark, stage.screen(t.center(w, h)), area);
+        let pointer = response.hover_pos();
+        let hovered_item = pointer.and_then(|p| menu_items.iter().position(|item| menu_shown && item.distance(p) <= MENU_ITEM_RADIUS));
+        let on_mark = pointer.is_some_and(|p| p.distance(mark) <= TOP_RADIUS + 3.0);
+        let near_menu = pointer.is_some_and(|p| p.distance(menu_origin) <= MENU_RADIUS + MENU_ITEM_RADIUS + 8.0 || p.distance(mark) <= TOP_RADIUS + 8.0);
+        if let Some(wait) = self.menu.update(now, on_mark, near_menu, self.drag.is_some()) {
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(wait));
+        }
+
+        let hot = if hovered_item.is_some() { None } else { self.drag.map(|drag| drag.part()).or_else(|| pointer.map(|p| stage.part_at(t, p))) };
         if let (Some(part), true) = (hot, response.hovered() || self.drag.is_some()) {
             ui.ctx().set_cursor_icon(stage.cursor(t, part, self.drag.is_some()));
         }
+        if let Some(i) = hovered_item {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), ui.id().with("frame_menu_hint"), |ui| {
+                ui.label(MenuItem::ALL[i].hint());
+            });
+        }
 
         let painter = ui.painter_at(area);
+        let [fw, fh] = t.size(w, h, stage.outline);
+        let center = stage.screen(t.center(w, h));
+        let radius = (fw / 2.0 * scale) as f32;
+        let corners = t.corners(w, h, stage.outline).map(|p| stage.screen(p));
+        if t.bars {
+            // Where the frame reaches past the picture, the result is black.
+            match stage.outline.mask {
+                Mask::Circle => {
+                    painter.circle_filled(center, radius, Color32::BLACK);
+                }
+                Mask::Rect => {
+                    painter.add(Shape::convex_polygon(corners.to_vec(), Color32::BLACK, Stroke::NONE));
+                }
+            }
+        }
         match texture {
             Some(texture) => {
                 let uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
@@ -324,14 +512,11 @@ impl SourceView {
         }
 
         let main = FrameOverlay { outline: stage.outline, ..frames[0].clone() };
-        let [fw, fh] = t.size(w, h, stage.outline);
-        let center = stage.screen(t.center(w, h));
-        let corners = t.corners(w, h, stage.outline).map(|p| stage.screen(p));
         let clipped = painter.with_clip_rect(image);
         let shade = Color32::from_black_alpha(160);
         match stage.outline.mask {
-            Mask::Circle => shade_outside_circle(&clipped, image, center, (fw / 2.0 * scale) as f32, shade),
-            Mask::Rect => shade_outside_rect(&clipped, &corners, shade),
+            Mask::Circle => shade_outside_circle(&clipped, image, center, radius, shade),
+            Mask::Rect => shade_outside_rect(&clipped, &corners, area.size().length() * 4.0, shade),
         }
         for frame in &frames[1..] {
             paint_reference(&painter, &stage, t, frame, frame.outline.fit(fw, fh));
@@ -350,7 +535,27 @@ impl SourceView {
                 paint_label(&painter, p + vec2(16.0, 16.0), text, Color32::WHITE, None);
             }
         }
+        if menu_visibility > 0.0 {
+            paint_menu(&painter, menu_origin, &menu_items, menu_visibility, frames[0].color, hovered_item, t.bars);
+        }
         aspect
+    }
+}
+
+/// The items, sliding out of `origin` as `visibility` goes from 0 to 1.
+fn paint_menu(painter: &Painter, origin: Pos2, items: &[Pos2; 4], visibility: f32, color: Color32, hovered: Option<usize>, bars: bool) {
+    for (i, (item, at)) in MenuItem::ALL.into_iter().zip(items).enumerate() {
+        let on = item == MenuItem::Bars && bars;
+        let fill = match (on, hovered == Some(i)) {
+            (true, _) => flash::COLOR.gamma_multiply(0.75),
+            (false, true) => Color32::from_gray(70),
+            (false, false) => Color32::from_gray(24),
+        };
+        let at = origin.lerp(*at, visibility);
+        let stroke = Stroke::new(if hovered == Some(i) { 2.0 } else { 1.5 }, color.gamma_multiply(visibility));
+        painter.circle(at, MENU_ITEM_RADIUS, fill.gamma_multiply(visibility), stroke);
+        let text = if on { Color32::BLACK } else { Color32::WHITE };
+        painter.text(at, Align2::CENTER_CENTER, item.label(), FontId::proportional(12.0), text.gamma_multiply(visibility));
     }
 }
 
@@ -392,7 +597,7 @@ fn paint_main(painter: &Painter, stage: &Stage, t: &Transform, frame: &FrameOver
 /// The color of a lock: an open one should catch the eye.
 pub fn lock_color(free: bool) -> Color32 {
     if free {
-        Color32::from_rgb(255, 205, 60)
+        flash::COLOR
     } else {
         Color32::from_rgb(235, 235, 235)
     }
@@ -545,10 +750,13 @@ impl OutputView {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, Color32::BLACK);
         if let Some(texture) = texture {
-            // The output corners sample the turned frame on the source.
+            // The whole picture, placed where the frame sees it. The painter cuts it to the box, and
+            // with bars what is left of the box stays black.
+            let pixels_per_source = box_size.x as f64 / t.size(w, h, outline)[0];
             let mut mesh = Mesh::with_texture(texture.id());
-            let screen = [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom()];
-            for (pos, [x, y]) in screen.into_iter().zip(t.corners(w, h, outline)) {
+            for [x, y] in [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]] {
+                let [u, v] = t.source_to_output(w, h, [x, y]);
+                let pos = rect.center() + vec2((u * pixels_per_source) as f32, (v * pixels_per_source) as f32);
                 let uv = pos2((x / w) as f32, (y / h) as f32);
                 mesh.vertices.push(Vertex { pos, uv, color: Color32::WHITE });
             }
@@ -577,10 +785,9 @@ fn shade_outside_circle(painter: &Painter, area: Rect, center: Pos2, radius: f32
     painter.circle_stroke(center, radius, Stroke::new(width, color));
 }
 
-/// Covers everything the painter can reach outside the rectangle with `color`. The outside is cut
-/// into four pinwheel blades, one per side, so that no part of it is covered twice.
-fn shade_outside_rect(painter: &Painter, corners: &[Pos2; 4], color: Color32) {
-    let reach = painter.clip_rect().size().length() * 4.0;
+/// Covers everything the painter can reach outside the rectangle with `color`, out to `reach`. The
+/// outside is cut into four pinwheel blades, one per side, so that no part of it is covered twice.
+fn shade_outside_rect(painter: &Painter, corners: &[Pos2; 4], reach: f32, color: Color32) {
     let direction = |i: usize| (corners[(i + 1) % 4] - corners[i]).normalized();
     let mut mesh = Mesh::default();
     for i in 0..4 {
@@ -666,6 +873,125 @@ mod tests {
         // A circle has no proportions to change.
         let s = stage(1.0, Mask::Circle);
         assert!(matches!(s.begin_drag(t, pos2(580.0 + 135.0, 320.0), true), SourceDrag::Resize { .. }));
+    }
+
+    #[test]
+    fn the_menu_fans_out_away_from_the_frame() {
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let (origin, items) = menu_layout(pos2(400.0, 200.0), pos2(400.0, 400.0), area);
+        assert_eq!(origin, pos2(400.0, 200.0));
+        assert!(items.iter().all(|item| item.y < 200.0), "{items:?}");
+        // From left to right, as the frame's top is up.
+        assert!(items.windows(2).all(|pair| pair[0].x < pair[1].x), "{items:?}");
+    }
+
+    #[test]
+    fn the_menu_stays_inside_the_area_and_its_items_do_not_touch() {
+        let area = Rect::from_min_size(pos2(100.0, 50.0), vec2(800.0, 500.0));
+        let marks = [pos2(500.0, 52.0), pos2(102.0, 300.0), pos2(898.0, 548.0), pos2(500.0, 300.0), pos2(101.0, 51.0)];
+        for mark in marks {
+            for turn in 0..16 {
+                let (sin, cos) = (turn as f32 / 16.0 * TAU).sin_cos();
+                let center = mark + 200.0 * vec2(cos, sin);
+                let (_, items) = menu_layout(mark, center, area);
+                for (i, item) in items.iter().enumerate() {
+                    assert!(area.shrink(MENU_ITEM_RADIUS).contains(*item), "{mark:?}, turn {turn}: {item:?}");
+                    for other in &items[i + 1..] {
+                        assert!(item.distance(*other) > 2.0 * MENU_ITEM_RADIUS, "{mark:?}, turn {turn}: {item:?} and {other:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_menu_opens_after_a_rest_and_closes_after_leaving() {
+        let mut menu = FrameMenu::default();
+        // Passing over the mark does nothing.
+        assert!(menu.update(0.0, true, true, false).is_some());
+        assert_eq!(menu.update(0.1, false, false, false), None);
+        assert!(!menu.open);
+
+        // Resting on it does.
+        menu.update(1.0, true, true, false);
+        assert!(!menu.open);
+        menu.update(1.0 + MENU_OPEN_DELAY + 0.01, true, true, false);
+        assert!(menu.open);
+
+        // Moving towards an item keeps it, a short trip outside too.
+        menu.update(2.0, false, true, false);
+        assert!(menu.update(3.0, false, false, false).is_some());
+        menu.update(3.1, false, true, false);
+        assert!(menu.open);
+
+        // A longer one does not.
+        menu.update(4.0, false, false, false);
+        menu.update(4.0 + MENU_CLOSE_DELAY + 0.01, false, false, false);
+        assert!(!menu.open);
+
+        // Starting a drag closes it at once.
+        menu.open = true;
+        menu.update(5.0, true, true, true);
+        assert!(!menu.open);
+    }
+
+    #[test]
+    fn after_an_action_or_a_drag_the_menu_waits_for_the_pointer_to_leave_the_mark() {
+        let mut menu = FrameMenu { open: true, ..FrameMenu::default() };
+        menu.close();
+        assert_eq!(menu.update(10.5, true, true, false), None);
+        assert_eq!(menu.update(11.0, true, true, false), None);
+        assert!(!menu.open);
+
+        // A drag ending on the mark, as when pulling the top side by it.
+        menu.update(11.1, true, true, true);
+        assert_eq!(menu.update(11.2, true, true, false), None);
+        assert_eq!(menu.update(11.4, true, true, false), None);
+        assert!(!menu.open);
+
+        menu.update(11.5, false, false, false);
+        menu.update(12.0, true, true, false);
+        menu.update(12.0 + MENU_OPEN_DELAY + 0.01, true, true, false);
+        assert!(menu.open);
+    }
+
+    #[test]
+    fn menu_items_do_what_they_say() {
+        let outline = Outline { aspect: 9.0 / 16.0, mask: Mask::Rect };
+        let start = Transform { cx: 0.4, zoom: 1.5, angle_deg: 10.0, mirror: true, ..Transform::default() };
+
+        let mut t = start;
+        assert!(!MenuItem::Fit.apply(&mut t, W, H, outline));
+        assert_eq!(t, start.showing_whole_picture(W, H, outline));
+        assert!(!MenuItem::Fill.apply(&mut t, W, H, outline));
+        assert_eq!(t, start.filling_frame());
+
+        // Bars keeps the menu open, so that it can be turned back.
+        assert!(MenuItem::Bars.apply(&mut t, W, H, outline));
+        assert!(t.bars);
+        assert!(MenuItem::Bars.apply(&mut t, W, H, outline));
+        assert!(!t.bars);
+
+        assert!(!MenuItem::Reset.apply(&mut t, W, H, outline));
+        assert_eq!(t, Transform::default());
+    }
+
+    #[test]
+    fn the_view_makes_room_for_a_frame_past_the_picture() {
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 600.0));
+        let outline = Outline { aspect: 9.0 / 16.0, mask: Mask::Rect };
+
+        // Without bars the picture decides, and sits in the middle.
+        let (image, scale) = fit_view(area, [W, H], &Transform::default(), outline);
+        assert_eq!(image.center(), area.center());
+        assert!((scale - (1000.0 - 2.0 * MARGIN as f64) / W).abs() < 1e-9);
+
+        // The whole picture in a tall frame: the frame decides, the picture is still in the middle.
+        let t = Transform::default().showing_whole_picture(W, H, outline);
+        let (image, scale) = fit_view(area, [W, H], &t, outline);
+        assert!((image.center() - area.center()).length() < 1e-3);
+        let [_, fh] = t.size(W, H, outline);
+        assert!(((fh * scale) as f32 - (600.0 - 2.0 * MARGIN)).abs() < 1e-2);
     }
 
     #[test]

@@ -8,6 +8,8 @@
 use serde::{Deserialize, Serialize};
 
 pub const MAX_ZOOM: f64 = 10.0;
+/// With bars the frame can be larger than the picture: this makes it ten times the largest frame inside.
+pub const MIN_ZOOM_WITH_BARS: f64 = 0.1;
 /// How narrow or wide a frame can get.
 pub const MIN_ASPECT: f64 = 0.1;
 pub const MAX_ASPECT: f64 = 10.0;
@@ -73,11 +75,14 @@ pub struct Transform {
     /// The output is flipped left to right.
     #[serde(default)]
     pub mirror: bool,
+    /// The frame may reach outside the picture: the output is black there.
+    #[serde(default)]
+    pub bars: bool,
 }
 
 impl Default for Transform {
     fn default() -> Self {
-        Self { cx: 0.5, cy: 0.5, zoom: 1.0, angle_deg: 0.0, mirror: false }
+        Self { cx: 0.5, cy: 0.5, zoom: 1.0, angle_deg: 0.0, mirror: false, bars: false }
     }
 }
 
@@ -123,7 +128,7 @@ impl Transform {
         let [fw, fh] = self.size(w, h, outline);
         let half = if outline.mask == Mask::Circle || is_horizontal(side) { fw } else { fh } / 2.0;
         let wanted = if keep_opposite { (extent + half) / 2.0 } else { extent }.max(1.0);
-        let zoom = (self.zoom * half / wanted).max(outline.min_zoom(w, h, self.angle_deg)).min(MAX_ZOOM);
+        let zoom = (self.zoom * half / wanted).max(self.min_zoom(w, h, outline)).min(MAX_ZOOM);
         let mut out = Self { zoom, ..*self };
         if keep_opposite {
             out.shift_along(self, w, h, side, half * self.zoom / zoom - half);
@@ -132,8 +137,8 @@ impl Transform {
     }
 
     /// Moves a side of the frame to `extent` from the center and changes the proportions: the other
-    /// dimension stays. The side stops where the turned frame no longer fits in the source. Returns
-    /// the new placement and the proportions, passed through `snap` on the way.
+    /// dimension stays. Without bars the side stops where the turned frame no longer fits in the
+    /// source. Returns the new placement and the proportions, passed through `snap` on the way.
     #[allow(clippy::too_many_arguments)]
     pub fn reshaped(
         &self,
@@ -154,7 +159,7 @@ impl Transform {
         let (sin, cos) = abs_sin_cos(self.angle_deg);
         let (to_x, to_y) = if horizontal { (cos, sin) } else { (sin, cos) };
         let room = |free: f64, share: f64| if share > 1e-9 { free / share } else { f64::INFINITY };
-        let longest = room(w - other * to_y, to_x).min(room(h - other * to_x, to_y));
+        let longest = if self.bars { f64::INFINITY } else { room(w - other * to_y, to_x).min(room(h - other * to_x, to_y)) };
         let moved = wanted.min(longest).max(1.0);
 
         let aspect = if horizontal { moved / other } else { other / moved };
@@ -177,11 +182,44 @@ impl Transform {
         self.cy = cy / h;
     }
 
+    fn min_zoom(&self, w: f64, h: f64, outline: Outline) -> f64 {
+        if self.bars {
+            MIN_ZOOM_WITH_BARS
+        } else {
+            outline.min_zoom(w, h, self.angle_deg)
+        }
+    }
+
+    /// The whole picture in the middle of the frame, with bars around it.
+    pub fn showing_whole_picture(&self, w: f64, h: f64, outline: Outline) -> Self {
+        let [fw, fh] = outline.fit(w, h);
+        let zoom = match outline.mask {
+            // All the corners of the picture have to be inside the circle.
+            Mask::Circle => fw / w.hypot(h),
+            Mask::Rect => {
+                let (sin, cos) = abs_sin_cos(self.angle_deg);
+                (fw / (w * cos + h * sin)).min(fh / (w * sin + h * cos))
+            }
+        };
+        Self { cx: 0.5, cy: 0.5, zoom: zoom.max(MIN_ZOOM_WITH_BARS), bars: true, ..*self }
+    }
+
+    /// The largest centered frame without bars.
+    pub fn filling_frame(&self) -> Self {
+        Self { cx: 0.5, cy: 0.5, zoom: 1.0, bars: false, ..*self }
+    }
+
     /// Keeps the zoom in range and the frame inside the source: a turned rectangle needs a higher
-    /// zoom to fit, so that the output never has empty corners.
+    /// zoom to fit, so that the output never has empty corners. With bars only the frame's center
+    /// has to stay on the picture.
     pub fn clamped(mut self, w: f64, h: f64, outline: Outline) -> Self {
-        let min_zoom = outline.min_zoom(w, h, self.angle_deg);
+        let min_zoom = self.min_zoom(w, h, outline);
         self.zoom = self.zoom.max(min_zoom).min(MAX_ZOOM.max(min_zoom));
+        if self.bars {
+            self.cx = self.cx.clamp(0.0, 1.0);
+            self.cy = self.cy.clamp(0.0, 1.0);
+            return self;
+        }
         let [ex, ey] = outline.extents(self.size(w, h, outline), self.angle_deg);
         self.cx = self.cx.max(ex / w).min(1.0 - ex / w);
         self.cy = self.cy.max(ey / h).min(1.0 - ey / h);
@@ -252,7 +290,7 @@ mod tests {
     #[test]
     fn source_and_output_mappings_are_inverse() {
         for mirror in [false, true] {
-            let t = Transform { cx: 0.3, cy: 0.6, zoom: 2.5, angle_deg: 33.3, mirror };
+            let t = Transform { cx: 0.3, cy: 0.6, zoom: 2.5, angle_deg: 33.3, mirror, bars: false };
             for offset in [[10.0, -20.0], [0.0, 0.0], [-100.0, 55.0]] {
                 let p = t.output_to_source(W, H, offset);
                 assert_close(t.source_to_output(W, H, p), offset);
@@ -271,7 +309,7 @@ mod tests {
 
     #[test]
     fn clamp_keeps_the_circle_inside() {
-        let t = Transform { cx: 0.0, cy: 0.0, zoom: 0.5, angle_deg: 45.0, mirror: false }.clamped(W, H, CIRCLE);
+        let t = Transform { cx: 0.0, cy: 0.0, zoom: 0.5, angle_deg: 45.0, mirror: false, bars: false }.clamped(W, H, CIRCLE);
         assert_eq!(t.zoom, 1.0);
         assert!((t.cx - 540.0 / W).abs() < 1e-12);
         assert_eq!(t.cy, 0.5);
@@ -285,7 +323,7 @@ mod tests {
         for outline in outlines {
             for angle_deg in [0.0, 7.5, 30.0, 45.0, 90.0, 133.0, -60.0, 180.0] {
                 for (cx, cy) in [(0.5, 0.5), (0.0, 0.0), (1.0, 0.3)] {
-                    let t = Transform { cx, cy, zoom: 1.0, angle_deg, mirror: false }.clamped(W, H, outline);
+                    let t = Transform { cx, cy, zoom: 1.0, angle_deg, mirror: false, bars: false }.clamped(W, H, outline);
                     for [x, y] in t.corners(W, H, outline) {
                         let inside = (-1e-6..=W + 1e-6).contains(&x) && (-1e-6..=H + 1e-6).contains(&y);
                         assert!(inside, "{outline:?} at {angle_deg}°: corner {x}, {y}");
@@ -297,7 +335,7 @@ mod tests {
 
     #[test]
     fn clamp_does_not_touch_an_upright_frame_that_fits() {
-        let t = Transform { cx: 0.2, cy: 0.5, zoom: 1.0, angle_deg: 0.0, mirror: false }.clamped(W, H, VERTICAL);
+        let t = Transform { cx: 0.2, cy: 0.5, zoom: 1.0, angle_deg: 0.0, mirror: false, bars: false }.clamped(W, H, VERTICAL);
         assert_eq!(t.zoom, 1.0);
         assert!((t.cx - 0.2).abs() < 1e-12);
     }
@@ -371,6 +409,55 @@ mod tests {
         let [new_fw, _] = t.size(W, H, Outline { aspect, mask: Mask::Rect });
         assert!((new_fw - fw * 1.5).abs() < 1e-6);
         assert_close(t.output_to_source(W, H, [-new_fw / 2.0, 0.0]), opposite);
+    }
+
+    #[test]
+    fn with_bars_the_frame_may_leave_the_picture() {
+        let t = Transform { cx: 0.05, cy: 0.1, zoom: 0.5, bars: true, ..Default::default() }.clamped(W, H, VERTICAL);
+        assert_eq!((t.cx, t.cy, t.zoom), (0.05, 0.1, 0.5));
+
+        // Only the center has to stay on the picture.
+        let t = Transform { cx: -1.0, cy: 2.0, zoom: 0.01, bars: true, ..Default::default() }.clamped(W, H, VERTICAL);
+        assert_eq!((t.cx, t.cy, t.zoom), (0.0, 1.0, MIN_ZOOM_WITH_BARS));
+
+        // Dragging a side can go past the largest frame, in both ways of resizing.
+        let start = Transform { bars: true, ..Default::default() };
+        let half = start.size(W, H, VERTICAL)[0] / 2.0;
+        let t = start.resized(W, H, VERTICAL, [1.0, 0.0], half * 2.0, false);
+        assert!((t.zoom - 0.5).abs() < 1e-9);
+        let (t, aspect) = start.reshaped(W, H, VERTICAL, [0.0, 1.0], 1080.0, false, |a| a);
+        assert_close(t.size(W, H, Outline { aspect, mask: Mask::Rect }), [607.5, 2160.0]);
+    }
+
+    #[test]
+    fn the_whole_picture_fits_the_frame() {
+        let cases = [(VERTICAL, 0.0), (WIDE, 0.0), (VERTICAL, 30.0), (CIRCLE, 0.0), (CIRCLE, 40.0), (Outline { aspect: 1.6, mask: Mask::Rect }, -75.0)];
+        for (outline, angle_deg) in cases {
+            let t = Transform { angle_deg, ..Default::default() }.showing_whole_picture(W, H, outline);
+            assert!(t.bars);
+            assert_eq!(t.clamped(W, H, outline), t);
+            let [fw, fh] = t.size(W, H, outline);
+            for corner in [[0.0, 0.0], [W, 0.0], [W, H], [0.0, H]] {
+                let [u, v] = t.source_to_output(W, H, corner);
+                let inside = match outline.mask {
+                    Mask::Circle => u.hypot(v) <= fw / 2.0 + 1e-6,
+                    Mask::Rect => u.abs() <= fw / 2.0 + 1e-6 && v.abs() <= fh / 2.0 + 1e-6,
+                };
+                assert!(inside, "{outline:?} at {angle_deg}°: corner at {u}, {v} in {fw}×{fh}");
+            }
+        }
+
+        // 16:9 in 16:9 is exactly the picture.
+        assert!((Transform::default().showing_whole_picture(W, H, WIDE).zoom - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn filling_the_frame_removes_the_bars() {
+        let t = Transform::default().showing_whole_picture(W, H, VERTICAL).filling_frame().clamped(W, H, VERTICAL);
+        assert_eq!(t, Transform::default());
+        // Turned, it still fits the picture, so it is smaller.
+        let t = Transform { angle_deg: 30.0, ..Default::default() }.filling_frame().clamped(W, H, VERTICAL);
+        assert!(t.zoom > 1.0);
     }
 
     #[test]

@@ -4,6 +4,7 @@ pub mod frames;
 pub mod geometry;
 pub mod player;
 pub mod probe;
+pub mod render;
 pub mod timecode;
 
 use std::sync::Arc;

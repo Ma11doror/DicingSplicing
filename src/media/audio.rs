@@ -19,12 +19,13 @@ pub struct PlayRange {
     pub sound: Segment,
 }
 
-/// Timeline `start..end` plays the source from `source_start` on.
+/// Timeline `start..end` plays the source from `source_start` on, multiplied by `gain`.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Segment {
     pub start: f64,
     pub end: f64,
     pub source_start: f64,
+    pub gain: f32,
 }
 
 impl Segment {
@@ -173,8 +174,9 @@ where
                             (Some(pcm), Some(source)) => sample_at(pcm, source * rate),
                             _ => (0.0, 0.0),
                         };
-                        let gain = range.gain(t);
-                        write_frame(frame, left * gain, right * gain, silence);
+                        // A volume above 100% can go past full scale.
+                        let gain = range.gain(t) * range.sound.gain;
+                        write_frame(frame, (left * gain).clamp(-1.0, 1.0), (right * gain).clamp(-1.0, 1.0), silence);
                         pos += step;
                         continue;
                     }
@@ -237,7 +239,7 @@ mod tests {
 
     #[test]
     fn segment_maps_to_source_time() {
-        let sound = Segment { start: 5.0, end: 15.0, source_start: 2.0 };
+        let sound = Segment { start: 5.0, end: 15.0, source_start: 2.0, gain: 1.0 };
         assert_eq!(sound.source_time(5.0), Some(2.0));
         assert_eq!(sound.source_time(10.5), Some(7.5));
         assert_eq!(sound.source_time(4.9), None);

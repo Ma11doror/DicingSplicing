@@ -8,6 +8,7 @@ use crate::media::frames::FrameDecoder;
 use crate::media::geometry::{self, Transform};
 use crate::media::player::Player;
 use crate::media::{timecode, Notify};
+use crate::ui::export::ExportWindow;
 use crate::ui::framing::Framing;
 use crate::ui::timeline::Timeline;
 use crate::ui::viewer::{OutputView, SourceView};
@@ -22,7 +23,7 @@ const OUTPUT_MAX_HEIGHT: f64 = 340.0;
 enum PlayMode {
     /// From the playhead to the end of the last clip.
     Timeline,
-    /// The export range, with the preset fades, looped if `loop_export` is on.
+    /// The export range, with the export fades, looped if `loop_export` is on.
     Export,
 }
 
@@ -45,6 +46,7 @@ pub struct Editor {
     selected: ClipId,
     history: History<Sequence>,
     framing: Framing,
+    export: ExportWindow,
     timeline: Timeline,
     source_view: SourceView,
     output_view: OutputView,
@@ -75,6 +77,7 @@ impl Editor {
             sequence,
             selected: ClipId { track: 0, index: 0 },
             framing: Framing::default(),
+            export: ExportWindow::default(),
             timeline: Timeline::new(),
             source_view: SourceView::default(),
             output_view: OutputView,
@@ -98,6 +101,8 @@ impl Editor {
         self.timeline_panel(ctx);
         self.output_panel(ctx);
         self.source_panel(ctx);
+        let shown = self.framing.shown_presets(self.sequence.output);
+        self.export.show(ctx, &mut self.sequence, &self.cache.source, &self.cache.info, &shown);
 
         let busy = ctx.input(|i| i.pointer.any_down()) || ctx.wants_keyboard_input();
         let now = ctx.input(|i| i.time);
@@ -157,16 +162,15 @@ impl Editor {
     }
 
     fn play_range(&self, mode: PlayMode) -> PlayRange {
-        let p = self.sequence.output.preset();
         let clip = self.clip();
-        let sound = Segment { start: clip.start, end: clip.end(), source_start: clip.source_in };
+        let sound = Segment { start: clip.start, end: clip.end(), source_start: clip.source_in, gain: clip.gain() as f32 };
         match mode {
             PlayMode::Timeline => PlayRange { start: 0.0, end: self.content().end, looping: false, fades: None, sound },
             PlayMode::Export => PlayRange {
                 start: self.sequence.export.start,
                 end: self.sequence.export.end,
                 looping: self.loop_export,
-                fades: Some((p.audio_fade_in, p.audio_fade_out)),
+                fades: Some(self.sequence.settings.fades),
                 sound,
             },
         }
@@ -352,11 +356,11 @@ impl Editor {
                 ui.separator();
                 let looped = ui
                     .toggle_value(&mut self.loop_export, "🔁 Loop export")
-                    .on_hover_text("Space plays the export range in a loop, with the preset fades");
+                    .on_hover_text("Space plays the export range in a loop, with the fades from the export settings");
                 if looped.changed() && self.playing {
                     self.play();
                 }
-                if ui.button("▶ Play export").on_hover_text("Play the export range with the preset fades").clicked() {
+                if ui.button("▶ Play export").on_hover_text("Play the export range with the fades from the export settings").clicked() {
                     self.play_export();
                 }
             });
@@ -420,20 +424,34 @@ impl Editor {
 
     fn output_panel(&mut self, ctx: &egui::Context) {
         let output = self.sequence.output;
+        let settings = self.sequence.settings;
         let outline = output.outline();
         let size = self.frame_size();
         // Between clips there is nothing in the output.
         let texture = self.texture.as_ref().filter(|_| self.sequence.clip_at(self.shown_time()).is_some());
         egui::SidePanel::right("output").resizable(true).default_width(380.0).min_width(280.0).show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                let t = &mut self.sequence.clip_mut(self.selected).transform;
                 ui.add_space(6.0);
-                ui.heading("Output");
+                let can_save_frame = self.sequence.clip_at(self.position).is_some() && !self.export.is_busy();
+                ui.horizontal(|ui| {
+                    ui.heading("Output");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(self.export.button_text()).clicked() {
+                            self.export.open();
+                        }
+                        let hint = "Save the picture at the playhead as a PNG, in the output's size";
+                        let save_frame = ui.add_enabled(can_save_frame, egui::Button::new("Save frame…"));
+                        if save_frame.on_hover_text(hint).clicked() {
+                            self.export.save_frame(ctx, &self.sequence, &self.cache.source, &self.cache.info, self.position);
+                        }
+                    });
+                });
+                let t = &mut self.sequence.clip_mut(self.selected).transform;
                 let [box_w, box_h] = outline.fit(ui.available_width() as f64, OUTPUT_MAX_HEIGHT);
                 let box_size = egui::vec2(box_w as f32, box_h as f32);
                 ui.vertical_centered(|ui| {
                     self.output_view.show(ui, texture, size, outline, t, box_size);
-                    let [px_w, px_h] = output.pixels();
+                    let [px_w, px_h] = settings.pixels(output);
                     let caption = format!("{} · {} · {px_w}×{px_h}", output.preset().name, output.ratio().label());
                     ui.label(RichText::new(caption).weak());
                 });
@@ -453,7 +471,7 @@ impl Editor {
                     }
                     ui.end_row();
                     ui.label("Zoom");
-                    ui.add(egui::DragValue::new(&mut t.zoom).speed(0.01).range(1.0..=geometry::MAX_ZOOM).fixed_decimals(2).prefix("×"));
+                    ui.add(egui::DragValue::new(&mut t.zoom).speed(0.01).range(geometry::MIN_ZOOM_WITH_BARS..=geometry::MAX_ZOOM).fixed_decimals(2).prefix("×"));
                     ui.end_row();
                     ui.label("Angle");
                     ui.add(egui::DragValue::new(&mut t.angle_deg).speed(0.2).fixed_decimals(1).suffix("°"));
@@ -487,13 +505,29 @@ impl Editor {
                     RichText::new(
                         "Drag inside the frame to move it (Alt: no snapping). Drag a side to resize it \
                          (Ctrl: the opposite side stays); with the lock open that changes the proportions \
-                         (Shift: the opposite of the lock). Drag an arrow to rotate it (Shift: 15° steps); \
-                         click the mark at its top for 0°. Wheel to zoom.",
+                         (Shift: the opposite of the lock). Drag an arrow to rotate it (Shift: 15° steps). \
+                         Rest on the mark at its top for Fit, Fill, Bars and Reset; click it for 0°. Wheel to zoom.",
                     )
                     .weak()
                     .small(),
                 );
                 ui.separator();
+
+                if self.cache.info.has_audio {
+                    ui.heading("Sound");
+                    let clip = self.sequence.clip_mut(self.selected);
+                    ui.horizontal(|ui| {
+                        let mut percent = clip.volume * 100.0;
+                        ui.label("Volume");
+                        if ui.add(egui::Slider::new(&mut percent, 0.0..=200.0).fixed_decimals(0).suffix(" %")).changed() {
+                            clip.volume = percent / 100.0;
+                        }
+                        if ui.add(egui::Button::new("Mute").selected(clip.muted)).clicked() {
+                            clip.muted = !clip.muted;
+                        }
+                    });
+                    ui.separator();
+                }
 
                 ui.heading("Source");
                 let info = &self.cache.info;

@@ -3,6 +3,7 @@
 //! All times here are timeline seconds unless a name says `source`. The timeline starts at 0;
 //! a clip plays its source from `source_in` to `source_out`, starting at `start`.
 
+use crate::core::export::ExportSettings;
 use crate::core::preset::Output;
 use crate::media::geometry::Transform;
 use serde::{Deserialize, Serialize};
@@ -72,6 +73,15 @@ pub struct Clip {
     pub source_out: f64,
     pub source_duration: f64,
     pub transform: Transform,
+    /// Sound level: 1 leaves it as it is.
+    #[serde(default = "full_volume")]
+    pub volume: f64,
+    #[serde(default)]
+    pub muted: bool,
+}
+
+fn full_volume() -> f64 {
+    1.0
 }
 
 impl Clip {
@@ -84,6 +94,17 @@ impl Clip {
             source_out: source_duration,
             source_duration,
             transform: Transform::default(),
+            volume: full_volume(),
+            muted: false,
+        }
+    }
+
+    /// What the clip's sound is multiplied by.
+    pub fn gain(&self) -> f64 {
+        if self.muted {
+            0.0
+        } else {
+            self.volume
         }
     }
 
@@ -164,13 +185,15 @@ pub struct Sequence {
     pub export: Span,
     /// The format of the output.
     pub output: Output,
+    /// How the output is encoded.
+    pub settings: ExportSettings,
 }
 
 impl Sequence {
     /// One track with one clip; everything of it is exported.
     pub fn new(clip: Clip) -> Self {
         let export = clip.span();
-        Self { tracks: vec![Track { clips: vec![clip] }], export, output: Output::default() }
+        Self { tracks: vec![Track { clips: vec![clip] }], export, output: Output::default(), settings: ExportSettings::default() }
     }
 
     pub fn clip(&self, id: ClipId) -> &Clip {

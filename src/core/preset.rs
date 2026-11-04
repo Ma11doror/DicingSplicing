@@ -87,21 +87,18 @@ pub struct Preset {
     /// For `Custom` only the starting value: the current one is in `Output`.
     pub ratio: Ratio,
     pub mask: Mask,
-    /// Long side of the output in pixels.
+    /// Long side of the output in pixels, unless the export settings say otherwise.
     pub long_side: u32,
-    pub audio_fade_in: f64,
-    pub audio_fade_out: f64,
     /// The frame's color on the source view.
     pub color: [u8; 3],
     pub safe: Option<SafeZone>,
 }
 
 const fn rect(id: PresetId, name: &'static str, ratio: Ratio, long_side: u32, color: [u8; 3]) -> Preset {
-    Preset { id, name, ratio, mask: Mask::Rect, long_side, audio_fade_in: 0.0, audio_fade_out: 0.0, color, safe: None }
+    Preset { id, name, ratio, mask: Mask::Rect, long_side, color, safe: None }
 }
 
-/// Values for the circle from tgCircleGen: 400 px, 1 s audio fades. The 10–60 s length limit belongs
-/// to the Telegram export settings, not to the editor.
+/// The circle is 400 px, as in tgCircleGen. It is saved as a square: Telegram shows it as a circle.
 ///
 /// The vertical safe zone is approximate: the apps change their interface and guides disagree on the
 /// numbers, so it only shows roughly where captions and buttons go.
@@ -112,8 +109,6 @@ pub const PRESETS: [Preset; 10] = [
         ratio: Ratio::new(1.0, 1.0),
         mask: Mask::Circle,
         long_side: 400,
-        audio_fade_in: 1.0,
-        audio_fade_out: 1.0,
         color: [255, 255, 255],
         safe: None,
     },
