@@ -109,6 +109,34 @@ mod tests {
     }
 
     #[test]
+    fn a_step_brings_back_the_clip_and_the_export_range_together() {
+        use crate::core::edit::{Clip, ClipId, Sequence};
+        let id = ClipId { track: 0, index: 0 };
+        let first = Sequence::new(Clip::new("a".into(), 30.0));
+        let mut history = History::new(first.clone());
+        let mut state = first.clone();
+
+        // The trim takes the export range along, the move leaves it.
+        state.trim_end(id, 8.0, 0.1);
+        history.track(&state, 0.0, false);
+        history.track(&state, 1.0, false);
+        let trimmed = state.clone();
+        state.move_clip(id, -4.0);
+        history.track(&state, 2.0, false);
+        history.track(&state, 3.0, false);
+        let moved = state.clone();
+
+        assert!(history.undo(&mut state));
+        assert_eq!(state, trimmed);
+        assert!(history.undo(&mut state));
+        assert_eq!(state, first);
+        assert!(state.export_fits());
+        assert!(history.redo(&mut state));
+        assert!(history.redo(&mut state));
+        assert_eq!(state, moved);
+    }
+
+    #[test]
     fn a_quick_series_of_changes_is_one_step() {
         let mut history = History::new(0);
         for (i, now) in [0.0, 0.1, 0.2, 0.3].into_iter().enumerate() {

@@ -247,6 +247,22 @@ mod tests {
     }
 
     #[test]
+    fn time_before_the_zero_of_the_timeline_plays_like_any_other() {
+        // A clip moved to -5..5 s, playing its source from 2 s on.
+        let sound = Segment { start: -5.0, end: 5.0, source_start: 2.0, gain: 1.0 };
+        assert_eq!(sound.source_time(-5.0), Some(2.0));
+        assert_eq!(sound.source_time(0.0), Some(7.0));
+        assert_eq!(sound.source_time(-5.1), None);
+
+        let range = PlayRange { start: -8.0, end: -2.0, looping: true, fades: Some((1.0, 2.0)), sound };
+        assert_eq!(range.gain(-8.0), 0.0);
+        assert_eq!(range.gain(-7.5), 0.5);
+        assert_eq!(range.gain(-3.0), 0.5);
+        assert_eq!(range.advance(-4.0, 1.0), Some(-3.0));
+        assert_eq!(range.advance(-4.0, 3.0), Some(-7.0));
+    }
+
+    #[test]
     fn interpolates_between_frames() {
         let pcm = [0, 0, 16384, -16384];
         assert_eq!(sample_at(&pcm, 0.5), (0.25, -0.25));

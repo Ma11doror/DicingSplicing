@@ -124,6 +124,13 @@ fn frame_rate_value(settings: &ExportSettings, info: &MediaInfo) -> String {
     }
 }
 
+fn frame_rate_number(settings: &ExportSettings, info: &MediaInfo) -> f64 {
+    match settings.frame_rate {
+        FrameRate::Source => info.fps.as_f64(),
+        FrameRate::Fixed(fps) => fps,
+    }
+}
+
 fn video_args(settings: &ExportSettings) -> Vec<String> {
     let codec = settings.video_codec;
     let mut args = vec!["-c:v".to_owned(), codec.encoder().to_owned()];
@@ -194,10 +201,19 @@ pub fn plan(source: &Path, info: &MediaInfo, sequence: &Sequence, output: &Path)
             args.push(source.into());
             let (from, to) = (start - seek, end - seek);
 
+            // One clock for picture and sound: the source's moment `from` lands on the file's moment
+            // `lead`. Counting each stream from its own first frame instead would put the picture ahead
+            // of the sound, by as much as that frame is after `from` or after the sound's start.
+            //
+            // Black comes in whole frames, the picture takes up the rest of the lead. Frames before the
+            // start stay until `fps`, which needs them to know what is on screen at that moment.
             let frame = frame_filter(w, h, &transform, sequence.output.outline(), pixels);
-            let mut video = format!("[0:V:0]trim=start={from:.6}:end={to:.6},setpts=PTS-STARTPTS,fps={fps},{frame}");
-            if time.lead > 0.0 || time.tail > 0.0 {
-                video += &format!(",tpad=start_duration={:.6}:stop_duration={:.6}:color=black", time.lead, time.tail);
+            let rate = frame_rate_number(settings, info);
+            let black = (time.lead * rate).round();
+            let shift = time.lead - black / rate - from;
+            let mut video = format!("[0:V:0]trim=end={to:.6},setpts=PTS{shift:+.6}/TB,fps={fps}:start_time=0,{frame}");
+            if black > 0.0 || time.tail > 0.0 {
+                video += &format!(",tpad=start={black}:stop_duration={:.6}:color=black", time.tail);
             }
             graph.push(video + ",format=yuv420p[v]");
             if has_sound {
@@ -205,7 +221,7 @@ pub fn plan(source: &Path, info: &MediaInfo, sequence: &Sequence, output: &Path)
                 // leave a hole in the stream instead of silence. The filling also evens out gaps in
                 // the source's own sound, so that it stays in sync with the picture.
                 let sound = format!(
-                    "[0:a:0]atrim=start={from:.6}:end={to:.6},asetpts=PTS-STARTPTS+{:.6}/TB,aresample=async=1:first_pts=0,\
+                    "[0:a:0]atrim=start={from:.6}:end={to:.6},asetpts=PTS-{from:.6}/TB+{:.6}/TB,aresample=async=1:first_pts=0,\
                      volume={gain:.4},apad=whole_dur={:.6},atrim=end={:.6}",
                     time.lead, time.total, time.total
                 );
@@ -642,6 +658,26 @@ mod tests {
     }
 
     #[test]
+    fn timing_goes_by_where_the_clip_stands() {
+        let id = crate::core::edit::ClipId { track: 0, index: 0 };
+        let mut s = sequence(10.0);
+        s.move_clip(id, -3.0);
+
+        // The range starts before the clip and ends inside it.
+        s.export = Span { start: -5.0, end: 2.0 };
+        assert_eq!(timing(&s), Timing { total: 7.0, lead: 2.0, tail: 0.0, source: Some((0.0, 5.0)) });
+
+        // The range starts inside the clip and ends after it.
+        s.export = Span { start: -1.0, end: 12.0 };
+        assert_eq!(timing(&s), Timing { total: 13.0, lead: 0.0, tail: 5.0, source: Some((2.0, 10.0)) });
+
+        // The clip is out of the range: all black, and the warning says so.
+        s.export = Span { start: 20.0, end: 25.0 };
+        assert_eq!(timing(&s), Timing { total: 5.0, lead: 5.0, tail: 0.0, source: None });
+        assert!(warnings(&s, &info(10.0)).iter().any(|w| w.contains("all black")));
+    }
+
+    #[test]
     fn every_format_gets_the_right_arguments() {
         let text = |settings: ExportSettings| -> String { video_args(&settings).join(" ") };
         let telegram = text(ExportSettings::default());
@@ -790,6 +826,139 @@ mod tests {
             .unwrap();
         let seconds = decoded.stdout.len() as f64 / 2.0 / 48000.0;
         assert!((seconds - 4.0).abs() < 0.1, "{seconds} s of samples");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A clip dragged along the timeline, even to before its zero: the file goes by where it stands.
+    #[test]
+    fn a_moved_clip_has_black_around_it_and_plays_the_same_picture() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let dir = temp_dir("moved");
+        let source = make_source(&dir, 6);
+        let id = crate::core::edit::ClipId { track: 0, index: 0 };
+        let mut s = sequence(6.0);
+        // Source 2..4 s, then moved to -3..-1 s, with 1 s of black on each side in the file.
+        s.trim_start(id, 2.0, 0.1);
+        s.trim_end(id, 4.0, 0.1);
+        s.move_clip(id, -3.0);
+        s.export = Span { start: -4.0, end: 0.0 };
+        s.settings.fades = (0.0, 0.0);
+        s.settings.size = OutputSize::LongSide(W);
+        s.settings.rate = Rate::Quality(10);
+        s.settings.frame_rate = FrameRate::Source;
+        s.settings.speed = Speed::Veryfast;
+        s.output = Output { preset: PresetId::Landscape, ..Output::default() };
+
+        let path = render(&source, &info(6.0), &s, &dir.join("moved.mp4"));
+        let result = probe::probe(&path).unwrap();
+        assert!((result.duration - 4.0).abs() < 0.1, "duration {}", result.duration);
+
+        assert!(mean_level(&rgb_at(&path, 0.5, W, H)) < 25.0, "the start should be black");
+        assert!(mean_level(&rgb_at(&path, 3.5, W, H)) < 25.0, "the end should be black");
+
+        // One second into the clip is second 3 of the source, not second 1 or 2.
+        let out = rgb_at(&path, 2.0, W, H);
+        let right = mean_difference(&out, &rgb_at(&source, 3.0, W, H));
+        let earlier = mean_difference(&out, &rgb_at(&source, 2.5, W, H));
+        assert!(right < 8.0, "differs by {right:.1} from the right moment");
+        assert!(right * 1.5 < earlier, "right {right:.1}, 0.5 s earlier {earlier:.1}");
+
+        let rms = |from: f64, to: f64| sound_level(&path, from, to);
+        assert!(rms(0.2, 0.8) < 5.0, "silence before the clip: {}", rms(0.2, 0.8));
+        assert!(rms(3.2, 3.8) < 5.0, "silence after the clip: {}", rms(3.2, 3.8));
+        assert!(rms(1.2, 2.8) > 100.0, "sound in the clip: {}", rms(1.2, 2.8));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A source where a white frame and a short beep happen together every two seconds, encoded like
+    /// a usual file. `video_late` starts its picture that much after its sound.
+    fn make_marked_source(dir: &Path, name: &str, rate: &str, every: u32, period: f64, video_late: f64) -> PathBuf {
+        let path = dir.join(name);
+        let picture = format!("color=c=black:s={W}x{H}:r={rate}:d=20,drawbox=enable='eq(mod(n\\,{every})\\,0)':color=white:t=fill,format=yuv420p");
+        let sound = format!("aevalsrc='if(lt(mod(t\\,{period:.9})\\,0.01)\\,0.9*sin(2*PI*1000*t)\\,0)':s=48000:d=20");
+        let late = video_late.to_string();
+        let mut args = Vec::new();
+        if video_late > 0.0 {
+            args.extend(["-itsoffset", &late]);
+        }
+        args.extend(["-f", "lavfi", "-i", &picture, "-f", "lavfi", "-i", &sound]);
+        args.extend(["-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "12", "-c:a", "aac", "-b:a", "256k"]);
+        args.push(path.to_str().unwrap());
+        ffmpeg(&args);
+        path
+    }
+
+    /// In a rendered file: the seconds of each white frame minus the seconds of its beep. Negative
+    /// means the picture comes first, so the sound lags.
+    fn picture_minus_sound(path: &Path, fps: f64) -> Vec<f64> {
+        let decode = |args: &[&str]| tools::command(tools::FFMPEG).args(["-v", "error", "-i"]).arg(path).args(args).output().unwrap().stdout;
+        let picture = decode(&["-vf", "scale=16:16:flags=area,format=gray", "-fps_mode", "passthrough", "-f", "rawvideo", "pipe:1"]);
+        let levels: Vec<f64> = picture.chunks_exact(256).map(|frame| frame.iter().map(|v| *v as f64).sum::<f64>() / 256.0).collect();
+        let flashes: Vec<f64> = (0..levels.len()).filter(|&i| levels[i] > 128.0 && (i == 0 || levels[i - 1] <= 128.0)).map(|i| i as f64 / fps).collect();
+
+        let sound = decode(&["-map", "0:a:0", "-ac", "1", "-ar", "48000", "-f", "s16le", "pipe:1"]);
+        let samples: Vec<f64> = sound.chunks_exact(2).map(|b| (i16::from_le_bytes([b[0], b[1]]) as f64).abs()).collect();
+        let loudest = samples.iter().cloned().fold(0.0, f64::max);
+        let mut beeps: Vec<f64> = Vec::new();
+        for (i, level) in samples.iter().enumerate() {
+            let t = i as f64 / 48000.0;
+            if *level > 0.4 * loudest && beeps.last().is_none_or(|last| t - last > 0.25) {
+                beeps.push(t);
+            }
+        }
+        assert!(!flashes.is_empty() && !beeps.is_empty(), "flashes {flashes:?}, beeps {beeps:?}");
+        flashes.iter().map(|flash| beeps.iter().map(|beep| flash - beep).fold(f64::MAX, |a, b| if b.abs() < a.abs() { b } else { a })).collect()
+    }
+
+    /// Picture and sound go by one clock, wherever the export starts. A frame falls on the output's
+    /// frame grid, so half a frame is what can't be avoided.
+    #[test]
+    fn picture_and_sound_stay_together() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let dir = temp_dir("sync");
+        let id = crate::core::edit::ClipId { track: 0, index: 0 };
+        let fps = 30.0;
+        let half_frame = 0.5 / fps + 0.003;
+        let render_marked = |source: &Path, name: &str, duration: f64, start: f64, lead: f64| -> Vec<f64> {
+            let mut s = sequence(duration);
+            s.trim_start(id, start, 0.1);
+            s.export = Span { start: start - lead, end: start + 10.0 };
+            s.settings.fades = (0.0, 0.0);
+            s.settings.size = OutputSize::LongSide(W);
+            s.settings.rate = Rate::Quality(12);
+            s.settings.speed = Speed::Ultrafast;
+            s.settings.frame_rate = FrameRate::Fixed(fps);
+            s.output = Output { preset: PresetId::Landscape, ..Output::default() };
+            let i = probe::probe(source).unwrap();
+            picture_minus_sound(&render(source, &i, &s, &dir.join(name)), fps)
+        };
+
+        let thirty = make_marked_source(&dir, "30.mp4", "30", 60, 2.0, 0.0);
+        let ntsc = make_marked_source(&dir, "2997.mp4", "30000/1001", 60, 2.002, 0.0);
+        let pal = make_marked_source(&dir, "25.mp4", "25", 50, 2.0, 0.0);
+        for (source, label) in [(&thirty, "30"), (&ntsc, "29.97"), (&pal, "25")] {
+            // A start on a frame, between frames, right before a frame; with black before the clip too.
+            for (start, lead) in [(0.0, 0.0), (5.217, 0.0), (5.235, 0.0), (0.0, 1.2345), (5.217, 1.2345), (5.235, 0.7)] {
+                let name = format!("{label}_{start}_{lead}.mp4");
+                for error in render_marked(source, &name, 20.0, start, lead) {
+                    assert!(error.abs() <= half_frame, "{label} fps, from {start}, lead {lead}: picture minus sound {:.1} ms", error * 1000.0);
+                }
+            }
+        }
+
+        // A picture that starts after the sound stays as far after it as it is in the file. Moving it
+        // to the sound's start would make the sound lag by all of that.
+        // The first mark says nothing: until the picture starts, its first frame is held on screen.
+        let late = make_marked_source(&dir, "late.mp4", "30", 60, 2.0, 0.4);
+        let errors = render_marked(&late, "late_out.mp4", 20.0, 0.0, 0.0);
+        assert!(errors.len() >= 4, "{errors:?}");
+        for error in errors.into_iter().skip(1) {
+            assert!((error - 0.4).abs() <= half_frame, "picture minus sound {:.1} ms, should stay 400", error * 1000.0);
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

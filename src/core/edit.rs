@@ -1,26 +1,22 @@
 //! The edit: clips of sources placed on tracks, and the range of the timeline that is exported.
 //!
-//! All times here are timeline seconds unless a name says `source`. The timeline starts at 0;
-//! a clip plays its source from `source_in` to `source_out`, starting at `start`.
+//! All times here are timeline seconds unless a name says `source`. They can be negative: the
+//! user sees time counted from the export start, so the timeline's own zero means nothing to them.
+//! A clip plays its source from `source_in` to `source_out`, starting at `start`.
 
 use crate::core::export::ExportSettings;
 use crate::core::preset::Output;
 use crate::media::geometry::Transform;
 use serde::{Deserialize, Serialize};
 
+/// Closer than this, two times are the same one: a saved file may not bring back the last digit.
+const SAME_TIME: f64 = 1e-6;
+
 /// A time range, start inclusive, end exclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Span {
     pub start: f64,
     pub end: f64,
-}
-
-/// Where the edges of a span may go: within `lo..=hi`, at least `min_len` apart.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Bounds {
-    pub lo: f64,
-    pub hi: f64,
-    pub min_len: f64,
 }
 
 impl Span {
@@ -32,33 +28,37 @@ impl Span {
         t >= self.start && t < self.end
     }
 
+    /// From the start of the earlier span to the end of the later one.
+    pub fn union(self, other: Span) -> Span {
+        Span { start: self.start.min(other.start), end: self.end.max(other.end) }
+    }
+
     /// Drags the start edge; the end stays.
-    pub fn resize_start(&mut self, t: f64, b: Bounds) {
-        self.start = clamp(t, b.lo, self.end - b.min_len);
+    pub fn resize_start(&mut self, t: f64, min_len: f64) {
+        self.start = t.min(self.end - min_len);
     }
 
     /// Drags the end edge; the start stays.
-    pub fn resize_end(&mut self, t: f64, b: Bounds) {
-        self.end = clamp(t, self.start + b.min_len, b.hi);
+    pub fn resize_end(&mut self, t: f64, min_len: f64) {
+        self.end = t.max(self.start + min_len);
     }
 
     /// Puts the start at `t`; the end follows only if it would be too close.
-    pub fn set_start(&mut self, t: f64, b: Bounds) {
-        self.start = clamp(t, b.lo, b.hi - b.min_len);
-        self.end = clamp(self.end, self.start + b.min_len, b.hi);
+    pub fn set_start(&mut self, t: f64, min_len: f64) {
+        self.start = t;
+        self.end = self.end.max(t + min_len);
     }
 
     /// Puts the end at `t`; the start follows only if it would be too close.
-    pub fn set_end(&mut self, t: f64, b: Bounds) {
-        self.end = clamp(t, b.lo + b.min_len, b.hi);
-        self.start = clamp(self.start, b.lo, self.end - b.min_len);
+    pub fn set_end(&mut self, t: f64, min_len: f64) {
+        self.end = t;
+        self.start = self.start.min(t - min_len);
     }
 
     /// Moves the whole span, keeping its length.
-    pub fn move_to(&mut self, start: f64, b: Bounds) {
-        let len = self.len();
-        self.start = clamp(start, b.lo, b.hi - len);
-        self.end = self.start + len;
+    pub fn move_to(&mut self, start: f64) {
+        self.end = start + self.len();
+        self.start = start;
     }
 }
 
@@ -177,14 +177,30 @@ impl Track {
 
     /// Trims a clip's start, up to the end of the clip before it.
     pub fn trim_start(&mut self, index: usize, t: f64, min_len: f64) {
-        let lo = index.checked_sub(1).map_or(0.0, |i| self.clips[i].end());
+        let lo = self.free_before(index);
         self.clips[index].trim_start(t, lo, min_len);
     }
 
     /// Trims a clip's end, up to the start of the clip after it.
     pub fn trim_end(&mut self, index: usize, t: f64, min_len: f64) {
-        let hi = self.clips.get(index + 1).map_or(f64::INFINITY, |c| c.start);
+        let hi = self.free_after(index);
         self.clips[index].trim_end(t, hi, min_len);
+    }
+
+    /// Puts a clip's start at `t`, between its neighbours. What it plays does not change.
+    pub fn move_clip(&mut self, index: usize, t: f64) {
+        let len = self.clips[index].span().len();
+        self.clips[index].start = clamp(t, self.free_before(index), self.free_after(index) - len);
+    }
+
+    /// Where the clip before this one ends.
+    fn free_before(&self, index: usize) -> f64 {
+        index.checked_sub(1).map_or(f64::NEG_INFINITY, |i| self.clips[i].end())
+    }
+
+    /// Where the clip after this one starts.
+    fn free_after(&self, index: usize) -> f64 {
+        self.clips.get(index + 1).map_or(f64::INFINITY, |c| c.start)
     }
 }
 
@@ -234,26 +250,71 @@ impl Sequence {
 
     /// From the start of the first clip to the end of the last one.
     pub fn content(&self) -> Option<Span> {
-        self.clips().map(|(_, c)| c.span()).reduce(|a, b| Span { start: a.start.min(b.start), end: a.end.max(b.end) })
+        self.clips().map(|(_, c)| c.span()).reduce(Span::union)
     }
 
-    /// How far the timeline goes: to the end of the furthest source, trimmed parts included, so
-    /// that every trim can be undone by dragging, or of the export range.
-    pub fn end(&self) -> f64 {
-        self.clips().map(|(_, c)| c.source_span().end).fold(self.export.end, f64::max)
+    /// Where there is anything to see: the export range and all the sources, trimmed parts included,
+    /// so that every trim can be undone by dragging.
+    pub fn reach(&self) -> Span {
+        self.clips().map(|(_, c)| c.source_span()).fold(self.export, Span::union)
     }
 
-    /// Where the export range may go.
-    pub fn export_bounds(&self, min_len: f64) -> Bounds {
-        Bounds { lo: 0.0, hi: self.end(), min_len }
+    /// The parts of the export range that no clip covers: black and silence in the result.
+    pub fn gaps(&self) -> Vec<Span> {
+        let mut spans: Vec<Span> = self.clips().map(|(_, c)| c.span()).collect();
+        spans.sort_by(|a, b| a.start.total_cmp(&b.start));
+        let mut gaps = Vec::new();
+        let mut at = self.export.start;
+        for span in spans {
+            if span.start >= self.export.end {
+                break;
+            }
+            if span.start > at {
+                gaps.push(Span { start: at, end: span.start });
+            }
+            at = at.max(span.end);
+        }
+        if at < self.export.end {
+            gaps.push(Span { start: at, end: self.export.end });
+        }
+        gaps
     }
 
+    /// Whether the export range is exactly what the clips cover.
+    pub fn export_fits(&self) -> bool {
+        let same = |a: f64, b: f64| (a - b).abs() < SAME_TIME;
+        self.content().is_some_and(|c| same(c.start, self.export.start) && same(c.end, self.export.end))
+    }
+
+    /// Makes the export range exactly what the clips cover.
+    pub fn fit_export(&mut self) {
+        if let Some(content) = self.content() {
+            self.export = content;
+        }
+    }
+
+    /// Trims a clip's start. An export range that fitted the clips goes on fitting them, otherwise
+    /// the trim would leave black in the result that nobody asked for.
     pub fn trim_start(&mut self, id: ClipId, t: f64, min_len: f64) {
+        let fitted = self.export_fits();
         self.tracks[id.track].trim_start(id.index, t, min_len);
+        if fitted {
+            self.fit_export();
+        }
     }
 
+    /// Trims a clip's end, see `trim_start`.
     pub fn trim_end(&mut self, id: ClipId, t: f64, min_len: f64) {
+        let fitted = self.export_fits();
         self.tracks[id.track].trim_end(id.index, t, min_len);
+        if fitted {
+            self.fit_export();
+        }
+    }
+
+    /// Puts a clip's start at `t`. The export range stays: this is how a clip gets black around it.
+    pub fn move_clip(&mut self, id: ClipId, t: f64) {
+        self.tracks[id.track].move_clip(id.index, t);
     }
 }
 
@@ -266,7 +327,7 @@ fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
 mod tests {
     use super::*;
 
-    const B: Bounds = Bounds { lo: 0.0, hi: 200.0, min_len: 1.0 };
+    const MIN: f64 = 1.0;
 
     fn span(start: f64, end: f64) -> Span {
         Span { start, end }
@@ -280,38 +341,39 @@ mod tests {
     #[test]
     fn resize_keeps_the_other_edge() {
         let mut s = span(20.0, 50.0);
-        s.resize_start(60.0, B);
+        s.resize_start(60.0, MIN);
         assert_eq!(s, span(49.0, 50.0));
-        s.resize_start(-5.0, B);
-        assert_eq!(s, span(0.0, 50.0));
-        s.resize_end(500.0, B);
-        assert_eq!(s, span(0.0, 200.0));
-        s.resize_end(-3.0, B);
-        assert_eq!(s, span(0.0, 1.0));
+        // Time has no limits on either side.
+        s.resize_start(-5.0, MIN);
+        assert_eq!(s, span(-5.0, 50.0));
+        s.resize_end(500.0, MIN);
+        assert_eq!(s, span(-5.0, 500.0));
+        s.resize_end(-30.0, MIN);
+        assert_eq!(s, span(-5.0, -4.0));
     }
 
     #[test]
     fn set_moves_the_other_edge_only_when_needed() {
         let mut s = span(20.0, 50.0);
-        s.set_start(30.0, B);
+        s.set_start(30.0, MIN);
         assert_eq!(s, span(30.0, 50.0));
-        s.set_start(70.0, B);
+        s.set_start(70.0, MIN);
         assert_eq!(s, span(70.0, 71.0));
-        s.set_end(40.0, B);
+        s.set_end(40.0, MIN);
         assert_eq!(s, span(39.0, 40.0));
-        s.set_end(500.0, B);
-        assert_eq!(s, span(39.0, 200.0));
-        s.set_start(500.0, B);
-        assert_eq!(s, span(199.0, 200.0));
+        s.set_end(500.0, MIN);
+        assert_eq!(s, span(39.0, 500.0));
+        s.set_start(-10.0, MIN);
+        assert_eq!(s, span(-10.0, 500.0));
     }
 
     #[test]
     fn move_keeps_the_length() {
         let mut s = span(20.0, 50.0);
-        s.move_to(180.0, B);
-        assert_eq!(s, span(170.0, 200.0));
-        s.move_to(-3.0, B);
-        assert_eq!(s, span(0.0, 30.0));
+        s.move_to(180.0);
+        assert_eq!(s, span(180.0, 210.0));
+        s.move_to(-3.0);
+        assert_eq!(s, span(-3.0, 27.0));
     }
 
     #[test]
@@ -345,11 +407,11 @@ mod tests {
     }
 
     #[test]
-    fn trimming_stops_at_the_timeline_start_and_at_neighbours() {
-        // Source time 0 would be before the timeline start.
+    fn trimming_stops_at_the_source_and_at_neighbours() {
+        // The source starts 4 s before the zero of the timeline, and that is as far as it goes.
         let mut track = Track { clips: vec![Clip { start: 1.0, source_in: 5.0, ..Clip::new("a".into(), 30.0) }] };
         track.trim_start(0, -10.0, 0.5);
-        assert_eq!((track.clips[0].start, track.clips[0].source_in), (0.0, 4.0));
+        assert_eq!((track.clips[0].start, track.clips[0].source_in), (-4.0, 0.0));
 
         let mut track = Track { clips: vec![Clip::new("a".into(), 10.0), placed_clip()] };
         track.clips[0].source_out = 5.0;
@@ -357,6 +419,133 @@ mod tests {
         assert_eq!(track.clips[0].end(), 10.0);
         track.trim_start(1, 0.0, 0.5);
         assert_eq!(track.clips[1].start, 10.0);
+    }
+
+    #[test]
+    fn moving_a_clip_keeps_what_it_plays() {
+        let mut track = Track { clips: vec![placed_clip()] };
+        for t in [14.0, -25.0, 500.0] {
+            track.move_clip(0, t);
+            let clip = &track.clips[0];
+            assert_eq!((clip.start, clip.source_in, clip.source_out), (t, 2.0, 12.0));
+            assert_eq!(clip.span(), span(t, t + 10.0));
+            assert_eq!(clip.source_span(), span(t - 2.0, t + 28.0));
+            assert_eq!(clip.source_time(t + 1.0), 3.0);
+        }
+    }
+
+    #[test]
+    fn a_clip_does_not_move_onto_its_neighbours() {
+        let neighbours = || Track {
+            clips: vec![
+                Clip { start: 0.0, source_out: 5.0, ..Clip::new("a".into(), 30.0) },
+                Clip { start: 10.0, source_out: 5.0, ..Clip::new("b".into(), 30.0) },
+                Clip { start: 30.0, source_out: 5.0, ..Clip::new("c".into(), 30.0) },
+            ],
+        };
+        let mut track = neighbours();
+        track.move_clip(1, 2.0);
+        assert_eq!(track.clips[1].start, 5.0);
+        track.move_clip(1, 28.0);
+        assert_eq!(track.clips[1].start, 25.0);
+        track.move_clip(1, 12.0);
+        assert_eq!(track.clips[1].start, 12.0);
+
+        // The first and the last one are free on their outer side.
+        track.move_clip(0, -100.0);
+        assert_eq!(track.clips[0].start, -100.0);
+        track.move_clip(2, 900.0);
+        assert_eq!(track.clips[2].start, 900.0);
+    }
+
+    #[test]
+    fn a_trim_takes_a_fitting_export_range_along() {
+        let id = ClipId { track: 0, index: 0 };
+        let mut sequence = Sequence::new(Clip::new("a".into(), 30.0));
+        assert!(sequence.export_fits());
+        sequence.trim_start(id, 3.0, 0.5);
+        sequence.trim_end(id, 8.0, 0.5);
+        assert_eq!(sequence.export, span(3.0, 8.0));
+        assert!(sequence.export_fits());
+
+        // Set by hand, it stays. Back on the edges of the clip, it follows again.
+        sequence.export = span(1.0, 8.0);
+        assert!(!sequence.export_fits());
+        sequence.trim_end(id, 9.0, 0.5);
+        assert_eq!(sequence.export, span(1.0, 8.0));
+        sequence.fit_export();
+        assert_eq!(sequence.export, span(3.0, 9.0));
+        sequence.trim_start(id, 4.0, 0.5);
+        assert_eq!(sequence.export, span(4.0, 9.0));
+    }
+
+    #[test]
+    fn a_move_leaves_the_export_range_where_it_is() {
+        let id = ClipId { track: 0, index: 0 };
+        let mut sequence = Sequence::new(Clip::new("a".into(), 12.0));
+        sequence.move_clip(id, 2.0);
+        assert_eq!(sequence.export, span(0.0, 12.0));
+        assert_eq!(sequence.clip(id).span(), span(2.0, 14.0));
+        assert!(!sequence.export_fits());
+        // And the trim after it does not fit it either: there is black now, and it was asked for.
+        sequence.trim_end(id, 10.0, 0.5);
+        assert_eq!(sequence.export, span(0.0, 12.0));
+    }
+
+    #[test]
+    fn the_export_range_also_fits_clips_of_several_tracks() {
+        let mut sequence = Sequence::new(Clip::new("a".into(), 10.0));
+        sequence.tracks.push(Track { clips: vec![Clip { start: 5.0, source_out: 10.0, ..Clip::new("b".into(), 30.0) }] });
+        assert!(!sequence.export_fits());
+        sequence.fit_export();
+        assert_eq!(sequence.export, span(0.0, 15.0));
+
+        // A trim that does not change the outer edges leaves them where they are.
+        sequence.trim_end(ClipId { track: 0, index: 0 }, 6.0, 0.5);
+        assert_eq!(sequence.export, span(0.0, 15.0));
+        sequence.trim_end(ClipId { track: 1, index: 0 }, 12.0, 0.5);
+        assert_eq!(sequence.export, span(0.0, 12.0));
+    }
+
+    #[test]
+    fn a_saved_time_may_differ_in_the_last_digit() {
+        let mut sequence = Sequence::new(Clip::new("a".into(), 30.0));
+        sequence.export.end += 1e-9;
+        assert!(sequence.export_fits());
+        sequence.export.end += 0.01;
+        assert!(!sequence.export_fits());
+    }
+
+    #[test]
+    fn nothing_to_fit_without_clips() {
+        let mut sequence = Sequence::new(Clip::new("a".into(), 30.0));
+        sequence.tracks.clear();
+        assert!(!sequence.export_fits());
+        sequence.fit_export();
+        assert_eq!(sequence.export, span(0.0, 30.0));
+    }
+
+    #[test]
+    fn finds_the_black_in_the_export_range() {
+        let id = ClipId { track: 0, index: 0 };
+        let mut sequence = Sequence::new(Clip::new("a".into(), 10.0));
+        assert!(sequence.gaps().is_empty());
+
+        sequence.export = span(-2.0, 13.0);
+        assert_eq!(sequence.gaps(), [span(-2.0, 0.0), span(10.0, 13.0)]);
+
+        // Out of the range altogether: all of it is black.
+        sequence.move_clip(id, 20.0);
+        assert_eq!(sequence.gaps(), [span(-2.0, 13.0)]);
+        sequence.move_clip(id, -50.0);
+        assert_eq!(sequence.gaps(), [span(-2.0, 13.0)]);
+
+        // Clips of two tracks cover the range together, whichever is on top.
+        sequence.move_clip(id, -2.0);
+        sequence.tracks.push(Track { clips: vec![Clip { start: 6.0, source_out: 4.0, ..Clip::new("b".into(), 30.0) }] });
+        assert_eq!(sequence.gaps(), [span(10.0, 13.0)]);
+        sequence.move_clip(ClipId { track: 1, index: 0 }, 9.0);
+        assert_eq!(sequence.gaps(), [span(8.0, 9.0)]);
     }
 
     #[test]
@@ -386,10 +575,16 @@ mod tests {
         assert_eq!(sequence.clip_at(30.0), None);
         assert_eq!(sequence.content(), Some(span(0.0, 30.0)));
         // The second clip's source reaches 38 s even though the clip ends at 20 s.
-        assert_eq!(sequence.end(), 38.0);
+        assert_eq!(sequence.reach(), span(0.0, 38.0));
 
         sequence.trim_end(ClipId { track: 0, index: 0 }, 12.0, 0.5);
         assert_eq!(sequence.content(), Some(span(0.0, 20.0)));
         assert_eq!(sequence.clip_at(25.0), None);
+
+        // The reach goes wherever the clips and the export range go.
+        sequence.move_clip(top, -40.0);
+        assert_eq!(sequence.reach().start, -42.0);
+        sequence.export = span(-50.0, 100.0);
+        assert_eq!(sequence.reach(), span(-50.0, 100.0));
     }
 }

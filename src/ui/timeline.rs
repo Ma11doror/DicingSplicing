@@ -1,6 +1,10 @@
 //! The timeline: a ruler and tracks of clips that slide under a fixed playhead in the center.
-//! Dragging scrubs, the wheel zooms. The export range is edited on the ruler, the selected clip
-//! is trimmed by the handles on its edges.
+//! The ruler counts from the export start, so that it shows the time of the resulting file.
+//!
+//! One axis with things on it, and the cursor tells what a drag will do. The tape moves when dragged
+//! by the ruler or an empty place, a clip when dragged by its body. The edges of the selected
+//! clip trim it, the anchors on the ruler move the edges of the export range, the strip between
+//! them moves all of it. The wheel zooms.
 
 use crate::core::edit::{ClipId, Sequence, Span};
 use crate::media::timecode;
@@ -22,6 +26,10 @@ const AUTOSCROLL_ZONE: f32 = 48.0;
 const AUTOSCROLL_SPEED: f32 = 900.0;
 /// Minimum distance between labelled ticks.
 const MAJOR_TICK_SPACING: f64 = 90.0;
+/// The tape goes no further than this much of what is on it stays on the screen.
+const KEEP_IN_SIGHT: f32 = 40.0;
+/// A gap in the export range gets its label when it is this wide.
+const GAP_LABEL_WIDTH: f32 = 64.0;
 
 const PLAYHEAD_COLOR: Color32 = Color32::from_rgb(255, 86, 64);
 const EXPORT_COLOR: Color32 = Color32::from_rgb(64, 150, 240);
@@ -43,6 +51,9 @@ pub struct Timeline {
     press_x: f32,
     /// Where the dragged edge has snapped to.
     snapped: Option<f64>,
+    /// The dragged edge has stopped at a limit and no longer follows the pointer. The tape waits
+    /// for it then, instead of carrying it away from the pointer.
+    stuck: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -53,14 +64,27 @@ enum Drag {
     ExportMove,
     ClipStart(ClipId),
     ClipEnd(ClipId),
+    ClipMove(ClipId),
+}
+
+impl Drag {
+    /// The clip this drag is about.
+    fn clip(self) -> Option<ClipId> {
+        match self {
+            Drag::ClipStart(id) | Drag::ClipEnd(id) | Drag::ClipMove(id) => Some(id),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Default)]
 pub struct TimelineResponse {
     /// The user moved the playhead.
     pub seeked: bool,
-    /// The user grabbed an edge or the export range.
+    /// The user grabbed an edge, a clip or the export range.
     pub edit_started: bool,
+    /// The user pressed on this clip: it becomes the selected one.
+    pub selected: Option<ClipId>,
     /// While an edge is dragged: the time whose frame the preview should show instead of the playhead's.
     pub peek: Option<f64>,
 }
@@ -114,7 +138,7 @@ impl Layout {
 impl Timeline {
     /// `scale` is the pixels per second to start with, if they are known from before.
     pub fn new(scale: Option<f32>) -> Self {
-        Self { pps: scale, drag: None, fling: 0.0, grab: 0.0, press_x: 0.0, snapped: None }
+        Self { pps: scale, drag: None, fling: 0.0, grab: 0.0, press_x: 0.0, snapped: None, stuck: false }
     }
 
     pub fn scale(&self) -> Option<f32> {
@@ -130,7 +154,6 @@ impl Timeline {
         selected: Option<ClipId>,
         fps: f64,
     ) -> TimelineResponse {
-        let end = sequence.end();
         let frame = 1.0 / fps;
         let width = ui.available_width();
         let height = LABEL_HEIGHT + RULER_HEIGHT + TRACK_HEIGHT * sequence.tracks.len().max(1) as f32;
@@ -138,9 +161,9 @@ impl Timeline {
         let layout = Layout::new(rect);
         let mut out = TimelineResponse::default();
 
-        // From "half the bar holds the whole timeline" to "a frame is 60 px wide".
+        // From "half the bar holds everything there is" to "a frame is 60 px wide".
         let max_pps = (fps * 60.0) as f32;
-        let min_pps = (width * 0.5 / end.max(0.1) as f32).min(max_pps);
+        let min_pps = (width * 0.5 / sequence.reach().len().max(0.1) as f32).min(max_pps);
         let mut pps = self.pps.unwrap_or(width / 40.0).clamp(min_pps, max_pps);
         let mut pos = *position;
 
@@ -164,7 +187,9 @@ impl Timeline {
                     self.grab = edge - view(pos).t(p.x);
                     out.edit_started = true;
                 }
+                out.selected = drag.clip();
                 self.press_x = p.x;
+                self.stuck = false;
                 self.drag = Some(drag);
             }
         }
@@ -173,14 +198,16 @@ impl Timeline {
                 pos = start_time - ((p.x - start_x) / pps) as f64;
                 out.seeked = true;
             } else {
-                let speed = autoscroll_speed(p.x, self.press_x, rect.left(), rect.right());
+                let speed = if self.stuck { 0.0 } else { autoscroll_speed(p.x, self.press_x, rect.left(), rect.right()) };
                 if speed != 0.0 {
-                    pos = (pos + (speed * ui.input(|i| i.stable_dt).min(0.1) / pps) as f64).clamp(0.0, end);
+                    pos += (speed * ui.input(|i| i.stable_dt).min(0.1) / pps) as f64;
                     out.seeked = true;
                     ui.ctx().request_repaint();
                 }
                 let snap_range = if ui.input(|i| i.modifiers.alt) { 0.0 } else { (SNAP_DISTANCE / pps) as f64 };
-                self.snapped = edit(sequence, drag, view(pos).t(p.x) + self.grab, pos, snap_range, frame);
+                let wanted = view(pos).t(p.x) + self.grab;
+                self.snapped = edit(sequence, drag, wanted, pos, snap_range, frame);
+                self.stuck = edge_time(sequence, drag).is_some_and(|edge| (edge - wanted).abs() > snap_range + frame);
             }
         }
         if response.drag_stopped() {
@@ -195,8 +222,14 @@ impl Timeline {
         }
         if response.clicked() {
             if let Some(p) = response.interact_pointer_pos() {
-                pos = view(pos).t(p.x);
-                out.seeked = true;
+                // A click on a clip only selects it; anywhere else it goes to that time.
+                match hit(p, &layout, view(pos), sequence, selected).and_then(Drag::clip) {
+                    Some(id) => out.selected = Some(id),
+                    None => {
+                        pos = view(pos).t(p.x);
+                        out.seeked = true;
+                    }
+                }
                 self.fling = 0.0;
             }
         }
@@ -210,7 +243,7 @@ impl Timeline {
             out.seeked = true;
             ui.ctx().request_repaint();
         }
-        let clamped = pos.clamp(0.0, end);
+        let clamped = keep_in_sight(pos, sequence.reach(), width, pps);
         if clamped != pos {
             self.fling = 0.0;
         }
@@ -219,13 +252,7 @@ impl Timeline {
 
         let hovered = response.hover_pos().and_then(|p| hit(p, &layout, view, sequence, selected));
         if response.hover_pos().is_some() {
-            let icon = match self.drag.or(hovered) {
-                Some(Drag::Scrub { .. }) => CursorIcon::Grabbing,
-                Some(Drag::ExportMove) if self.drag.is_some() => CursorIcon::Grabbing,
-                Some(Drag::ExportMove) | None => CursorIcon::Grab,
-                Some(_) => CursorIcon::ResizeHorizontal,
-            };
-            ui.ctx().set_cursor_icon(icon);
+            ui.ctx().set_cursor_icon(cursor(self.drag.or(hovered)));
         }
 
         out.peek = match self.drag {
@@ -262,29 +289,21 @@ impl Timeline {
         painter.rect_filled(body, 3.0, visuals.extreme_bg_color);
         painter.hline(body.x_range(), layout.ruler.bottom(), visuals.widgets.noninteractive.bg_stroke);
 
-        // Before the start and after the end of the timeline.
-        let outside = Color32::from_black_alpha(110);
-        let (x_start, x_end) = (view.x(0.0), view.x(sequence.end()));
-        if x_start > body.left() {
-            painter.rect_filled(Rect::from_x_y_ranges(x_span(body.left(), x_start), body.y_range()), 0.0, outside);
-        }
-        if x_end < body.right() {
-            painter.rect_filled(Rect::from_x_y_ranges(x_span(x_end, body.right()), body.y_range()), 0.0, outside);
-        }
-
-        // Ruler.
+        // Ruler: it counts from the export start, and travels with it.
+        let export = sequence.export;
+        let zero = export.start;
         let (major, minor) = tick_steps(view.pps, fps);
-        let t_from = view.t(body.left()).max(0.0);
-        let t_to = view.t(body.right()).min(sequence.end());
+        let t_from = view.t(body.left()) - zero;
+        let t_to = view.t(body.right()) - zero;
         let ticks_bottom = layout.strip.top();
         for t in ticks(t_from, t_to, minor) {
-            let x = view.x(t);
+            let x = view.x(zero + t);
             painter.line_segment([pos2(x, ticks_bottom - 5.0), pos2(x, ticks_bottom)], Stroke::new(1.0, tick_color));
         }
         for t in ticks(t_from, t_to, major) {
-            let x = view.x(t);
+            let x = view.x(zero + t);
             painter.line_segment([pos2(x, body.top() + 14.0), pos2(x, ticks_bottom)], Stroke::new(1.0, tick_color));
-            let label = if major < 1.0 { timecode::format(t, fps) } else { timecode::format_minutes(t) };
+            let label = if major < 1.0 { timecode::format(t) } else { timecode::format_minutes(t) };
             painter.text(pos2(x + 3.0, body.top() + 2.0), Align2::LEFT_TOP, label, FontId::monospace(10.0), tick_color);
         }
 
@@ -298,7 +317,7 @@ impl Timeline {
                 painter.rect_stroke(ghost, 4.0, Stroke::new(1.0, CLIP_COLOR.gamma_multiply(0.7)));
             }
             painter.rect_filled(block, 4.0, CLIP_COLOR);
-            let text = format!("{}  ·  {}", clip.name, timecode::format(clip.span().len(), fps));
+            let text = format!("{}  ·  {}", clip.name, timecode::format(clip.span().len()));
             let text_x = block.left().max(body.left()) + if is_selected { HANDLE_WIDTH + 6.0 } else { 6.0 };
             painter.with_clip_rect(block.shrink(2.0)).text(
                 pos2(text_x, block.center().y),
@@ -321,14 +340,22 @@ impl Timeline {
             }
         }
 
-        // Everything on the timeline outside the export range is greyed out.
-        let export = sequence.export;
-        let (x_in, x_out) = (view.x(export.start), view.x(export.end));
-        if x_in > x_start {
-            painter.rect_filled(Rect::from_x_y_ranges(x_span(x_start, x_in), body.y_range()), 0.0, OUTSIDE_EXPORT_TINT);
+        // Where the export range has no clip, the file will be black: the bottom row says so.
+        for gap in sequence.gaps() {
+            let (from, to) = (view.x(gap.start).max(body.left()), view.x(gap.end).min(body.right()));
+            if to - from >= GAP_LABEL_WIDTH {
+                let at = pos2((from + to) / 2.0, layout.row(0).center().y);
+                painter.text(at, Align2::CENTER_CENTER, "black", FontId::proportional(12.0), tick_color);
+            }
         }
-        if x_out < x_end {
-            painter.rect_filled(Rect::from_x_y_ranges(x_span(x_out, x_end), body.y_range()), 0.0, OUTSIDE_EXPORT_TINT);
+
+        // Everything outside the export range is greyed out.
+        let (x_in, x_out) = (view.x(export.start), view.x(export.end));
+        if x_in > body.left() {
+            painter.rect_filled(Rect::from_x_y_ranges(x_span(body.left(), x_in), body.y_range()), 0.0, OUTSIDE_EXPORT_TINT);
+        }
+        if x_out < body.right() {
+            painter.rect_filled(Rect::from_x_y_ranges(x_span(x_out, body.right()), body.y_range()), 0.0, OUTSIDE_EXPORT_TINT);
         }
 
         // The export range: a strip with its length, and an anchor at each edge.
@@ -336,7 +363,7 @@ impl Timeline {
         let moving = active == Some(Drag::ExportMove);
         painter.rect_filled(strip, 0.0, EXPORT_COLOR.gamma_multiply(if moving { 1.0 } else { 0.75 }));
         if strip.width() > 90.0 {
-            let length = timecode::format(export.len(), fps);
+            let length = timecode::format(export.len());
             let at = strip.intersect(body).center();
             painter.text(at, Align2::CENTER_CENTER, length, FontId::monospace(10.0), Color32::WHITE);
         }
@@ -364,17 +391,22 @@ impl Timeline {
             pos2(center_x, body.top()),
         ];
         painter.add(Shape::convex_polygon(arrow, PLAYHEAD_COLOR, Stroke::NONE));
-        painter.text(
+        let in_file = export.contains(view.pos);
+        let time = painter.text(
             pos2(center_x, layout.rect.top()),
             Align2::CENTER_TOP,
-            timecode::format(view.pos, fps),
+            timecode::format(view.pos - zero),
             FontId::monospace(13.0),
-            visuals.strong_text_color(),
+            if in_file { visuals.strong_text_color() } else { tick_color },
         );
+        if !in_file {
+            let at = pos2(time.right() + 8.0, time.center().y);
+            painter.text(at, Align2::LEFT_CENTER, "outside the export", FontId::proportional(11.0), tick_color);
+        }
     }
 }
 
-/// What a press at `p` grabs, if not the bar itself.
+/// What a press at `p` grabs, if not the tape itself.
 fn hit(p: Pos2, layout: &Layout, view: View, sequence: &Sequence, selected: Option<ClipId>) -> Option<Drag> {
     if layout.ruler.contains(p) {
         let export = sequence.export;
@@ -386,12 +418,32 @@ fn hit(p: Pos2, layout: &Layout, view: View, sequence: &Sequence, selected: Opti
             None => None,
         };
     }
-    let id = selected?;
-    let block = layout.block(id.track, sequence.clip(id).span(), view);
-    if !block.y_range().contains(p.y) {
-        return None;
+    // Edges only on the selected clip: the others show no handles to grab.
+    if let Some(id) = selected {
+        let block = layout.block(id.track, sequence.clip(id).span(), view);
+        if block.y_range().contains(p.y) {
+            if let Some(start) = nearer_edge(p.x, block.left(), block.right(), HANDLE_WIDTH) {
+                return Some(if start { Drag::ClipStart(id) } else { Drag::ClipEnd(id) });
+            }
+        }
     }
-    nearer_edge(p.x, block.left(), block.right(), HANDLE_WIDTH).map(|start| if start { Drag::ClipStart(id) } else { Drag::ClipEnd(id) })
+    sequence.clips().find(|&(id, clip)| layout.block(id.track, clip.span(), view).contains(p)).map(|(id, _)| Drag::ClipMove(id))
+}
+
+/// What the pointer looks like over `target`: nothing grabbed means the tape.
+fn cursor(target: Option<Drag>) -> CursorIcon {
+    match target {
+        None => CursorIcon::Grab,
+        Some(Drag::Scrub { .. }) => CursorIcon::Grabbing,
+        Some(Drag::ClipMove(_) | Drag::ExportMove) => CursorIcon::Move,
+        Some(Drag::ClipStart(_) | Drag::ClipEnd(_) | Drag::ExportStart | Drag::ExportEnd) => CursorIcon::ResizeHorizontal,
+    }
+}
+
+/// Where the playhead may be so that something of `reach` stays on a bar `width` wide.
+fn keep_in_sight(pos: f64, reach: Span, width: f32, pps: f32) -> f64 {
+    let margin = ((width / 2.0 - KEEP_IN_SIGHT).max(0.0) / pps) as f64;
+    pos.max(reach.start - margin).min(reach.end + margin)
 }
 
 /// Whether `x` grabs the start (true) or the end (false) of a span drawn from `start` to `end`
@@ -408,18 +460,18 @@ fn nearer_edge(x: f32, start: f32, end: f32, width: f32) -> Option<bool> {
     ((x - middle).abs() <= reach + (end - start) / 2.0).then_some(x < middle)
 }
 
-/// The time a drag moves: the dragged edge, or the export start when moving the range.
+/// The time a drag moves: the dragged edge, or the start of what is moved whole.
 fn edge_time(sequence: &Sequence, drag: Drag) -> Option<f64> {
     match drag {
         Drag::Scrub { .. } => None,
         Drag::ExportStart | Drag::ExportMove => Some(sequence.export.start),
         Drag::ExportEnd => Some(sequence.export.end),
-        Drag::ClipStart(id) => Some(sequence.clip(id).start),
+        Drag::ClipStart(id) | Drag::ClipMove(id) => Some(sequence.clip(id).start),
         Drag::ClipEnd(id) => Some(sequence.clip(id).end()),
     }
 }
 
-/// Moves an edge (or the export start, when moving the range) to `t`. Returns the snap target used.
+/// Moves an edge (or the start of what is moved whole) to `t`. Returns the snap target used.
 fn edit(sequence: &mut Sequence, drag: Drag, t: f64, playhead: f64, snap_range: f64, frame: f64) -> Option<f64> {
     let targets = snap_targets(sequence, drag, playhead);
     // Snapped to a target, or else to the nearest frame.
@@ -427,31 +479,31 @@ fn edit(sequence: &mut Sequence, drag: Drag, t: f64, playhead: f64, snap_range: 
         Some(target) => (target, Some(target)),
         None => ((t / frame).round() * frame, None),
     };
-    let bounds = sequence.export_bounds(frame);
+    // Something moved whole may snap by either edge; the nearer target wins.
+    let place_whole = |start: f64, len: f64| {
+        let by_start = snap(start, &targets, snap_range).map(|s| (s, s - start));
+        let by_end = snap(start + len, &targets, snap_range).map(|e| (e, e - len - start));
+        let best = [by_start, by_end].into_iter().flatten().min_by(|a, b| a.1.abs().total_cmp(&b.1.abs()));
+        match best {
+            Some((target, shift)) => (start + shift, Some(target)),
+            None => ((start / frame).round() * frame, None),
+        }
+    };
     match drag {
         Drag::Scrub { .. } => None,
         Drag::ExportStart => {
             let (t, snapped) = place(t);
-            sequence.export.resize_start(t, bounds);
+            sequence.export.resize_start(t, frame);
             snapped
         }
         Drag::ExportEnd => {
             let (t, snapped) = place(t);
-            sequence.export.resize_end(t, bounds);
+            sequence.export.resize_end(t, frame);
             snapped
         }
         Drag::ExportMove => {
-            // Either edge may snap; the nearer target wins.
-            let len = sequence.export.len();
-            let start = t;
-            let by_start = snap(start, &targets, snap_range).map(|s| (s, s - start));
-            let by_end = snap(start + len, &targets, snap_range).map(|e| (e, e - len - start));
-            let best = [by_start, by_end].into_iter().flatten().min_by(|a, b| a.1.abs().total_cmp(&b.1.abs()));
-            let (start, snapped) = match best {
-                Some((target, shift)) => (start + shift, Some(target)),
-                None => ((start / frame).round() * frame, None),
-            };
-            sequence.export.move_to(start, bounds);
+            let (start, snapped) = place_whole(t, sequence.export.len());
+            sequence.export.move_to(start);
             snapped
         }
         Drag::ClipStart(id) => {
@@ -464,26 +516,33 @@ fn edit(sequence: &mut Sequence, drag: Drag, t: f64, playhead: f64, snap_range: 
             sequence.trim_end(id, t, frame);
             snapped
         }
+        Drag::ClipMove(id) => {
+            let (start, snapped) = place_whole(t, sequence.clip(id).span().len());
+            sequence.move_clip(id, start);
+            snapped
+        }
     }
 }
 
-/// Times a dragged edge sticks to: the timeline start, the playhead, clip edges and the export
-/// range, except the edge being dragged.
+/// Times a dragged edge sticks to: the playhead, clip edges and the export range, except what is
+/// being dragged and what moves along with it.
 fn snap_targets(sequence: &Sequence, drag: Drag, playhead: f64) -> Vec<f64> {
-    let mut targets = vec![0.0, playhead];
+    let mut targets = vec![playhead];
     for (id, clip) in sequence.clips() {
-        if drag != Drag::ClipStart(id) {
+        if drag != Drag::ClipStart(id) && drag != Drag::ClipMove(id) {
             targets.push(clip.start);
         }
-        if drag != Drag::ClipEnd(id) {
+        if drag != Drag::ClipEnd(id) && drag != Drag::ClipMove(id) {
             targets.push(clip.end());
         }
     }
+    // An export range that fits the clips goes with the edge that is being trimmed.
+    let fitted = sequence.export_fits();
     let moving = drag == Drag::ExportMove;
-    if !moving && drag != Drag::ExportStart {
+    if !moving && drag != Drag::ExportStart && !(fitted && matches!(drag, Drag::ClipStart(_))) {
         targets.push(sequence.export.start);
     }
-    if !moving && drag != Drag::ExportEnd {
+    if !moving && drag != Drag::ExportEnd && !(fitted && matches!(drag, Drag::ClipEnd(_))) {
         targets.push(sequence.export.end);
     }
     targets
@@ -595,11 +654,141 @@ mod tests {
         assert!((sequence.clip(CLIP).end() - 20.32).abs() < 1e-9);
         // The export end sticks to the trimmed clip end.
         assert_eq!(edit(&mut sequence, Drag::ExportEnd, 20.4, 5.0, 0.1, frame), Some(sequence.clip(CLIP).end()));
-        // Moving the range keeps its length; here its start sticks to the timeline start.
+        // Moving the range keeps its length; here its start sticks to the clip start.
         let len = sequence.export.len();
         assert_eq!(edit(&mut sequence, Drag::ExportMove, 0.05, 30.0, 0.1, frame), Some(0.0));
         assert_eq!(sequence.export.start, 0.0);
         assert!((sequence.export.len() - len).abs() < 1e-9);
+    }
+
+    /// A bar 1000 px wide: 10 px per second, with 40 s at x = 500.
+    fn view() -> View {
+        View { center_x: 500.0, pps: 10.0, pos: 40.0 }
+    }
+
+    fn layout() -> Layout {
+        // Label 26, ruler 32, then one track of 44: clips are drawn from y = 62 to y = 98.
+        Layout::new(Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 102.0)))
+    }
+
+    #[test]
+    fn a_press_grabs_what_the_cursor_is_over() {
+        // A clip from 30 s to 50 s (x = 400..600), the export range from 20 s to 60 s (x = 300..700).
+        let mut sequence = Sequence::new(Clip { start: 30.0, source_out: 20.0, ..Clip::new("a".into(), 60.0) });
+        sequence.export = Span { start: 20.0, end: 60.0 };
+        let (layout, view) = (layout(), view());
+        let at = |x: f32, y: f32, selected| hit(pos2(x, y), &layout, view, &sequence, selected);
+        let (track, ruler, strip) = (80.0, 40.0, 52.0);
+        let selected = Some(CLIP);
+
+        // The clip: its body moves it, its edges trim it, if it is the selected one.
+        assert!(matches!(at(500.0, track, selected), Some(Drag::ClipMove(CLIP))));
+        assert!(matches!(at(405.0, track, selected), Some(Drag::ClipStart(CLIP))));
+        assert!(matches!(at(595.0, track, selected), Some(Drag::ClipEnd(CLIP))));
+        assert!(matches!(at(405.0, track, None), Some(Drag::ClipMove(CLIP))));
+        // Next to the clip there is only the tape, as above and under it.
+        assert!(at(350.0, track, selected).is_none());
+        assert!(at(500.0, 60.0, selected).is_none());
+        assert!(at(500.0, 100.0, selected).is_none());
+        // The ruler: the anchors, the strip between them, and the tape.
+        assert!(matches!(at(304.0, ruler, selected), Some(Drag::ExportStart)));
+        assert!(matches!(at(696.0, ruler, selected), Some(Drag::ExportEnd)));
+        assert!(matches!(at(500.0, strip, selected), Some(Drag::ExportMove)));
+        assert!(at(500.0, ruler, selected).is_none());
+        assert!(at(100.0, strip, selected).is_none());
+    }
+
+    #[test]
+    fn a_clip_is_found_on_its_own_track() {
+        // The upper track holds a clip where the lower one has a gap.
+        let mut sequence = Sequence::new(Clip { start: 30.0, source_out: 5.0, ..Clip::new("a".into(), 60.0) });
+        sequence.tracks.push(crate::core::edit::Track { clips: vec![Clip { start: 38.0, source_out: 5.0, ..Clip::new("b".into(), 60.0) }] });
+        let upper = ClipId { track: 1, index: 0 };
+        let layout = Layout::new(Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 146.0)));
+        let at = |x: f32, y: f32| hit(pos2(x, y), &layout, view(), &sequence, Some(CLIP));
+        // Lower track: y = 106..142, x = 400..450. Upper track: y = 62..98, x = 480..530.
+        assert!(matches!(at(505.0, 80.0), Some(Drag::ClipMove(id)) if id == upper));
+        assert!(at(425.0, 80.0).is_none());
+        assert!(matches!(at(425.0, 124.0), Some(Drag::ClipMove(CLIP))));
+        assert!(matches!(at(405.0, 124.0), Some(Drag::ClipStart(CLIP))));
+        assert!(at(505.0, 124.0).is_none());
+        // Only the selected clip has edges.
+        assert!(matches!(at(485.0, 80.0), Some(Drag::ClipMove(id)) if id == upper));
+    }
+
+    #[test]
+    fn the_cursor_tells_what_a_drag_will_do() {
+        let tape = Drag::Scrub { start_time: 0.0, start_x: 0.0 };
+        assert_eq!(cursor(None), CursorIcon::Grab);
+        assert_eq!(cursor(Some(tape)), CursorIcon::Grabbing);
+        assert_eq!(cursor(Some(Drag::ClipMove(CLIP))), CursorIcon::Move);
+        assert_eq!(cursor(Some(Drag::ExportMove)), CursorIcon::Move);
+        for edge in [Drag::ClipStart(CLIP), Drag::ClipEnd(CLIP), Drag::ExportStart, Drag::ExportEnd] {
+            assert_eq!(cursor(Some(edge)), CursorIcon::ResizeHorizontal);
+        }
+    }
+
+    #[test]
+    fn a_dragged_clip_goes_anywhere_and_snaps_by_either_edge() {
+        let mut sequence = Sequence::new(Clip::new("a".into(), 10.0));
+        let frame = 0.04;
+        sequence.export.end = 25.0;
+        let export = sequence.export;
+
+        // Free on both sides of the timeline's zero. The export range stays where it was.
+        assert_eq!(edit(&mut sequence, Drag::ClipMove(CLIP), -7.0, 100.0, 0.1, frame), None);
+        assert!((sequence.clip(CLIP).start + 7.0).abs() < 1e-9);
+        assert_eq!(edit(&mut sequence, Drag::ClipMove(CLIP), 300.0, 100.0, 0.1, frame), None);
+        assert!((sequence.clip(CLIP).start - 300.0).abs() < 1e-9);
+        assert_eq!(sequence.export, export);
+
+        // By its start, to the export start; by its end, to the export end.
+        assert_eq!(edit(&mut sequence, Drag::ClipMove(CLIP), 0.05, 100.0, 0.1, frame), Some(0.0));
+        assert_eq!(sequence.clip(CLIP).start, 0.0);
+        assert_eq!(edit(&mut sequence, Drag::ClipMove(CLIP), 15.03, 100.0, 0.1, frame), Some(25.0));
+        assert!((sequence.clip(CLIP).end() - 25.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_dragged_thing_does_not_stick_to_itself() {
+        // The clip fits the export range: both edges of each are at the same times.
+        let sequence = Sequence::new(Clip { start: 2.0, source_out: 8.0, ..Clip::new("a".into(), 30.0) });
+        let export = Span { start: 2.0, end: 10.0 };
+        assert_eq!(sequence.export, export);
+        let targets = |drag| snap_targets(&sequence, drag, 100.0);
+        // Moved whole, the clip has only the export range to stick to.
+        assert_eq!(targets(Drag::ClipMove(CLIP)), [100.0, 2.0, 10.0]);
+        // A trimmed edge takes the export edge along, and has the other edges to stick to.
+        assert_eq!(targets(Drag::ClipStart(CLIP)), [100.0, 10.0, 10.0]);
+        assert_eq!(targets(Drag::ClipEnd(CLIP)), [100.0, 2.0, 2.0]);
+        // The same goes for the edges of the range.
+        assert_eq!(targets(Drag::ExportStart), [100.0, 2.0, 10.0, 10.0]);
+        assert_eq!(targets(Drag::ExportMove), [100.0, 2.0, 10.0]);
+    }
+
+    #[test]
+    fn a_slow_trim_of_a_fitting_clip_does_not_jump() {
+        let mut sequence = Sequence::new(Clip::new("a".into(), 30.0));
+        let frame = 0.04;
+        let mut t = 0.0;
+        while t < 1.0 {
+            t += frame;
+            assert_eq!(edit(&mut sequence, Drag::ClipStart(CLIP), t, 100.0, 0.2, frame), None);
+            assert!((sequence.clip(CLIP).start - t).abs() < frame, "at {t}");
+            assert_eq!(sequence.export.start, sequence.clip(CLIP).start);
+        }
+    }
+
+    #[test]
+    fn the_tape_stops_when_only_a_little_of_it_is_left_to_see() {
+        // 1000 px at 10 px per second: 46 s from the center to KEEP_IN_SIGHT of a side.
+        let reach = Span { start: 0.0, end: 12.0 };
+        assert_eq!(keep_in_sight(5.0, reach, 1000.0, 10.0), 5.0);
+        assert_eq!(keep_in_sight(-30.0, reach, 1000.0, 10.0), -30.0);
+        assert_eq!(keep_in_sight(-100.0, reach, 1000.0, 10.0), -46.0);
+        assert_eq!(keep_in_sight(100.0, reach, 1000.0, 10.0), 58.0);
+        // A bar too narrow to keep anything aside: the playhead stays on what there is.
+        assert_eq!(keep_in_sight(100.0, reach, 60.0, 10.0), 12.0);
     }
 
     #[test]

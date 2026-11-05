@@ -1,6 +1,6 @@
 //! The editor: source view, output preview with transform controls, timeline and transport.
 
-use crate::core::edit::{Bounds, Clip, ClipId, Sequence, Span};
+use crate::core::edit::{Clip, ClipId, Sequence, Span};
 use crate::core::history::History;
 use crate::core::plugins::Plugin;
 use crate::core::project::{self, Project, Source, ViewState, RENDERS_FOLDER};
@@ -116,7 +116,7 @@ impl Editor {
             player,
             texture: None,
             requested_frame: None,
-            position: view.playhead.clamp(0.0, sequence.end()),
+            position: view.playhead,
             peek: None,
             playing: false,
             play_mode: PlayMode::Timeline,
@@ -198,7 +198,7 @@ impl Editor {
     pub fn ui(&mut self, ctx: &egui::Context, plugins: &[Plugin], workspace: Option<&Workspace>, settings: &Settings) {
         if self.playing {
             let (t, still_playing) = self.player.poll();
-            self.position = t.clamp(0.0, self.sequence.end());
+            self.position = t;
             self.playing = still_playing;
         }
         if let Some(image) = self.decoder.poll() {
@@ -258,8 +258,9 @@ impl Editor {
         self.sequence.content().unwrap_or(Span { start: 0.0, end: 0.0 })
     }
 
-    fn export_bounds(&self) -> Bounds {
-        self.sequence.export_bounds(self.frame())
+    /// What plain playback goes through: the clips and the black around them in the export range.
+    fn play_span(&self) -> Span {
+        self.content().union(self.sequence.export)
     }
 
     fn frame_size(&self) -> [f64; 2] {
@@ -276,7 +277,10 @@ impl Editor {
         let clip = self.clip();
         let sound = Segment { start: clip.start, end: clip.end(), source_start: clip.source_in, gain: clip.gain() as f32 };
         match mode {
-            PlayMode::Timeline => PlayRange { start: 0.0, end: self.content().end, looping: false, fades: None, sound },
+            PlayMode::Timeline => {
+                let span = self.play_span();
+                PlayRange { start: span.start, end: span.end, looping: false, fades: None, sound }
+            }
             PlayMode::Export => PlayRange {
                 start: self.sequence.export.start,
                 end: self.sequence.export.end,
@@ -289,10 +293,10 @@ impl Editor {
 
     fn play(&mut self) {
         let mode = if self.loop_export { PlayMode::Export } else { PlayMode::Timeline };
-        let content = self.content();
+        let span = self.play_span();
         match mode {
             PlayMode::Export if !self.sequence.export.contains(self.position) => self.position = self.sequence.export.start,
-            PlayMode::Timeline if self.position >= content.end - self.frame() => self.position = content.start,
+            PlayMode::Timeline if self.position >= span.end - self.frame() => self.position = span.start,
             _ => {}
         }
         self.start(mode);
@@ -324,7 +328,7 @@ impl Editor {
 
     fn seek(&mut self, t: f64) {
         self.pause();
-        self.position = t.clamp(0.0, self.sequence.end());
+        self.position = t;
     }
 
     fn step(&mut self, frames: i64) {
@@ -333,13 +337,13 @@ impl Editor {
     }
 
     fn set_export_start(&mut self, t: f64) {
-        let bounds = self.export_bounds();
-        self.sequence.export.set_start(t, bounds);
+        let frame = self.frame();
+        self.sequence.export.set_start(t, frame);
     }
 
     fn set_export_end(&mut self, t: f64) {
-        let bounds = self.export_bounds();
-        self.sequence.export.set_end(t, bounds);
+        let frame = self.frame();
+        self.sequence.export.set_end(t, frame);
     }
 
     fn trim_start(&mut self, t: f64) {
@@ -364,10 +368,9 @@ impl Editor {
         }
     }
 
-    /// The timeline may have got shorter, and what is playing no longer matches the edit.
+    /// What is playing no longer matches the edit.
     fn after_history_step(&mut self) {
         self.pause();
-        self.position = self.position.clamp(0.0, self.sequence.end());
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
@@ -431,21 +434,27 @@ impl Editor {
 
     fn timeline_panel(&mut self, ctx: &egui::Context) {
         let fps = self.fps();
-        let end = self.sequence.end();
+        let frame = self.frame();
         egui::TopBottomPanel::bottom("timeline").show(ctx, |ui| {
             ui.add_space(6.0);
             let response = self.timeline.show(ui, &mut self.position, &mut self.sequence, Some(self.selected), fps);
             if (response.seeked || response.edit_started) && self.playing {
                 self.pause();
             }
+            if let Some(id) = response.selected {
+                self.selected = id;
+            }
             self.peek = response.peek;
             ui.add_space(4.0);
 
+            // Every time shown is time in the file: it counts from the export start.
+            let zero = self.sequence.export.start;
+
             ui.horizontal(|ui| {
-                if ui.button("⏮").on_hover_text("Go to the export start (↑)").clicked() {
+                if ui.button("⏮").on_hover_text("Go to the export start (Up)").clicked() {
                     self.seek(self.sequence.export.start);
                 }
-                if ui.button("⏪").on_hover_text("Previous frame (←, Shift+← for a second)").clicked() {
+                if ui.button("⏪").on_hover_text("Previous frame (Left, Shift+Left for a second)").clicked() {
                     self.step(-1);
                 }
                 let play = if self.playing { "⏸" } else { "▶" };
@@ -453,16 +462,16 @@ impl Editor {
                 if ui.add(play_button).on_hover_text("Play / pause (Space)").clicked() {
                     self.toggle_play();
                 }
-                if ui.button("⏩").on_hover_text("Next frame (→, Shift+→ for a second)").clicked() {
+                if ui.button("⏩").on_hover_text("Next frame (Right, Shift+Right for a second)").clicked() {
                     self.step(1);
                 }
-                if ui.button("⏭").on_hover_text("Go to the export end (↓)").clicked() {
+                if ui.button("⏭").on_hover_text("Go to the export end (Down)").clicked() {
                     self.seek(self.sequence.export.end);
                 }
                 ui.separator();
-                let mut t = self.position;
-                if ui.add(time_value(&mut t, fps, end)).on_hover_text("Playhead").changed() {
-                    self.seek(t);
+                let mut t = self.position - zero;
+                if ui.add(time_value(&mut t, fps)).on_hover_text("Playhead").changed() {
+                    self.seek(zero + t);
                 }
                 ui.separator();
                 let looped = ui
@@ -477,56 +486,60 @@ impl Editor {
             });
 
             let at_playhead = self.frame_start(self.position);
-            egui::Grid::new("ranges").num_columns(9).spacing([8.0, 4.0]).show(ui, |ui| {
+            egui::Grid::new("ranges").num_columns(10).spacing([8.0, 4.0]).show(ui, |ui| {
+                // The export starts at the zero by definition, so In and Out would be 0 and the length.
+                // The columns line up with the row of the clip: the two kinds of Set and the two lengths.
                 let export = self.sequence.export;
-                let bounds = self.export_bounds();
                 ui.label(RichText::new("Export").strong());
-                ui.label("In");
-                let mut start = export.start;
-                if ui.add(time_value(&mut start, fps, end)).changed() {
-                    self.set_export_start(start);
-                }
-                if ui.button("Set (I)").on_hover_text("Start the export at the playhead").clicked() {
+                ui.label("");
+                ui.label("");
+                if ui.button("Set In (I)").on_hover_text("Start the export at the playhead").clicked() {
                     self.set_export_start(at_playhead);
                 }
-                ui.label("Out");
-                let mut out = export.end;
-                if ui.add(time_value(&mut out, fps, end)).changed() {
-                    self.set_export_end(out);
-                }
-                if ui.button("Set (O)").on_hover_text("End the export at the playhead").clicked() {
+                ui.label("");
+                ui.label("");
+                if ui.button("Set Out (O)").on_hover_text("End the export at the playhead").clicked() {
                     self.set_export_end(at_playhead);
                 }
                 ui.label("Length");
                 let mut length = export.len();
-                if ui.add(time_value(&mut length, fps, end)).changed() {
-                    self.sequence.export.resize_end(export.start + length, bounds);
+                if ui.add(time_value(&mut length, fps)).changed() {
+                    self.sequence.export.resize_end(export.start + length, frame);
+                }
+                let fit = ui
+                    .add_enabled(!self.sequence.export_fits(), egui::Button::new("Fit to clips"))
+                    .on_hover_text("Make the export range exactly what the clips cover")
+                    .on_disabled_hover_text("The export range is exactly what the clips cover. Trimming a clip takes it along");
+                if fit.clicked() {
+                    self.sequence.fit_export();
                 }
                 ui.end_row();
 
                 let clip = self.clip().span();
+                let (source_in, source_out) = (self.clip().source_in, self.clip().source_out);
                 ui.label(RichText::new("Clip").strong());
                 ui.label("Start");
-                let mut start = clip.start;
-                if ui.add(time_value(&mut start, fps, end)).changed() {
-                    self.trim_start(start);
+                let mut start = clip.start - zero;
+                if ui.add(time_value(&mut start, fps)).on_hover_text("Where the clip starts in the file. Changing it trims the clip").changed() {
+                    self.trim_start(zero + start);
                 }
                 if ui.button("Set ([)").on_hover_text("Trim the clip's start to the playhead").clicked() {
                     self.trim_start(at_playhead);
                 }
                 ui.label("End");
-                let mut clip_end = clip.end;
-                if ui.add(time_value(&mut clip_end, fps, end)).changed() {
-                    self.trim_end(clip_end);
+                let mut clip_end = clip.end - zero;
+                if ui.add(time_value(&mut clip_end, fps)).on_hover_text("Where the clip ends in the file. Changing it trims the clip").changed() {
+                    self.trim_end(zero + clip_end);
                 }
                 if ui.button("Set (])").on_hover_text("Trim the clip's end to the playhead").clicked() {
                     self.trim_end(at_playhead);
                 }
                 ui.label("Length");
                 let mut length = clip.len();
-                if ui.add(time_value(&mut length, fps, end)).changed() {
+                if ui.add(time_value(&mut length, fps)).changed() {
                     self.trim_end(clip.start + length);
                 }
+                ui.label(RichText::new(format!("from source {} to {}", timecode::format(source_in), timecode::format(source_out))).weak());
                 ui.end_row();
             });
             ui.add_space(6.0);
@@ -666,7 +679,7 @@ impl Editor {
             }
             ui.end_row();
             ui.label("Duration");
-            ui.label(timecode::format(info.duration, preview_fps));
+            ui.label(timecode::format(info.duration));
             ui.end_row();
             ui.label("Audio");
             ui.label(if info.has_audio { "yes" } else { "no" });
@@ -711,11 +724,10 @@ impl Editor {
     }
 }
 
-/// A time field: drag to change, click to type `mm:ss:ff`, `mm:ss` or seconds.
-fn time_value(value: &mut f64, fps: f64, max: f64) -> egui::DragValue<'_> {
+/// A time field: drag to change, click to type `mm:ss.cc`, `mm:ss:ff` or seconds.
+fn time_value(value: &mut f64, fps: f64) -> egui::DragValue<'_> {
     egui::DragValue::new(value)
         .speed(1.0 / fps)
-        .range(0.0..=max)
-        .custom_formatter(move |v, _| timecode::format(v, fps))
+        .custom_formatter(|v, _| timecode::format(v))
         .custom_parser(move |s| timecode::parse(s, fps))
 }

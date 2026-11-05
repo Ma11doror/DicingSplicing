@@ -3,6 +3,7 @@
 use crate::cancel::{hide_window, Cancel};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -19,11 +20,82 @@ const PROGRESS_PREFIX: &str = "SE|";
 const PICTURE_SHARE: f32 = 0.75;
 const SOUND_SHARE: f32 = 0.2;
 
+const PROGRAM_NAME: &str = "yt-dlp";
+const PROGRAM_FILE: &str = if cfg!(windows) { "yt-dlp.exe" } else { "yt-dlp" };
+
 pub struct YtDlp {
-    pub program: String,
+    pub program: PathBuf,
     pub cookies: Option<PathBuf>,
     pub max_height: u32,
     pub ffmpeg: Option<String>,
+}
+
+/// The program to run when the settings don't say which.
+pub fn find_program() -> PathBuf {
+    locate(&|name| std::env::var_os(name))
+}
+
+/// On the PATH it goes by its name, as that is the user's own choice. Otherwise it is looked for
+/// where it usually gets installed: the editor may have been started before the install changed
+/// the PATH, or from somewhere that never saw it. Found nowhere, the name stays, and running it
+/// says that it is missing.
+fn locate(env: &dyn Fn(&str) -> Option<OsString>) -> PathBuf {
+    let on_path = env("PATH").is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(PROGRAM_FILE).is_file()));
+    if on_path {
+        return PathBuf::from(PROGRAM_NAME);
+    }
+    usual_places(env).into_iter().find(|place| place.is_file()).unwrap_or_else(|| PathBuf::from(PROGRAM_NAME))
+}
+
+/// Where the ways of installing it leave the program.
+#[cfg(windows)]
+fn usual_places(env: &dyn Fn(&str) -> Option<OsString>) -> Vec<PathBuf> {
+    let dir = |name: &str| env(name).map(PathBuf::from);
+    let local = dir("LOCALAPPDATA");
+    let program_data = dir("ProgramData");
+    let home = dir("USERPROFILE");
+
+    let mut folders: Vec<PathBuf> = Vec::new();
+    // winget: a link if it could make one, and the package's own folder in any case.
+    let winget = [local.as_ref().map(|d| d.join("Microsoft").join("WinGet")), dir("ProgramFiles").map(|d| d.join("WinGet"))];
+    for root in winget.into_iter().flatten() {
+        folders.push(root.join("Links"));
+        folders.extend(subfolders(&root.join("Packages"), "yt-dlp.yt-dlp"));
+    }
+    // Chocolatey and Scoop, which can be told to live elsewhere.
+    let chocolatey = dir("ChocolateyInstall").or_else(|| program_data.as_ref().map(|d| d.join("chocolatey")));
+    folders.extend(chocolatey.map(|d| d.join("bin")));
+    let scoop = dir("SCOOP").or_else(|| home.as_ref().map(|d| d.join("scoop")));
+    folders.extend(scoop.map(|d| d.join("shims")));
+    folders.extend(program_data.as_ref().map(|d| d.join("scoop").join("shims")));
+    // pip, for all users of a Python and with --user, one folder per version. pipx.
+    if let Some(local) = &local {
+        folders.extend(subfolders(&local.join("Programs").join("Python"), "Python").into_iter().map(|d| d.join("Scripts")));
+    }
+    if let Some(roaming) = dir("APPDATA") {
+        folders.extend(subfolders(&roaming.join("Python"), "Python").into_iter().map(|d| d.join("Scripts")));
+    }
+    folders.extend(home.as_ref().map(|d| d.join(".local").join("bin")));
+
+    folders.into_iter().map(|folder| folder.join(PROGRAM_FILE)).collect()
+}
+
+/// Started from a desktop, a program may not get the PATH of the terminal.
+#[cfg(not(windows))]
+fn usual_places(env: &dyn Fn(&str) -> Option<OsString>) -> Vec<PathBuf> {
+    let home = env("HOME").map(|d| PathBuf::from(d).join(".local").join("bin"));
+    let system = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"].map(PathBuf::from);
+    home.into_iter().chain(system).map(|folder| folder.join(PROGRAM_FILE)).collect()
+}
+
+/// The folders in `dir` whose names start with `prefix`, sorted so that the same one is always found.
+#[cfg(windows)]
+fn subfolders(dir: &Path, prefix: &str) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else { return Vec::new() };
+    let mut found: Vec<PathBuf> =
+        entries.filter_map(Result::ok).filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix)).map(|entry| entry.path()).collect();
+    found.sort();
+    found
 }
 
 /// What a video is, as yt-dlp sees it.
@@ -157,7 +229,8 @@ impl YtDlp {
         let mut command = Command::new(&self.program);
         command.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
         hide_window(&mut command);
-        let mut child = command.spawn().with_context(|| format!("{} was not found: install it, or say where it is in the settings of this plugin", self.program))?;
+        let mut child =
+            command.spawn().with_context(|| format!("{} was not found: install it, or say where it is in the settings of this plugin", self.program.display()))?;
         cancel.started(child.id());
 
         let stderr = child.stderr.take().context("yt-dlp has no error stream")?;
@@ -238,6 +311,106 @@ mod tests {
 
     fn tool() -> YtDlp {
         YtDlp { program: "yt-dlp".into(), cookies: None, max_height: 720, ffmpeg: None }
+    }
+
+    /// An empty folder of its own for one test.
+    fn temp_root(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("simple_editor_link_find_{}_{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Puts a program at `relative` inside `root`, and says where that is.
+    fn install(root: &Path, relative: &str) -> PathBuf {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "x").unwrap();
+        path
+    }
+
+    /// `locate` in a world that has only these variables.
+    fn locate_with(vars: &[(&str, &Path)]) -> PathBuf {
+        locate(&|name| vars.iter().find(|(var, _)| *var == name).map(|(_, value)| value.as_os_str().to_owned()))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn finds_what_each_way_of_installing_leaves() {
+        let cases = [
+            ("LOCALAPPDATA", "Microsoft/WinGet/Links/yt-dlp.exe"),
+            ("LOCALAPPDATA", "Microsoft/WinGet/Packages/yt-dlp.yt-dlp_Microsoft.Winget.Source_8wekyb3d8bbwe/yt-dlp.exe"),
+            ("ProgramFiles", "WinGet/Links/yt-dlp.exe"),
+            ("ProgramFiles", "WinGet/Packages/yt-dlp.yt-dlp_Microsoft.Winget.Source_8wekyb3d8bbwe/yt-dlp.exe"),
+            ("ProgramData", "chocolatey/bin/yt-dlp.exe"),
+            ("ChocolateyInstall", "bin/yt-dlp.exe"),
+            ("USERPROFILE", "scoop/shims/yt-dlp.exe"),
+            ("SCOOP", "shims/yt-dlp.exe"),
+            ("ProgramData", "scoop/shims/yt-dlp.exe"),
+            ("LOCALAPPDATA", "Programs/Python/Python312/Scripts/yt-dlp.exe"),
+            ("APPDATA", "Python/Python313/Scripts/yt-dlp.exe"),
+            ("USERPROFILE", ".local/bin/yt-dlp.exe"),
+        ];
+        for (n, (var, relative)) in cases.into_iter().enumerate() {
+            let root = temp_root(&format!("way{n}"));
+            let path = install(&root, relative);
+            assert_eq!(locate_with(&[(var, &root)]), path, "{var} {relative}");
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn the_path_comes_before_the_usual_places() {
+        let root = temp_root("path");
+        let on_path = root.join("on path");
+        install(&on_path, PROGRAM_FILE);
+        install(&root, "Microsoft/WinGet/Links/yt-dlp.exe");
+        install(&root, ".local/bin/yt-dlp");
+        let found = locate_with(&[("PATH", &on_path), ("LOCALAPPDATA", &root), ("HOME", &root)]);
+        assert_eq!(found, Path::new("yt-dlp"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_path_without_it_does_not_stop_the_search() {
+        let root = temp_root("other_path");
+        let path = install(&root, "Microsoft/WinGet/Links/yt-dlp.exe");
+        let empty = root.join("nothing here");
+        fs::create_dir_all(&empty).unwrap();
+        assert_eq!(locate_with(&[("PATH", &empty), ("LOCALAPPDATA", &root)]), path);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn found_nowhere_it_stays_a_name() {
+        let root = temp_root("nowhere");
+        assert_eq!(locate_with(&[]), Path::new("yt-dlp"));
+        assert_eq!(locate_with(&[("PATH", &root), ("LOCALAPPDATA", &root), ("USERPROFILE", &root)]), Path::new("yt-dlp"));
+
+        // winget's other package, a folder with the program's name: neither of them is the program.
+        install(&root, "Microsoft/WinGet/Packages/yt-dlp.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe/yt-dlp.exe");
+        fs::create_dir_all(root.join("Microsoft/WinGet/Links/yt-dlp.exe")).unwrap();
+        assert_eq!(locate_with(&[("LOCALAPPDATA", &root)]), Path::new("yt-dlp"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_order_of_the_places_is_always_the_same() {
+        let root = temp_root("order");
+        // Of two Pythons, the same one each time.
+        let python = install(&root, "Programs/Python/Python312/Scripts/yt-dlp.exe");
+        install(&root, "Programs/Python/Python313/Scripts/yt-dlp.exe");
+        assert_eq!(locate_with(&[("LOCALAPPDATA", &root)]), python);
+
+        // winget before pip, whichever came first.
+        let winget = install(&root, "Microsoft/WinGet/Packages/yt-dlp.yt-dlp_x/yt-dlp.exe");
+        assert_eq!(locate_with(&[("LOCALAPPDATA", &root)]), winget);
+        let links = install(&root, "Microsoft/WinGet/Links/yt-dlp.exe");
+        assert_eq!(locate_with(&[("LOCALAPPDATA", &root)]), links);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

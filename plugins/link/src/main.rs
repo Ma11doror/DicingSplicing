@@ -32,7 +32,7 @@ const DESCRIPTION: &str = r#"{
   "prompt": "A link to a song or a video",
   "hint": "song.link, YouTube and whatever else yt-dlp understands. A video is downloaded only once.",
   "options": [
-    { "key": "yt_dlp", "label": "yt-dlp", "kind": "file", "hint": "From the PATH" },
+    { "key": "yt_dlp", "label": "yt-dlp", "kind": "file", "hint": "Found automatically" },
     { "key": "cookies", "label": "Cookies file", "kind": "file", "hint": "Only if it fails without them" },
     { "key": "max_height", "label": "Highest quality", "kind": "text", "hint": "1080" }
   ]
@@ -136,7 +136,7 @@ fn fetch(args: &FetchArgs, cancel: &Cancel) -> Result<Marker> {
         None => DEFAULT_MAX_HEIGHT,
     };
     let tool = YtDlp {
-        program: option("yt_dlp").unwrap_or("yt-dlp").to_owned(),
+        program: option("yt_dlp").map_or_else(ytdlp::find_program, PathBuf::from),
         cookies: option("cookies").map(PathBuf::from),
         max_height,
         ffmpeg: std::env::var("SIMPLE_EDITOR_FFMPEG").ok().filter(|path| !path.is_empty() && path != "ffmpeg"),
