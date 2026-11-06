@@ -718,7 +718,7 @@ pub struct OutputView;
 
 impl OutputView {
     /// What the output looks like: the transformed picture under the frame's mask, `box_size` pixels
-    /// large. Dragging moves the picture, the wheel zooms.
+    /// large. Dragging moves the picture, the wheel zooms. Returns whether the user did either.
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -727,9 +727,10 @@ impl OutputView {
         outline: Outline,
         t: &mut Transform,
         box_size: egui::Vec2,
-    ) {
+    ) -> bool {
         let [w, h] = size;
         let (rect, response) = ui.allocate_exact_size(box_size, Sense::drag());
+        let mut touched = response.dragged();
 
         if response.dragged() {
             // The picture follows the pointer, so the sampled area moves the opposite way.
@@ -743,6 +744,7 @@ impl OutputView {
             // Taken from the input so that the panel's scroll area does not scroll as well.
             let scroll = ui.input_mut(|i| std::mem::take(&mut i.smooth_scroll_delta).y);
             t.zoom *= (scroll as f64 * WHEEL_ZOOM_SPEED).exp();
+            touched |= scroll != 0.0;
             ui.ctx().set_cursor_icon(if response.dragged() { CursorIcon::Grabbing } else { CursorIcon::Grab });
         }
         *t = t.clamped(w, h, outline);
@@ -774,6 +776,7 @@ impl OutputView {
                 painter.rect_stroke(rect, 0.0, border);
             }
         }
+        touched
     }
 }
 

@@ -1,7 +1,6 @@
 //! Playback control on top of the audio output. Without an audio device it runs on the system clock.
 
 use crate::media::audio::{AudioOutput, PlayRange};
-use crate::media::cache::Pcm;
 use std::time::Instant;
 
 pub struct Player {
@@ -16,9 +15,15 @@ struct Clock {
     range: PlayRange,
 }
 
+impl Default for Player {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Player {
-    pub fn new(pcm: Pcm) -> Self {
-        match AudioOutput::new(pcm) {
+    pub fn new() -> Self {
+        match AudioOutput::new() {
             Ok(audio) => Self { audio: Some(audio), audio_error: None, clock: None },
             Err(e) => Self { audio: None, audio_error: Some(format!("{e:#}")), clock: None },
         }
@@ -32,11 +37,11 @@ impl Player {
     }
 
     pub fn set_range(&mut self, range: PlayRange) {
+        if let Some(clock) = &mut self.clock {
+            clock.range = range.clone();
+        }
         if let Some(audio) = &self.audio {
             audio.set_range(range);
-        }
-        if let Some(clock) = &mut self.clock {
-            clock.range = range;
         }
     }
 

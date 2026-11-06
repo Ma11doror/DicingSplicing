@@ -5,68 +5,54 @@ use crate::core::project::{self, Project, PROJECT_FILE};
 use crate::core::settings::{self, Settings};
 use crate::core::tools;
 use crate::core::workspace::Workspace;
-use crate::media::cache::{CacheStatus, MediaCache};
+use crate::media::probe;
 use crate::media::Notify;
 use crate::ui::editor::Editor;
 use crate::ui::plugins::SourceWindow;
 use crate::ui::settings::SettingsWindow;
-use crate::ui::start::{self, MissingAction, RecentProject, StartAction};
-use anyhow::{Context, Result};
-use egui::{Color32, RichText};
+use crate::ui::start::{self, RecentProject, StartAction};
+use crate::ui::pick_video;
+use anyhow::Result;
+use egui::Color32;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
 
-const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "mov", "webm", "avi", "m4v"];
 const ERROR: Color32 = Color32::from_rgb(230, 80, 70);
 const TITLE: &str = "Simple Editor";
 
-/// What opening in the background comes to.
+/// A new project, made in the background: its video has to be read first.
 struct Opened {
-    cache: MediaCache,
     project: Project,
     dir: PathBuf,
-}
-
-/// What to open in the background.
-enum OpenJob {
-    Existing { project: Box<Project>, dir: PathBuf, cache_root: PathBuf },
-    New { video: PathBuf, workspace: Workspace, name: Option<String>, meta: BTreeMap<String, String> },
-}
-
-impl OpenJob {
-    fn run(self, notify: Notify) -> Result<Opened> {
-        match self {
-            Self::Existing { project, dir, cache_root } => {
-                let source = project.sources.first().context("the project has no video")?;
-                let cache = MediaCache::open_in(&cache_root, &source.path, notify)?;
-                Ok(Opened { cache, project: *project, dir })
-            }
-            // The project's folder appears only when its video has turned out to open.
-            Self::New { video, workspace, name, meta } => {
-                let video = std::path::absolute(&video).unwrap_or(video);
-                let cache = MediaCache::open_in(&workspace.cache_dir(), &video, notify)?;
-                let name = name.unwrap_or_else(|| video.file_stem().map_or_else(|| "project".to_owned(), |stem| stem.to_string_lossy().into_owned()));
-                let dir = workspace.new_project_dir(&name)?;
-                let mut project = Project::new(name, video, cache.info.duration);
-                if let Some(source) = project.sources.first_mut() {
-                    source.meta = meta;
-                }
-                project.save(&dir)?;
-                Ok(Opened { cache, project, dir })
-            }
-        }
-    }
-}
-
-/// A project whose video has to be found first.
-struct Missing {
-    project: Box<Project>,
-    dir: PathBuf,
     cache_root: PathBuf,
+}
+
+/// A project to make from a video, in the background.
+struct NewProject {
+    video: PathBuf,
+    workspace: Workspace,
+    name: Option<String>,
+    meta: BTreeMap<String, String>,
+}
+
+impl NewProject {
+    /// The project's folder appears only when its video has turned out to open.
+    fn run(self) -> Result<Opened> {
+        let Self { video, workspace, name, meta } = self;
+        let video = std::path::absolute(&video).unwrap_or(video);
+        let info = probe::probe(&video)?;
+        let name = name.unwrap_or_else(|| video.file_stem().map_or_else(|| "project".to_owned(), |stem| stem.to_string_lossy().into_owned()));
+        let dir = workspace.new_project_dir(&name)?;
+        let mut project = Project::new(name, video, info.duration);
+        if let Some(source) = project.sources.first_mut() {
+            source.meta = meta;
+        }
+        project.save(&dir)?;
+        Ok(Opened { project, dir, cache_root: workspace.cache_dir() })
+    }
 }
 
 pub struct EditorApp {
@@ -77,7 +63,6 @@ pub struct EditorApp {
     workspace: Option<Workspace>,
     editor: Option<Editor>,
     opening: Option<(String, Receiver<Result<Opened>>)>,
-    missing: Option<Missing>,
     recent: Vec<RecentProject>,
     /// A video to open as soon as there is a workspace.
     waiting_video: Option<PathBuf>,
@@ -85,6 +70,8 @@ pub struct EditorApp {
     /// The plugins, while they are still being looked for.
     finding_plugins: Option<Receiver<(Vec<Plugin>, Vec<String>)>>,
     source_window: SourceWindow,
+    /// What the plugin's window brings in goes into the open project, not a new one.
+    fetch_into_editor: bool,
     errors: Vec<String>,
 }
 
@@ -128,12 +115,12 @@ impl EditorApp {
             workspace,
             editor: None,
             opening: None,
-            missing: None,
             recent: Vec::new(),
             waiting_video: None,
             plugins: Vec::new(),
             finding_plugins: Some(finding_plugins),
             source_window: SourceWindow::default(),
+            fetch_into_editor: false,
             errors,
         };
         app.refresh_recent();
@@ -148,17 +135,23 @@ impl EditorApp {
         self.recent = self.settings.recent.iter().map(|dir| RecentProject::read(dir)).collect();
     }
 
-    fn start_opening(&mut self, label: String, job: OpenJob, ctx: &egui::Context) {
+    fn start_opening(&mut self, label: String, job: NewProject, ctx: &egui::Context) {
         let (sender, receiver) = mpsc::channel();
         let notify: Notify = {
             let ctx = ctx.clone();
             Arc::new(move || ctx.request_repaint())
         };
         thread::spawn(move || {
-            let _ = sender.send(job.run(notify.clone()));
+            let _ = sender.send(job.run());
             notify();
         });
         self.opening = Some((label, receiver));
+    }
+
+    fn show_project(&mut self, project: Project, dir: PathBuf, cache_root: PathBuf, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{} — {TITLE}", project.name)));
+        self.settings.remember_project(&dir);
+        self.editor = Some(Editor::new(project, dir, cache_root, ctx));
     }
 
     fn close_project(&mut self, ctx: &egui::Context) {
@@ -166,7 +159,6 @@ impl EditorApp {
             editor.flush();
             self.errors.extend(editor.save_error.take());
         }
-        self.missing = None;
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(TITLE.to_owned()));
         self.refresh_recent();
     }
@@ -209,8 +201,8 @@ impl EditorApp {
     fn new_project(&mut self, video: PathBuf, name: Option<String>, meta: BTreeMap<String, String>, ctx: &egui::Context) {
         let Some(workspace) = self.workspace.clone() else { return };
         self.close_project(ctx);
-        let label = name.clone().unwrap_or_else(|| file_name(&video));
-        self.start_opening(label, OpenJob::New { video, workspace, name, meta }, ctx);
+        let label = name.clone().unwrap_or_else(|| project::file_label(&video));
+        self.start_opening(label, NewProject { video, workspace, name, meta }, ctx);
     }
 
     fn poll_plugins(&mut self) {
@@ -240,25 +232,8 @@ impl EditorApp {
             self.errors.push(format!("{} is not in a projects folder. Choose one first.", dir.display()));
             return;
         };
-        let source_exists = project.sources.first().is_some_and(|source| source.path.is_file());
-        let project = Box::new(project);
-        if source_exists {
-            self.start_opening(project.name.clone(), OpenJob::Existing { project, dir, cache_root }, ctx);
-        } else {
-            self.missing = Some(Missing { project, dir, cache_root });
-        }
-    }
-
-    fn locate_missing_video(&mut self, ctx: &egui::Context) {
-        let Some(video) = pick_video() else { return };
-        let Some(Missing { mut project, dir, cache_root }) = self.missing.take() else { return };
-        if let Some(source) = project.sources.first_mut() {
-            source.path = video;
-        }
-        if let Err(error) = project.save(&dir) {
-            self.errors.push(format!("{error:#}"));
-        }
-        self.start_opening(project.name.clone(), OpenJob::Existing { project, dir, cache_root }, ctx);
+        // Its videos are looked at in the editor: one that is not there is marked, not in the way.
+        self.show_project(project, dir, cache_root, ctx);
     }
 
     fn choose_workspace(&mut self, ctx: &egui::Context) {
@@ -292,11 +267,7 @@ impl EditorApp {
         }
         let Some((label, _)) = self.opening.take() else { return };
         match result {
-            Ok(Ok(Opened { cache, project, dir })) => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{} — {TITLE}", project.name)));
-                self.settings.remember_project(&dir);
-                self.editor = Some(Editor::new(cache, project, dir, ctx));
-            }
+            Ok(Ok(Opened { project, dir, cache_root })) => self.show_project(project, dir, cache_root, ctx),
             Ok(Err(error)) => {
                 self.errors.push(format!("Can't open {label}: {error:#}"));
                 self.refresh_recent();
@@ -316,6 +287,7 @@ impl EditorApp {
             StartAction::OpenPlugin(i) => {
                 if let Some(plugin) = self.plugins.get(i) {
                     self.source_window.open(plugin.clone());
+                    self.fetch_into_editor = false;
                 }
             }
             StartAction::OpenProject => {
@@ -341,22 +313,11 @@ impl EditorApp {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if let Some(editor) = &self.editor {
+                if let Some(editor) = &mut self.editor {
                     close = ui.button("◀ Projects").on_hover_text("Close this project. It is saved").clicked();
-                    ui.label(RichText::new(&editor.name).strong()).on_hover_text(editor.cache.source.display().to_string());
-                    match editor.cache.status() {
-                        CacheStatus::Building(progress) => {
-                            let text = format!("Preparing frames {:.0}%", progress * 100.0);
-                            ui.add(egui::ProgressBar::new(progress).desired_width(220.0).text(text));
-                            ctx.request_repaint_after(Duration::from_millis(250));
-                        }
-                        CacheStatus::Failed(error) => {
-                            ui.colored_label(ERROR, format!("Preparing failed: {error}"));
-                        }
-                        CacheStatus::Ready => {}
-                    }
-                    if let Some(error) = &editor.save_error {
-                        ui.colored_label(ERROR, error);
+                    if let Some(plugin) = editor.top_bar(ui, &self.plugins).and_then(|i| self.plugins.get(i)) {
+                        self.source_window.open(plugin.clone());
+                        self.fetch_into_editor = true;
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -412,23 +373,24 @@ impl eframe::App for EditorApp {
             self.choose_workspace(ctx);
         }
         if let Some(fetched) = self.source_window.show(ctx, self.workspace.as_ref(), &self.settings) {
-            self.open_fetched(fetched, ctx);
+            match &mut self.editor {
+                Some(editor) if self.fetch_into_editor => editor.add_source(fetched.path, fetched.name, fetched.meta),
+                _ => self.open_fetched(fetched, ctx),
+            }
         }
 
         if let Some(path) = dropped {
-            self.open_path(path, ctx);
+            // A video dropped on an open project joins its sources; a project opens as it is.
+            let is_project = path.is_dir() || path.file_name().is_some_and(|name| name == PROJECT_FILE);
+            match &mut self.editor {
+                Some(editor) if !is_project => editor.add_source(path, None, BTreeMap::new()),
+                _ => self.open_path(path, ctx),
+            }
         }
         if let Some(editor) = &mut self.editor {
             editor.ui(ctx, &self.plugins, self.workspace.as_ref(), &self.settings);
         } else if let Some((label, _)) = &self.opening {
             start::opening_screen(ctx, label);
-        } else if let Some(missing) = &self.missing {
-            let path = missing.project.sources.first().map_or_else(PathBuf::new, |source| source.path.clone());
-            match start::missing_source_screen(ctx, &missing.project.name, &path) {
-                Some(MissingAction::Locate) => self.locate_missing_video(ctx),
-                Some(MissingAction::Back) => self.close_project(ctx),
-                None => {}
-            }
         } else {
             let action = start::start_screen(ctx, workspace_root.as_deref(), &self.recent, self.waiting_video.as_deref(), &self.plugins);
             if let Some(action) = action {
@@ -444,16 +406,4 @@ impl eframe::App for EditorApp {
         }
         self.save_settings();
     }
-}
-
-fn pick_video() -> Option<PathBuf> {
-    rfd::FileDialog::new()
-        .set_title("Choose a video")
-        .add_filter("Video", VIDEO_EXTENSIONS)
-        .add_filter("All files", &["*"])
-        .pick_file()
-}
-
-fn file_name(path: &Path) -> String {
-    path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned())
 }

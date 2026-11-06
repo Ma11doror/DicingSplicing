@@ -72,6 +72,16 @@ impl<T: Clone + PartialEq> History<T> {
         true
     }
 
+    /// Changes every state it keeps, for a fact that is not an edit: say, a source file turned out
+    /// shorter. Undo then can't bring back what no longer fits.
+    pub fn amend(&mut self, change: impl Fn(&mut T)) {
+        for state in self.undo.iter_mut().chain(&mut self.redo) {
+            change(state);
+        }
+        change(&mut self.saved);
+        change(&mut self.last_seen);
+    }
+
     fn restore(&mut self, state: &mut T) {
         *state = self.saved.clone();
         self.last_seen = self.saved.clone();
@@ -194,6 +204,22 @@ mod tests {
         }
         assert_eq!(undone, LIMIT);
         assert_eq!(state, 5);
+    }
+
+    #[test]
+    fn an_amendment_is_not_a_step_and_reaches_every_step() {
+        let (mut history, mut state, now) = with_steps(&[1, 2]);
+        let add_ten = |value: &mut i32| *value += 10;
+        history.amend(add_ten);
+        add_ten(&mut state);
+        assert!(!history.track(&state, now + 1.0, false));
+        assert!(history.undo(&mut state));
+        assert_eq!(state, 11);
+        assert!(history.undo(&mut state));
+        assert_eq!(state, 10);
+        assert!(history.redo(&mut state));
+        assert!(history.redo(&mut state));
+        assert_eq!(state, 12);
     }
 
     #[test]

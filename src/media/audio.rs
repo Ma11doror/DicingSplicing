@@ -6,17 +6,26 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::OnceLock;
 
 /// What to play: a range of the timeline, optionally looped, with fades at its edges.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Clone, Default)]
 pub struct PlayRange {
     pub start: f64,
     pub end: f64,
     pub looping: bool,
     /// Fade-in and fade-out lengths, when the range is the export range.
     pub fades: Option<(f64, f64)>,
-    /// Where on the timeline the clip's sound is; silence elsewhere.
-    pub sound: Segment,
+    /// The sounds on the timeline: they play together, and where there is none it is silent.
+    pub sounds: Arc<[Sound]>,
+}
+
+/// A clip's sound: where it is on the timeline, and the decoded source it comes from.
+#[derive(Clone)]
+pub struct Sound {
+    pub segment: Segment,
+    pub pcm: Pcm,
 }
 
 /// Timeline `start..end` plays the source from `source_start` on, multiplied by `gain`.
@@ -49,6 +58,20 @@ impl PlayRange {
         gain.clamp(0.0, 1.0) as f32
     }
 
+    /// The sounds at `t` added together, before the fades.
+    pub fn mix(&self, t: f64) -> (f32, f32) {
+        let mut sum = (0.0, 0.0);
+        for sound in self.sounds.iter() {
+            // A source whose sound is still being decoded is silent until it is there.
+            if let (Some(pcm), Some(source)) = (sound.pcm.get(), sound.segment.source_time(t)) {
+                let (left, right) = sample_at(pcm, source * AUDIO_RATE as f64);
+                sum.0 += left * sound.segment.gain;
+                sum.1 += right * sound.segment.gain;
+            }
+        }
+        sum
+    }
+
     /// Position `elapsed` seconds after starting at `from`, or None once playback has run out.
     pub fn advance(&self, from: f64, elapsed: f64) -> Option<f64> {
         let t = from + elapsed;
@@ -63,7 +86,6 @@ impl PlayRange {
 }
 
 struct Shared {
-    pcm: Pcm,
     range: Mutex<PlayRange>,
     playing: AtomicBool,
     /// Seconds, as f64 bits. Written only by the audio callback.
@@ -78,11 +100,10 @@ pub struct AudioOutput {
 }
 
 impl AudioOutput {
-    pub fn new(pcm: Pcm) -> Result<Self> {
+    pub fn new() -> Result<Self> {
         let device = cpal::default_host().default_output_device().context("no audio output device")?;
         let config = device.default_output_config().context("can't read the audio output config")?;
         let shared = Arc::new(Shared {
-            pcm,
             range: Mutex::new(PlayRange::default()),
             playing: AtomicBool::new(false),
             position: AtomicU64::new(0f64.to_bits()),
@@ -149,13 +170,12 @@ where
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
             // Never block the audio thread: if the UI holds the lock, keep the last range.
             if let Ok(r) = shared.range.try_lock() {
-                range = *r;
+                range = r.clone();
             }
             if shared.seek_pending.swap(false, Ordering::AcqRel) {
                 pos = f64::from_bits(shared.seek_to.load(Ordering::Acquire)) * rate;
             }
             let mut playing = shared.playing.load(Ordering::Acquire);
-            let pcm = shared.pcm.get();
             for frame in data.chunks_mut(channels) {
                 if playing {
                     let mut t = pos / rate;
@@ -169,13 +189,9 @@ where
                         }
                     }
                     if playing {
-                        let source = range.sound.source_time(t);
-                        let (left, right) = match (pcm, source) {
-                            (Some(pcm), Some(source)) => sample_at(pcm, source * rate),
-                            _ => (0.0, 0.0),
-                        };
-                        // A volume above 100% can go past full scale.
-                        let gain = range.gain(t) * range.sound.gain;
+                        let (left, right) = range.mix(t);
+                        // Clips together, or a volume above 100%, can go past full scale.
+                        let gain = range.gain(t);
                         write_frame(frame, (left * gain).clamp(-1.0, 1.0), (right * gain).clamp(-1.0, 1.0), silence);
                         pos += step;
                         continue;
@@ -254,12 +270,29 @@ mod tests {
         assert_eq!(sound.source_time(0.0), Some(7.0));
         assert_eq!(sound.source_time(-5.1), None);
 
-        let range = PlayRange { start: -8.0, end: -2.0, looping: true, fades: Some((1.0, 2.0)), sound };
+        let range = PlayRange { start: -8.0, end: -2.0, looping: true, fades: Some((1.0, 2.0)), ..PlayRange::default() };
         assert_eq!(range.gain(-8.0), 0.0);
         assert_eq!(range.gain(-7.5), 0.5);
         assert_eq!(range.gain(-3.0), 0.5);
         assert_eq!(range.advance(-4.0, 1.0), Some(-3.0));
         assert_eq!(range.advance(-4.0, 3.0), Some(-7.0));
+    }
+
+    #[test]
+    fn sounds_of_clips_play_together() {
+        let pcm = |level: i16| -> Pcm { Arc::new(OnceLock::from(Arc::new(vec![level; 2 * AUDIO_RATE as usize * 20]))) };
+        // One clip at 0..10 s at half volume, another at 5..15 s; a third whose sound is not decoded yet.
+        let sounds: Vec<Sound> = vec![
+            Sound { segment: Segment { start: 0.0, end: 10.0, source_start: 0.0, gain: 0.5 }, pcm: pcm(8192) },
+            Sound { segment: Segment { start: 5.0, end: 15.0, source_start: 3.0, gain: 1.0 }, pcm: pcm(4096) },
+            Sound { segment: Segment { start: 0.0, end: 15.0, source_start: 0.0, gain: 1.0 }, pcm: Arc::new(OnceLock::new()) },
+        ];
+        let range = PlayRange { start: 0.0, end: 20.0, sounds: sounds.into(), ..PlayRange::default() };
+        assert_eq!(range.mix(2.0), (0.125, 0.125));
+        assert_eq!(range.mix(7.0), (0.25, 0.25));
+        assert_eq!(range.mix(12.0), (0.125, 0.125));
+        assert_eq!(range.mix(16.0), (0.0, 0.0));
+        assert_eq!(PlayRange::default().mix(1.0), (0.0, 0.0));
     }
 
     #[test]

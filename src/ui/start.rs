@@ -2,7 +2,7 @@
 
 use crate::core::plugins::{Plugin, PluginKind};
 use crate::core::project::{Project, PROJECT_FILE};
-use egui::{Button, Color32, RichText};
+use egui::{Button, RichText};
 use std::path::{Path, PathBuf};
 
 const COLUMN_WIDTH: f32 = 620.0;
@@ -30,11 +30,6 @@ pub enum StartAction {
     OpenPlugin(usize),
     OpenRecent(PathBuf),
     ForgetRecent(PathBuf),
-}
-
-pub enum MissingAction {
-    Locate,
-    Back,
 }
 
 /// A centered column in the central panel.
@@ -115,29 +110,6 @@ pub fn start_screen(
             ui.add_space(8.0);
         }
         ui.label(RichText::new(format!("Projects are kept in {}", workspace.display())).weak().small());
-    });
-    action
-}
-
-/// The project's video is not where it was.
-pub fn missing_source_screen(ctx: &egui::Context, project: &str, path: &Path) -> Option<MissingAction> {
-    let mut action = None;
-    column(ctx, |ui| {
-        ui.label(RichText::new(project).size(22.0).strong());
-        ui.add_space(12.0);
-        ui.colored_label(Color32::from_rgb(230, 170, 70), "The video of this project is not where it was:");
-        ui.label(path.display().to_string());
-        ui.add_space(4.0);
-        ui.label(RichText::new("Your edit is safe. Say where the video is now, and it opens as you left it.").weak());
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            if ui.button(RichText::new("Locate the file…").strong()).clicked() {
-                action = Some(MissingAction::Locate);
-            }
-            if ui.button("Back to projects").clicked() {
-                action = Some(MissingAction::Back);
-            }
-        });
     });
     action
 }

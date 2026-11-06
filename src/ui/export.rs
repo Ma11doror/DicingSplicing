@@ -11,9 +11,8 @@ use crate::core::settings::Settings;
 use crate::core::tools;
 use crate::core::workspace::folder_name;
 use crate::media::geometry::Mask;
-use crate::media::probe::MediaInfo;
 use crate::media::render::{self, RenderJob, RenderStatus, RenderTask};
-use crate::media::Notify;
+use crate::media::{Notify, SourceFiles};
 use crate::ui::flash;
 use crate::ui::plugins::{Offer, PublishEnv, PublishSection};
 use egui::{Color32, NumExt, RichText};
@@ -76,8 +75,8 @@ struct Outcome {
 
 /// What the tab needs from the editor.
 pub struct ExportEnv<'a> {
-    pub source: &'a Path,
-    pub info: &'a MediaInfo,
+    /// The files of the sources that can be read.
+    pub files: &'a SourceFiles,
     pub shown: &'a [&'static Preset],
     /// The playhead, for saving a frame.
     pub position: f64,
@@ -303,7 +302,7 @@ impl ExportPanel {
     }
 
     /// Saves the output's picture at `time` as an image.
-    fn save_frame(&mut self, ctx: &egui::Context, sequence: &Sequence, source: &Path, info: &MediaInfo, time: f64) {
+    fn save_frame(&mut self, ctx: &egui::Context, sequence: &Sequence, files: &SourceFiles, time: f64) {
         let mut dialog = rfd::FileDialog::new()
             .set_title("Save the frame")
             .add_filter("PNG", &["png"])
@@ -313,7 +312,10 @@ impl ExportPanel {
             dialog = dialog.set_directory(folder);
         }
         if let Some(path) = dialog.save_file() {
-            self.start(ctx, vec![Target { task: render::frame_task(source, info, sequence, time, &path), for_telegram: false }], None);
+            match render::frame_task(files, sequence, time, &path) {
+                Ok(task) => self.start(ctx, vec![Target { task, for_telegram: false }], None),
+                Err(error) => self.message = Some(format!("{error:#}")),
+            }
         }
     }
 
@@ -345,7 +347,7 @@ impl ExportPanel {
     fn actions(&mut self, ui: &mut egui::Ui, sequence: &Sequence, env: &ExportEnv) {
         let running = self.run.is_some();
         ui.add_enabled_ui(!running, |ui| self.destination(ui, sequence, env.shown));
-        for warning in render::warnings(sequence, env.info) {
+        for warning in render::warnings(sequence, env.files) {
             ui.colored_label(WARNING, warning);
         }
         ui.add_space(4.0);
@@ -529,10 +531,10 @@ impl ExportPanel {
         }
     }
 
-    fn start_export(&mut self, ctx: &egui::Context, sequence: &Sequence, source: &Path, info: &MediaInfo, shown: &[&'static Preset]) {
+    fn start_export(&mut self, ctx: &egui::Context, sequence: &Sequence, files: &SourceFiles, shown: &[&'static Preset]) {
         let paths = self.paths(sequence, shown);
-        if paths.iter().any(|path| path == source) {
-            self.message = Some("The source video can't be replaced with its own export.".to_owned());
+        if paths.iter().any(|path| files.values().any(|file| file.path == *path)) {
+            self.message = Some("A source video can't be replaced with an export.".to_owned());
             return;
         }
         if let Some(Err(error)) = paths.first().and_then(|path| path.parent()).map(fs::create_dir_all) {
@@ -540,13 +542,16 @@ impl ExportPanel {
             return;
         }
         let circle = |sequence: &Sequence| sequence.output.outline().mask == Mask::Circle;
-        let sequences = std::iter::once(sequence.clone()).chain(shown.iter().map(|preset| render::variant(sequence, info, preset)));
-        let targets = paths
+        let sequences = std::iter::once(sequence.clone()).chain(shown.iter().map(|preset| render::variant(sequence, files, preset)));
+        let targets: Result<Vec<Target>, _> = paths
             .iter()
             .zip(sequences)
-            .map(|(path, sequence)| Target { task: render::video_task(source, info, &sequence, path), for_telegram: circle(&sequence) })
+            .map(|(path, sequence)| Ok::<_, anyhow::Error>(Target { task: render::video_task(files, &sequence, path)?, for_telegram: circle(&sequence) }))
             .collect();
-        self.start(ctx, targets, Some(sequence.clone()));
+        match targets {
+            Ok(targets) => self.start(ctx, targets, Some(sequence.clone())),
+            Err(error) => self.message = Some(format!("{error:#}")),
+        }
     }
 
     /// The button that writes the file, or how far that has come.
@@ -568,12 +573,12 @@ impl ExportPanel {
             let sending = self.sections.values().any(PublishSection::is_sending);
             let export = ui.add_enabled(!sending, egui::Button::new(RichText::new("Export").strong()));
             if export.on_disabled_hover_text("A video is going out, and this would replace it").clicked() {
-                self.start_export(ui.ctx(), sequence, env.source, env.info, env.shown);
+                self.start_export(ui.ctx(), sequence, env.files, env.shown);
             }
             let hint = "Save the picture at the playhead as a PNG, in the output's size";
-            let frame = ui.add_enabled(sequence.clip_at(env.position).is_some(), egui::Button::new("Save frame…"));
+            let frame = ui.add_enabled(sequence.shown_at(env.position).is_some(), egui::Button::new("Save frame…"));
             if frame.on_hover_text(hint).clicked() {
-                self.save_frame(ui.ctx(), sequence, env.source, env.info, env.position);
+                self.save_frame(ui.ctx(), sequence, env.files, env.position);
             }
         });
     }
@@ -723,9 +728,10 @@ mod tests {
     #[test]
     fn a_run_that_writes_nothing_leaves_the_video_ready() {
         let sequence = Sequence::new(Clip::new("a".into(), 1.0));
-        let info = MediaInfo { duration: 1.0, width: 16, height: 16, fps: crate::media::probe::Rational { num: 25, den: 1 }, has_audio: false };
+        let info = crate::media::probe::MediaInfo { duration: 1.0, width: 16, height: 16, fps: crate::media::probe::Rational { num: 25, den: 1 }, has_audio: false };
         let output = std::env::temp_dir().join(format!("simple_editor_export_{}.png", std::process::id()));
-        let task = render::frame_task(Path::new("there is no such video.mp4"), &info, &sequence, 0.0, &output);
+        let files = SourceFiles::from([(0, crate::media::SourceFile { path: "there is no such video.mp4".into(), info })]);
+        let task = render::frame_task(&files, &sequence, 0.0, &output).unwrap();
         let ctx = egui::Context::default();
         let mut panel = window();
         panel.video_saved(vec![saved("a.mp4")], &sequence);

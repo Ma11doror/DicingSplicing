@@ -1,13 +1,12 @@
 //! Rendering the edit to a file with ffmpeg, always from the original source.
 
-use crate::core::edit::Sequence;
+use crate::core::edit::{Clip, ClipId, Sequence, Span};
 use crate::core::export::{ExportSettings, FrameRate, Rate, VideoCodec};
 use crate::core::preset::Preset;
 use crate::core::tools;
 use crate::media::geometry::{Mask, Outline, Transform};
-use crate::media::probe::MediaInfo;
-use crate::media::Notify;
-use anyhow::{Context, Result};
+use crate::media::{Notify, SourceFile, SourceFiles};
+use anyhow::{bail, Context, Result};
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs;
@@ -85,50 +84,78 @@ fn pull_in(position: f64, max: f64) -> f64 {
     }
 }
 
-/// The part of the source that plays in the export range, and the emptiness around it.
+/// A run of the result's frames that come from one clip, or are black.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Timing {
-    total: f64,
-    /// Black and silence before and after the clip.
-    lead: f64,
-    tail: f64,
-    /// Source seconds; `None` if no clip reaches into the range.
-    source: Option<(f64, f64)>,
+struct Piece {
+    first: u64,
+    count: u64,
+    clip: Option<ClipId>,
 }
 
-/// There is one clip for now. Several clips will need overlay and a sound mix here.
-fn timing(sequence: &Sequence) -> Timing {
+/// The result's picture, frame by frame: the clip each run of frames shows. Where one clip gives
+/// way to another falls on the frame nearest to where it is on the timeline.
+fn pieces(sequence: &Sequence, fps: f64) -> Vec<Piece> {
     let export = sequence.export;
-    let total = export.len();
-    let clip = sequence.clips().next().map(|(_, clip)| clip);
-    let overlap = clip.and_then(|clip| {
-        let span = clip.span();
-        let (start, end) = (span.start.max(export.start), span.end.min(export.end));
-        (end > start).then_some((clip, start, end))
-    });
-    match overlap {
-        Some((clip, start, end)) => Timing {
-            total,
-            lead: start - export.start,
-            tail: export.end - end,
-            source: Some((clip.source_time(start), clip.source_time(end))),
-        },
-        None => Timing { total, lead: total, tail: 0.0, source: None },
+    let frame_at = |t: f64| ((t - export.start) * fps).round().max(0.0) as u64;
+    let mut pieces: Vec<Piece> = Vec::new();
+    for (span, clip) in sequence.picture(export) {
+        let (first, end) = (frame_at(span.start), frame_at(span.end));
+        if end <= first {
+            continue;
+        }
+        match pieces.last_mut() {
+            Some(last) if last.clip == clip => last.count = end - last.first,
+            _ => pieces.push(Piece { first, count: end - first, clip }),
+        }
+    }
+    if pieces.is_empty() {
+        pieces.push(Piece { first: 0, count: frame_at(export.end).max(1), clip: None });
+    }
+    pieces
+}
+
+/// The clips whose sound is in the result, with the part of the timeline each one sounds in.
+fn heard<'a>(sequence: &'a Sequence, files: &SourceFiles) -> Vec<(&'a Clip, Span)> {
+    let export = sequence.export;
+    sequence
+        .clips()
+        .filter(|(id, clip)| !sequence.tracks[id.track].muted && clip.gain() > 0.0)
+        .filter(|(_, clip)| files.get(&clip.source).is_none_or(|file| file.info.has_audio))
+        .filter_map(|(_, clip)| {
+            let span = clip.span();
+            let (start, end) = (span.start.max(export.start), span.end.min(export.end));
+            (end > start).then_some((clip, Span { start, end }))
+        })
+        .collect()
+}
+
+/// The clips that reach into the export range at all, seen or heard.
+fn reaching(sequence: &Sequence) -> impl Iterator<Item = (ClipId, &Clip)> {
+    let export = sequence.export;
+    sequence.clips().filter(move |(_, clip)| clip.span().start < export.end && clip.span().end > export.start)
+}
+
+/// The result's frame rate, as ffmpeg takes it and as a number. "As the source" is the highest rate
+/// of the clips that are seen, so that none of them loses frames.
+fn frame_rate(sequence: &Sequence, files: &SourceFiles) -> (String, f64) {
+    match sequence.settings.frame_rate {
+        FrameRate::Fixed(fps) => (fps.to_string(), fps),
+        FrameRate::Source => {
+            let seen = sequence.picture(sequence.export).into_iter().filter_map(|(_, id)| files.get(&sequence.clip(id?).source));
+            let fastest = seen.map(|file| file.info.fps).max_by(|a, b| a.as_f64().total_cmp(&b.as_f64()));
+            fastest.map_or_else(|| ("30".to_owned(), 30.0), |fps| (format!("{}/{}", fps.num, fps.den), fps.as_f64()))
+        }
     }
 }
 
-fn frame_rate_value(settings: &ExportSettings, info: &MediaInfo) -> String {
-    match settings.frame_rate {
-        FrameRate::Source => format!("{}/{}", info.fps.num, info.fps.den),
-        FrameRate::Fixed(fps) => fps.to_string(),
-    }
+/// The result's frame rate.
+pub fn output_fps(sequence: &Sequence, files: &SourceFiles) -> f64 {
+    frame_rate(sequence, files).1
 }
 
-fn frame_rate_number(settings: &ExportSettings, info: &MediaInfo) -> f64 {
-    match settings.frame_rate {
-        FrameRate::Source => info.fps.as_f64(),
-        FrameRate::Fixed(fps) => fps,
-    }
+/// The file a clip plays, or why there is none.
+fn file_of<'a>(files: &'a SourceFiles, clip: &Clip) -> Result<&'a SourceFile> {
+    files.get(&clip.source).with_context(|| format!("The file of {} is not there or can't be read.", clip.name))
 }
 
 fn video_args(settings: &ExportSettings) -> Vec<String> {
@@ -174,66 +201,107 @@ pub struct RenderPlan {
     pub total: f64,
 }
 
+/// Adds an input that starts a little before `start`: seeking before the input saves decoding
+/// everything up to it, and decoding covers the rest exactly. Timestamps then count from where the
+/// seek landed. Returns the input's number and where it starts.
+fn add_input(args: &mut Vec<OsString>, inputs: &mut usize, path: &Path, start: f64, end: f64) -> (usize, f64) {
+    let seek = (start - SEEK_MARGIN).max(0.0);
+    if seek > 0.0 {
+        args.push("-ss".into());
+        args.push(format!("{seek:.6}").into());
+    }
+    // Nothing after the end is needed; a second more keeps the last frame and the last samples.
+    args.push("-t".into());
+    args.push(format!("{:.6}", end - seek + 1.0).into());
+    args.push("-i".into());
+    args.push(path.into());
+    *inputs += 1;
+    (*inputs - 1, seek)
+}
+
 /// What ffmpeg has to do to write the edit to `output`.
-pub fn plan(source: &Path, info: &MediaInfo, sequence: &Sequence, output: &Path) -> RenderPlan {
+///
+/// The picture is the pieces of the clips that are seen, one after another, on the result's frame
+/// grid: a clip covers the whole frame, so the one on top is all there is to see. The sound is every
+/// clip's sound in its place, mixed. Picture and sound go by one clock: a source's moment lands on
+/// the same moment of the file in both. Counting a stream from its own first frame instead would
+/// put the picture ahead of the sound, by as much as that frame is late.
+pub fn plan(files: &SourceFiles, sequence: &Sequence, output: &Path) -> Result<RenderPlan> {
     let settings = &sequence.settings;
-    let (w, h) = (info.width as f64, info.height as f64);
+    let export = sequence.export;
+    let total = export.len();
     let pixels = settings.pixels(sequence.output);
-    let fps = frame_rate_value(settings, info);
-    let time = timing(sequence);
-    let has_sound = info.has_audio && settings.audio_codec.encoder().is_some();
-    let clip = sequence.clips().next().map(|(_, clip)| clip);
-    let transform = clip.map_or_else(Transform::default, |clip| clip.transform);
-    let gain = clip.map_or(1.0, |clip| clip.gain());
+    let [px, py] = pixels;
+    let outline = sequence.output.outline();
+    let (fps, rate) = frame_rate(sequence, files);
+    for (_, clip) in reaching(sequence) {
+        file_of(files, clip)?;
+    }
 
     let mut args: Vec<OsString> = ["-v", "error", "-nostdin", "-nostats", "-progress", "pipe:1", "-y"].map(OsString::from).to_vec();
+    let mut inputs = 0;
     let mut graph = Vec::new();
-    match time.source {
-        Some((start, end)) => {
-            // Seeking before the input saves decoding everything up to the start. Timestamps then
-            // count from the point the seek landed on.
-            let seek = (start - SEEK_MARGIN).max(0.0);
-            if seek > 0.0 {
-                args.push("-ss".into());
-                args.push(format!("{seek:.6}").into());
-            }
-            args.push("-i".into());
-            args.push(source.into());
-            let (from, to) = (start - seek, end - seek);
 
-            // One clock for picture and sound: the source's moment `from` lands on the file's moment
-            // `lead`. Counting each stream from its own first frame instead would put the picture ahead
-            // of the sound, by as much as that frame is after `from` or after the sound's start.
-            //
-            // Black comes in whole frames, the picture takes up the rest of the lead. Frames before the
-            // start stay until `fps`, which needs them to know what is on screen at that moment.
-            let frame = frame_filter(w, h, &transform, sequence.output.outline(), pixels);
-            let rate = frame_rate_number(settings, info);
-            let black = (time.lead * rate).round();
-            let shift = time.lead - black / rate - from;
-            let mut video = format!("[0:V:0]trim=end={to:.6},setpts=PTS{shift:+.6}/TB,fps={fps}:start_time=0,{frame}");
-            if black > 0.0 || time.tail > 0.0 {
-                video += &format!(",tpad=start={black}:stop_duration={:.6}:color=black", time.tail);
-            }
-            graph.push(video + ",format=yuv420p[v]");
-            if has_sound {
-                // Moved by the lead, then filled from 0: adelay only shifts the timestamps, which would
-                // leave a hole in the stream instead of silence. The filling also evens out gaps in
-                // the source's own sound, so that it stays in sync with the picture.
-                let sound = format!(
-                    "[0:a:0]atrim=start={from:.6}:end={to:.6},asetpts=PTS-{from:.6}/TB+{:.6}/TB,aresample=async=1:first_pts=0,\
-                     volume={gain:.4},apad=whole_dur={:.6},atrim=end={:.6}",
-                    time.lead, time.total, time.total
-                );
-                graph.push(sound + &fade_filters(settings, time.total) + "[a]");
+    let pieces = pieces(sequence, rate);
+    let mut labels = String::new();
+    for (n, piece) in pieces.iter().enumerate() {
+        let count = piece.count;
+        let label = if pieces.len() == 1 { "[v]".to_owned() } else { format!("[p{n}]") };
+        match piece.clip {
+            None => graph.push(format!("color=c=black:s={px}x{py}:r={fps},trim=end_frame={count},format=yuv420p,setsar=1{label}")),
+            Some(id) => {
+                let clip = sequence.clip(id);
+                let file = file_of(files, clip)?;
+                // The source's moment at the piece's first frame. Frames before it stay until `fps`,
+                // which needs them to know what is on screen at that moment; a source that ends a
+                // frame early has its last frame held.
+                let start = clip.source_time(export.start + piece.first as f64 / rate);
+                let end = start + count as f64 / rate;
+                let (input, seek) = add_input(&mut args, &mut inputs, &file.path, start, end);
+                let (from, to) = (start - seek, end - seek);
+                let frame = frame_filter(file.info.width as f64, file.info.height as f64, &clip.transform, outline, pixels);
+                graph.push(format!(
+                    "[{input}:V:0]trim=end={to:.6},setpts=PTS{:+.6}/TB,fps={fps}:start_time=0,{frame},\
+                     tpad=stop=-1:stop_mode=clone,trim=end_frame={count},format=yuv420p{label}",
+                    -from
+                ));
             }
         }
-        None => {
-            let [px, py] = pixels;
-            graph.push(format!("color=c=black:s={px}x{py}:r={fps}:d={:.6},format=yuv420p[v]", time.total));
-            if has_sound {
-                graph.push(format!("anullsrc=r=48000:cl=stereo:d={:.6}[a]", time.total));
-            }
+        labels += &label;
+    }
+    if pieces.len() > 1 {
+        graph.push(format!("{labels}concat=n={}:v=1:a=0[v]", pieces.len()));
+    }
+
+    let has_sound = settings.audio_codec.encoder().is_some()
+        && reaching(sequence).any(|(_, clip)| files.get(&clip.source).is_some_and(|file| file.info.has_audio));
+    if has_sound {
+        let fades = fade_filters(settings, total);
+        let mut sounds = String::new();
+        let heard = heard(sequence, files);
+        for (n, (clip, span)) in heard.iter().enumerate() {
+            let file = file_of(files, clip)?;
+            let (start, end) = (clip.source_time(span.start), clip.source_time(span.end));
+            let (input, seek) = add_input(&mut args, &mut inputs, &file.path, start, end);
+            let (from, to) = (start - seek, end - seek);
+            let lead = span.start - export.start;
+            // Moved to its place, then filled from 0: adelay only shifts the timestamps, which would
+            // leave a hole in the stream instead of silence. The filling also evens out gaps in the
+            // source's own sound, so that it stays with the picture.
+            let label = if heard.len() == 1 { format!("{fades}[a]") } else { format!("[s{n}]") };
+            graph.push(format!(
+                "[{input}:a:0]atrim=start={from:.6}:end={to:.6},asetpts=PTS-{from:.6}/TB+{lead:.6}/TB,\
+                 aresample=48000:async=1:first_pts=0,aformat=channel_layouts=stereo,volume={:.4},\
+                 apad=whole_dur={total:.6},atrim=end={total:.6}{label}",
+                clip.gain()
+            ));
+            sounds += &format!("[s{n}]");
+        }
+        match heard.len() {
+            0 => graph.push(format!("anullsrc=r=48000:cl=stereo:d={total:.6}[a]")),
+            1 => {}
+            // Added up as they are, like the editor plays them: not divided by how many there are.
+            count => graph.push(format!("{sounds}amix=inputs={count}:duration=longest:normalize=0{fades}[a]")),
         }
     }
 
@@ -244,7 +312,7 @@ pub fn plan(source: &Path, info: &MediaInfo, sequence: &Sequence, output: &Path)
         args.extend(["-map", "[a]"].map(OsString::from));
     }
     args.push("-t".into());
-    args.push(format!("{:.6}", time.total).into());
+    args.push(format!("{total:.6}").into());
     args.extend(video_args(settings).into_iter().map(OsString::from));
     if let (true, Some(encoder)) = (has_sound, settings.audio_codec.encoder()) {
         args.extend(["-c:a", encoder].map(OsString::from));
@@ -256,7 +324,7 @@ pub fn plan(source: &Path, info: &MediaInfo, sequence: &Sequence, output: &Path)
         args.extend(["-movflags", "+faststart"].map(OsString::from));
     }
     args.push(output.into());
-    RenderPlan { args, total: time.total }
+    Ok(RenderPlan { args, total })
 }
 
 fn fade_filters(settings: &ExportSettings, total: f64) -> String {
@@ -274,14 +342,14 @@ fn fade_filters(settings: &ExportSettings, total: f64) -> String {
 
 /// The edit as the frame `preset` would see it when shown for comparison: the same center and angle,
 /// inside the main frame.
-pub fn variant(sequence: &Sequence, info: &MediaInfo, preset: &Preset) -> Sequence {
-    let (w, h) = (info.width as f64, info.height as f64);
+pub fn variant(sequence: &Sequence, files: &SourceFiles, preset: &Preset) -> Sequence {
     let main = sequence.output.outline();
     let outline = sequence.output.outline_of(preset);
     let mut out = sequence.clone();
     out.output.preset = preset.id;
-    for track in &mut out.tracks {
-        for clip in &mut track.clips {
+    for clip in out.tracks.iter_mut().flat_map(|track| &mut track.clips) {
+        if let Some(file) = files.get(&clip.source) {
+            let (w, h) = (file.info.width as f64, file.info.height as f64);
             let [fw, fh] = clip.transform.size(w, h, main);
             clip.transform.zoom = outline.fit(w, h)[0] / outline.fit(fw, fh)[0];
         }
@@ -297,40 +365,51 @@ pub struct RenderTask {
 }
 
 /// Renders the edit to `output`.
-pub fn video_task(source: &Path, info: &MediaInfo, sequence: &Sequence, output: &Path) -> RenderTask {
+pub fn video_task(files: &SourceFiles, sequence: &Sequence, output: &Path) -> Result<RenderTask> {
     let part = part_path(output);
-    RenderTask { plan: plan(source, info, sequence, &part), part, output: output.to_owned() }
+    Ok(RenderTask { plan: plan(files, sequence, &part)?, part, output: output.to_owned() })
 }
 
 /// Saves the output's picture at timeline `time` as an image, from the original source.
-pub fn frame_task(source: &Path, info: &MediaInfo, sequence: &Sequence, time: f64, output: &Path) -> RenderTask {
+pub fn frame_task(files: &SourceFiles, sequence: &Sequence, time: f64, output: &Path) -> Result<RenderTask> {
+    let Some(id) = sequence.shown_at(time) else { bail!("There is no picture at the playhead.") };
+    let clip = sequence.clip(id);
+    let file = file_of(files, clip)?;
+    let info = &file.info;
     let part = part_path(output);
-    let clip = sequence.clip_at(time).map_or_else(|| sequence.clips().next().map(|(_, clip)| clip), |id| Some(sequence.clip(id)));
     let last_frame = (info.duration - 1.0 / info.fps.as_f64()).max(0.0);
-    let source_time = clip.map_or(0.0, |clip| clip.source_time(time)).clamp(0.0, last_frame);
-    let transform = clip.map_or_else(Transform::default, |clip| clip.transform);
-    let filter = frame_filter(info.width as f64, info.height as f64, &transform, sequence.output.outline(), sequence.settings.pixels(sequence.output));
+    let source_time = clip.source_time(time).clamp(0.0, last_frame);
+    let filter = frame_filter(info.width as f64, info.height as f64, &clip.transform, sequence.output.outline(), sequence.settings.pixels(sequence.output));
 
     let mut args: Vec<OsString> = ["-v", "error", "-nostdin", "-nostats", "-progress", "pipe:1", "-y", "-ss"].map(OsString::from).to_vec();
     args.push(format!("{source_time:.6}").into());
     args.push("-i".into());
-    args.push(source.into());
+    args.push((&file.path).into());
     args.push("-vf".into());
     args.push(filter.into());
     args.extend(["-frames:v", "1", "-update", "1"].map(OsString::from));
     args.push((&part).into());
-    RenderTask { plan: RenderPlan { args, total: 1.0 }, part, output: output.to_owned() }
+    Ok(RenderTask { plan: RenderPlan { args, total: 1.0 }, part, output: output.to_owned() })
 }
 
-/// What is worth knowing before the render. None of this stops it.
-pub fn warnings(sequence: &Sequence, info: &MediaInfo) -> Vec<String> {
+/// What is worth knowing before the render.
+pub fn warnings(sequence: &Sequence, files: &SourceFiles) -> Vec<String> {
     let mut warnings = Vec::new();
     let export = sequence.export;
-    let time = timing(sequence);
-    if time.source.is_none() {
-        warnings.push("No clip reaches into the export range: the result is all black.".to_owned());
-    } else if time.lead > 0.0 || time.tail > 0.0 {
-        warnings.push(format!("{:.1} s of the export range have no clip: black and silence.", time.lead + time.tail));
+    for (_, clip) in reaching(sequence) {
+        if let Err(error) = file_of(files, clip) {
+            let text = format!("{error} The export can't start.");
+            if !warnings.contains(&text) {
+                warnings.push(text);
+            }
+        }
+    }
+    let picture = sequence.picture(export);
+    let black: f64 = picture.iter().filter(|(_, shown)| shown.is_none()).map(|(span, _)| span.len()).sum();
+    if picture.iter().all(|(_, shown)| shown.is_none()) {
+        warnings.push("No clip is seen in the export range: the result is all black.".to_owned());
+    } else if black > 0.0 {
+        warnings.push(format!("{black:.1} s of the export range show no clip: they are black."));
     }
     let outline = sequence.output.outline();
     if outline.mask == Mask::Circle && !(TELEGRAM_MIN_SECONDS..=TELEGRAM_MAX_SECONDS).contains(&export.len()) {
@@ -339,12 +418,17 @@ pub fn warnings(sequence: &Sequence, info: &MediaInfo) -> Vec<String> {
             export.len()
         ));
     }
-    if let Some((_, clip)) = sequence.clips().next() {
-        let [fw, _] = clip.transform.size(info.width as f64, info.height as f64, outline);
-        let [px, _] = sequence.settings.pixels(sequence.output);
+    let mut seen: Vec<ClipId> = picture.iter().filter_map(|(_, shown)| *shown).collect();
+    seen.dedup();
+    let [px, _] = sequence.settings.pixels(sequence.output);
+    for id in seen {
+        let clip = sequence.clip(id);
+        let Some(file) = files.get(&clip.source) else { continue };
+        let [fw, _] = clip.transform.size(file.info.width as f64, file.info.height as f64, outline);
         let enlarged = px as f64 / fw;
-        if enlarged > 1.05 {
-            warnings.push(format!("The picture is enlarged {enlarged:.1} times: the frame covers fewer source pixels than the result has."));
+        let text = format!("{} is enlarged {enlarged:.1} times: the frame covers fewer of its pixels than the result has.", clip.name);
+        if enlarged > 1.05 && !warnings.contains(&text) {
+            warnings.push(text);
         }
     }
     warnings
@@ -499,8 +583,10 @@ mod tests {
     use crate::core::edit::{Clip, Span};
     use crate::core::export::{AudioCodec, Container, OutputSize, Speed};
     use crate::core::preset::{get, Output, PresetId, Ratio};
-    use crate::media::probe::{self, Rational};
+    use crate::core::edit::Track;
     use crate::media::geometry;
+    use crate::media::geometry::Transform;
+    use crate::media::probe::{self, MediaInfo, Rational};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -548,8 +634,17 @@ mod tests {
     }
 
     /// Runs the plan to the end, the way a job does, and returns the file.
+    /// The file as the only source, with id 0.
+    fn files(source: &Path, info: &MediaInfo) -> SourceFiles {
+        SourceFiles::from([(0, SourceFile { path: source.to_owned(), info: info.clone() })])
+    }
+
     fn render(source: &Path, info: &MediaInfo, sequence: &Sequence, output: &Path) -> PathBuf {
-        let plan = plan(source, info, sequence, output);
+        render_all(&files(source, info), sequence, output)
+    }
+
+    fn render_all(files: &SourceFiles, sequence: &Sequence, output: &Path) -> PathBuf {
+        let plan = plan(files, sequence, output).unwrap();
         let result = tools::command(tools::FFMPEG).args(&plan.args).output().unwrap();
         assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
         output.to_owned()
@@ -643,38 +738,78 @@ mod tests {
     }
 
     #[test]
-    fn timing_follows_the_clip_and_the_export_range() {
+    fn pieces_follow_the_clips_on_the_frame_grid() {
+        let id = ClipId { track: 0, index: 0 };
         let mut s = sequence(10.0);
-        assert_eq!(timing(&s), Timing { total: 10.0, lead: 0.0, tail: 0.0, source: Some((0.0, 10.0)) });
+        assert_eq!(pieces(&s, 30.0), [Piece { first: 0, count: 300, clip: Some(id) }]);
 
-        // The clip is trimmed to source 2..4 in place, the export range goes around it.
-        s.trim_start(crate::core::edit::ClipId { track: 0, index: 0 }, 2.0, 0.1);
-        s.trim_end(crate::core::edit::ClipId { track: 0, index: 0 }, 4.0, 0.1);
+        // The clip trimmed to source 2..4 in place, the range around it: black on both sides.
+        s.trim_start(id, 2.0, 0.1);
+        s.trim_end(id, 4.0, 0.1);
         s.export = Span { start: 1.0, end: 5.0 };
-        assert_eq!(timing(&s), Timing { total: 4.0, lead: 1.0, tail: 1.0, source: Some((2.0, 4.0)) });
+        let black = |first, count| Piece { first, count, clip: None };
+        assert_eq!(pieces(&s, 25.0), [black(0, 25), Piece { first: 25, count: 50, clip: Some(id) }, black(75, 25)]);
 
+        // Out of the range: all black, and the warning says so.
         s.export = Span { start: 6.0, end: 8.0 };
-        assert_eq!(timing(&s), Timing { total: 2.0, lead: 2.0, tail: 0.0, source: None });
+        assert_eq!(pieces(&s, 25.0), [black(0, 50)]);
+        assert!(warnings(&s, &files(Path::new("a.mp4"), &info(10.0))).iter().any(|w| w.contains("all black")));
     }
 
     #[test]
-    fn timing_goes_by_where_the_clip_stands() {
-        let id = crate::core::edit::ClipId { track: 0, index: 0 };
+    fn a_clip_on_top_cuts_into_the_one_under_it_on_whole_frames() {
+        // Below: 0..10 s. Above: 4.01..6.02 s. The range from -1 s to 12 s, at 30 fps.
         let mut s = sequence(10.0);
-        s.move_clip(id, -3.0);
-
-        // The range starts before the clip and ends inside it.
-        s.export = Span { start: -5.0, end: 2.0 };
-        assert_eq!(timing(&s), Timing { total: 7.0, lead: 2.0, tail: 0.0, source: Some((0.0, 5.0)) });
-
-        // The range starts inside the clip and ends after it.
+        s.tracks.push(Track { id: 1, clips: vec![Clip { start: 4.01, source_out: 2.01, ..Clip::of(1, "b".into(), 5.0) }], ..Track::default() });
         s.export = Span { start: -1.0, end: 12.0 };
-        assert_eq!(timing(&s), Timing { total: 13.0, lead: 0.0, tail: 5.0, source: Some((2.0, 10.0)) });
+        let (below, above) = (Some(ClipId { track: 0, index: 0 }), Some(ClipId { track: 1, index: 0 }));
+        let piece = |first, count, clip| Piece { first, count, clip };
+        let expected = [piece(0, 30, None), piece(30, 120, below), piece(150, 61, above), piece(211, 119, below), piece(330, 60, None)];
+        assert_eq!(pieces(&s, 30.0), expected);
+        assert_eq!(pieces(&s, 30.0).iter().map(|p| p.count).sum::<u64>(), 390);
 
-        // The clip is out of the range: all black, and the warning says so.
-        s.export = Span { start: 20.0, end: 25.0 };
-        assert_eq!(timing(&s), Timing { total: 5.0, lead: 5.0, tail: 0.0, source: None });
-        assert!(warnings(&s, &info(10.0)).iter().any(|w| w.contains("all black")));
+        // Hidden, it is not seen; muted, it is not heard.
+        s.tracks[1].hidden = true;
+        assert_eq!(pieces(&s, 30.0), [piece(0, 30, None), piece(30, 300, below), piece(330, 60, None)]);
+        let files = SourceFiles::from([
+            (0, SourceFile { path: "a.mp4".into(), info: info(10.0) }),
+            (1, SourceFile { path: "b.mp4".into(), info: info(5.0) }),
+        ]);
+        assert_eq!(heard(&s, &files).len(), 2);
+        s.tracks[0].muted = true;
+        assert_eq!(heard(&s, &files).iter().map(|(clip, _)| clip.name.as_str()).collect::<Vec<_>>(), ["b"]);
+        s.clip_mut(ClipId { track: 1, index: 0 }).muted = true;
+        assert!(heard(&s, &files).is_empty());
+    }
+
+    #[test]
+    fn a_missing_file_stops_the_export_only_if_its_clip_reaches_into_the_range() {
+        let mut s = sequence(10.0);
+        s.tracks.push(Track { id: 1, clips: vec![Clip { start: 20.0, ..Clip::of(1, "far".into(), 5.0) }], ..Track::default() });
+        let only_first = files(Path::new("a.mp4"), &info(10.0));
+        assert!(plan(&only_first, &s, Path::new("out.mp4")).is_ok());
+        assert!(warnings(&s, &only_first).iter().all(|w| !w.contains("far")));
+
+        s.export.end = 22.0;
+        let error = plan(&only_first, &s, Path::new("out.mp4")).err().unwrap().to_string();
+        assert!(error.contains("far"), "{error}");
+        assert!(warnings(&s, &only_first).iter().any(|w| w.contains("far") && w.contains("can't start")));
+    }
+
+    #[test]
+    fn the_rate_as_the_source_is_the_highest_of_what_is_seen() {
+        let mut s = sequence(10.0);
+        s.settings.frame_rate = FrameRate::Source;
+        s.tracks.push(Track { id: 1, clips: vec![Clip { start: 2.0, ..Clip::of(1, "b".into(), 1.0) }], ..Track::default() });
+        let fast = MediaInfo { fps: Rational { num: 60000, den: 1001 }, ..info(1.0) };
+        let mut files = files(Path::new("a.mp4"), &info(10.0));
+        files.insert(1, SourceFile { path: "b.mp4".into(), info: fast });
+        assert_eq!(frame_rate(&s, &files).0, "60000/1001");
+        // Hidden, it does not count.
+        s.tracks[1].hidden = true;
+        assert_eq!(frame_rate(&s, &files), ("25/1".to_owned(), 25.0));
+        s.settings.frame_rate = FrameRate::Fixed(30.0);
+        assert_eq!(output_fps(&s, &files), 30.0);
     }
 
     #[test]
@@ -695,6 +830,7 @@ mod tests {
     fn warns_about_what_is_worth_knowing() {
         let i = MediaInfo { width: 1920, height: 1080, ..info(100.0) };
         let mut s = sequence(100.0);
+        let i = files(Path::new("a.mp4"), &i);
         assert!(warnings(&s, &i).iter().any(|w| w.contains("Telegram")));
         s.export = Span { start: 0.0, end: 30.0 };
         assert!(warnings(&s, &i).is_empty(), "{:?}", warnings(&s, &i));
@@ -962,6 +1098,77 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A source of one colour, with a tone if `tone` is given.
+    fn make_solid(dir: &Path, name: &str, color: &str, rate: u32, size: (u32, u32), tone: Option<u32>) -> PathBuf {
+        let path = dir.join(name);
+        let picture = format!("color=c={color}:s={}x{}:r={rate}:d=10,format=yuv420p", size.0, size.1);
+        let mut args = vec!["-f".to_owned(), "lavfi".to_owned(), "-i".to_owned(), picture];
+        if let Some(tone) = tone {
+            args.extend(["-f", "lavfi", "-i", &format!("sine=frequency={tone}:duration=10")].map(str::to_owned));
+            args.extend(["-c:a", "aac", "-shortest"].map(str::to_owned));
+        }
+        args.extend(["-c:v", "libx264", "-preset", "ultrafast", "-crf", "10", path.to_str().unwrap()].map(str::to_owned));
+        ffmpeg(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        path
+    }
+
+    /// Clips of three sources on three tracks: what is seen is the top one, what is heard is all of them.
+    #[test]
+    fn clips_of_several_sources_make_one_file() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let dir = temp_dir("several");
+        let gray = make_solid(&dir, "gray.mp4", "0x808080", 30, (320, 180), Some(300));
+        let red = make_solid(&dir, "red.mp4", "0xff0000", 25, (640, 360), Some(1000));
+        let green = make_solid(&dir, "green.mp4", "0x00ff00", 30, (320, 180), None);
+        let files: SourceFiles = [(0, &gray), (1, &red), (2, &green)]
+            .into_iter()
+            .map(|(id, path)| (id, SourceFile { path: path.clone(), info: probe::probe(path).unwrap() }))
+            .collect();
+
+        // Gray 0..6 s at the bottom, red 2..4 s over it from its own second 1, green 5.5..7 s on top.
+        let mut s = Sequence::new(Clip { source_out: 6.0, ..Clip::of(0, "gray".into(), 10.0) });
+        let track = |id, clip| Track { id, clips: vec![clip], ..Track::default() };
+        s.tracks.push(track(1, Clip { start: 2.0, source_in: 1.0, source_out: 3.0, ..Clip::of(1, "red".into(), 10.0) }));
+        s.tracks.push(track(2, Clip { start: 5.5, source_out: 1.5, ..Clip::of(2, "green".into(), 10.0) }));
+        s.export = Span { start: 0.0, end: 7.5 };
+        s.output = Output { preset: PresetId::Landscape, ..Output::default() };
+        s.settings.size = OutputSize::LongSide(320);
+        s.settings.speed = Speed::Ultrafast;
+        s.settings.fades = (0.0, 0.0);
+        s.settings.frame_rate = FrameRate::Source;
+
+        let path = render_all(&files, &s, &dir.join("all.mp4"));
+        let result = probe::probe(&path).unwrap();
+        assert!((result.duration - 7.5).abs() < 0.1, "duration {}", result.duration);
+        assert_eq!((result.width, result.height, result.fps), (320, 180, Rational { num: 30, den: 1 }));
+        let color = |t: f64| {
+            let rgb = rgb_at(&path, t, 320, 180);
+            let channel = |c: usize| rgb.iter().skip(c).step_by(3).map(|v| *v as f64).sum::<f64>() / (rgb.len() / 3) as f64;
+            [channel(0), channel(1), channel(2)]
+        };
+        let near = |got: [f64; 3], want: [f64; 3]| got.iter().zip(want).all(|(g, w)| (g - w).abs() < 30.0);
+        for (t, want) in [(1.0, [128.0, 128.0, 128.0]), (3.0, [255.0, 0.0, 0.0]), (4.5, [128.0, 128.0, 128.0]), (6.5, [0.0, 255.0, 0.0]), (7.2, [0.0, 0.0, 0.0])] {
+            assert!(near(color(t), want), "at {t} s: {:?}, should be {want:?}", color(t));
+        }
+        // The red clip's sound joins the gray one's; after the gray clip, the green one has none.
+        let rms = |from: f64, to: f64| sound_level(&path, from, to);
+        let (alone, together, silent) = (rms(0.5, 1.5), rms(2.5, 3.5), rms(6.2, 6.9));
+        assert!(alone > 100.0 && together > alone * 1.3, "alone {alone}, together {together}");
+        assert!(silent < 5.0, "after the clips: {silent}");
+
+        // Hidden, the red track shows the gray one; muted, the gray one is not heard.
+        s.tracks[1].hidden = true;
+        s.tracks[0].muted = true;
+        let path = render_all(&files, &s, &dir.join("hidden.mp4"));
+        let rgb = rgb_at(&path, 3.0, 320, 180);
+        assert!((mean_level(&rgb) - 128.0).abs() < 30.0, "{}", mean_level(&rgb));
+        let rms = |from: f64, to: f64| sound_level(&path, from, to);
+        assert!(rms(0.5, 1.5) < 5.0 && rms(2.5, 3.5) > 100.0, "{} {}", rms(0.5, 1.5), rms(2.5, 3.5));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// The first frame with a fast seek against the same moment decoded from the start.
     fn assert_first_frame_matches(source: &Path, i: &MediaInfo, start: f64, dir: &Path) {
         let mut s = sequence(i.duration);
@@ -1071,7 +1278,7 @@ mod tests {
         let output = dir.join("frame.png");
         let notify: Notify = Arc::new(|| {});
 
-        let job = RenderJob::start(frame_task(&source, &i, &s, 5.2, &output), notify);
+        let job = RenderJob::start(frame_task(&files(&source, &i), &s, 5.2, &output).unwrap(), notify);
         assert!(matches!(wait_for_end(&job), RenderStatus::Done { .. }));
         assert!(!part_path(&output).exists());
 
@@ -1095,7 +1302,7 @@ mod tests {
         let [fw, fh] = main.size(w, h, s.output.outline());
 
         for preset in [PresetId::Square, PresetId::Landscape, PresetId::TelegramCircle] {
-            let v = variant(&s, &i, get(preset));
+            let v = variant(&s, &files(Path::new("a.mp4"), &i), get(preset));
             let t = v.clip(id).transform;
             let outline = v.output.outline();
             assert_eq!(v.output.preset, preset);
@@ -1173,7 +1380,7 @@ mod tests {
         s.settings.speed = Speed::Ultrafast;
         let notify: Notify = Arc::new(|| {});
 
-        let job = RenderJob::start(video_task(&source, &info(2.0), &s, &output), notify.clone());
+        let job = RenderJob::start(video_task(&files(&source, &info(2.0)), &s, &output).unwrap(), notify.clone());
         match wait_for_end(&job) {
             RenderStatus::Done { path, bytes } => {
                 assert_eq!(path, output);
@@ -1201,7 +1408,7 @@ mod tests {
         s.output = Output { preset: PresetId::Landscape, ..Output::default() };
         let notify: Notify = Arc::new(|| {});
 
-        let job = RenderJob::start(video_task(&source, &info(60.0), &s, &output), notify);
+        let job = RenderJob::start(video_task(&files(&source, &info(60.0)), &s, &output).unwrap(), notify);
         thread::sleep(Duration::from_millis(300));
         let cancelled_at = Instant::now();
         job.cancel();
@@ -1220,7 +1427,7 @@ mod tests {
         let dir = temp_dir("fail");
         let output = dir.join("failed.mp4");
         let notify: Notify = Arc::new(|| {});
-        let job = RenderJob::start(video_task(&dir.join("missing.mp4"), &info(2.0), &sequence(2.0), &output), notify);
+        let job = RenderJob::start(video_task(&files(&dir.join("missing.mp4"), &info(2.0)), &sequence(2.0), &output).unwrap(), notify);
         match wait_for_end(&job) {
             RenderStatus::Failed(message) => assert!(!message.is_empty()),
             other => panic!("{other:?}"),

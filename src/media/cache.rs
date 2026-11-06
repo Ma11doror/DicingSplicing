@@ -3,7 +3,7 @@
 //! ffmpeg at all.
 
 use crate::core::tools;
-use crate::media::probe::{self, MediaInfo, Rational};
+use crate::media::probe::{MediaInfo, Rational};
 use crate::media::Notify;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -121,13 +121,23 @@ struct BuildState {
 impl MediaCache {
     /// Opens the cache for `source` in the folder `root`, starting a background build if there is
     /// no complete one.
+    #[cfg(test)]
     pub fn open_in(root: &Path, source: &Path, notify: Notify) -> Result<Self> {
-        let info = probe::probe(source)?;
-        let dir = root.join(cache_key(source)?);
-        match Self::load(source, &dir, &info) {
+        let info = crate::media::probe::probe(source)?;
+        match Self::existing(root, source, &info) {
             Some(cache) => Ok(cache),
-            None => Self::build(source, dir, info, notify),
+            None => Self::build_in(root, source, info, notify),
         }
+    }
+
+    /// The complete cache of `source` in the folder `root`, if there is one.
+    pub fn existing(root: &Path, source: &Path, info: &MediaInfo) -> Option<Self> {
+        Self::load(source, &root.join(cache_key(source).ok()?), info)
+    }
+
+    /// Starts building the cache of `source` in the folder `root` in the background.
+    pub fn build_in(root: &Path, source: &Path, info: MediaInfo, notify: Notify) -> Result<Self> {
+        Self::build(source, root.join(cache_key(source)?), info, notify)
     }
 
     pub fn frames_path(&self) -> PathBuf {

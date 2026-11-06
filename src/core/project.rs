@@ -11,16 +11,44 @@ use std::path::{Path, PathBuf};
 
 pub const PROJECT_FILE: &str = "project.json";
 pub const RENDERS_FOLDER: &str = "renders";
-pub const VERSION: u32 = 1;
+/// 2: several tracks, each with an id of its own. An editor that knows only one track can't open
+/// such a file, and so can't lose the other tracks by saving it.
+pub const VERSION: u32 = 2;
 
 /// A video the project uses. It is not copied: the project remembers where it is.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Source {
     pub id: SourceId,
     pub path: PathBuf,
+    /// What it is called, when the file's name says little: a download is always `video.mp4`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// What the plugin that brought the video in said about it, if one did.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub meta: BTreeMap<String, String>,
+}
+
+impl Source {
+    /// What the user sees it as.
+    pub fn label(&self) -> String {
+        self.name.clone().unwrap_or_else(|| file_label(&self.path))
+    }
+}
+
+/// A file's name, or the whole path if it has none.
+pub fn file_label(path: &Path) -> String {
+    path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned())
+}
+
+/// Adds a video to the sources, unless the same file is there already. Returns its id and whether
+/// it is new.
+pub fn add_source(sources: &mut Vec<Source>, path: PathBuf, name: Option<String>, meta: BTreeMap<String, String>) -> (SourceId, bool) {
+    if let Some(existing) = sources.iter().find(|source| same_file(&source.path, &path)) {
+        return (existing.id, false);
+    }
+    let id = sources.iter().map(|source| source.id + 1).max().unwrap_or(0);
+    sources.push(Source { id, path, name, meta });
+    (id, true)
 }
 
 /// Where the user left things. None of this changes the result.
@@ -53,7 +81,7 @@ impl Project {
     pub fn new(name: String, video: PathBuf, duration: f64) -> Self {
         Self {
             version: VERSION,
-            sources: vec![Source { id: 0, path: video, meta: BTreeMap::new() }],
+            sources: vec![Source { id: 0, path: video, name: Some(name.clone()), meta: BTreeMap::new() }],
             sequence: Sequence::new(Clip::new(name.clone(), duration)),
             name,
             view: ViewState::default(),
@@ -76,7 +104,15 @@ impl Project {
         if header.version > VERSION {
             bail!("it was saved by a newer version of the editor (format {}, this one reads up to {VERSION})", header.version);
         }
-        serde_json::from_slice(bytes).context("the file is damaged")
+        let mut project: Self = serde_json::from_slice(bytes).context("the file is damaged")?;
+        // What came from the first version: one track with no id, a source without a name. The
+        // project and its clip were named after the video then.
+        project.version = VERSION;
+        project.sequence.number_tracks();
+        for source in project.sources.iter_mut().filter(|source| source.name.is_none()) {
+            source.name = project.sequence.clips().find(|(_, clip)| clip.source == source.id).map(|(_, clip)| clip.name.clone());
+        }
+        Ok(project)
     }
 
     /// Writes the project into `dir`. What is written is read back first, so that a value JSON
@@ -178,6 +214,42 @@ mod tests {
         let error = format!("{:#}", Project::load(&dir).unwrap_err());
         assert!(error.contains("damaged"), "{error}");
         assert_eq!(fs::read_to_string(&path).unwrap(), "{ \"version\": 1, \"name\": ");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_of_the_first_version_opens() {
+        let mut value = serde_json::to_value(edited()).unwrap();
+        value["version"] = 1.into();
+        value["sources"][0].as_object_mut().unwrap().remove("name");
+        value["sequence"]["tracks"][0].as_object_mut().unwrap().remove("id");
+        let mut second = value["sequence"]["tracks"][0].clone();
+        second["clips"] = serde_json::json!([]);
+        value["sequence"]["tracks"].as_array_mut().unwrap().push(second);
+
+        let project = Project::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(project.version, VERSION);
+        assert_eq!(project.sources[0].label(), "clip");
+        assert_eq!(project.sequence.tracks.iter().map(|track| track.id).collect::<Vec<_>>(), [0, 1]);
+        assert_eq!(project.sequence.clips().count(), 1);
+    }
+
+    #[test]
+    fn a_file_is_added_once() {
+        let dir = temp_dir("pool");
+        let (a, b) = (dir.join("a.mp4"), dir.join("b.mp4"));
+        fs::write(&a, "a").unwrap();
+        fs::write(&b, "b").unwrap();
+        let mut sources = Project::new("first".into(), a.clone(), 1.0).sources;
+        assert_eq!(add_source(&mut sources, b.clone(), None, BTreeMap::new()), (1, true));
+        // The same file, written another way.
+        let again = dir.join(".").join("a.mp4");
+        assert_eq!(add_source(&mut sources, again, Some("x".into()), BTreeMap::new()), (0, false));
+        assert_eq!(sources.len(), 2);
+        assert_eq!((sources[0].label(), sources[1].label()), ("first".to_owned(), "b.mp4".to_owned()));
+        // Ids are not given twice, even after a source is gone.
+        sources.remove(0);
+        assert_eq!(add_source(&mut sources, a, None, BTreeMap::new()), (2, true));
         let _ = fs::remove_dir_all(&dir);
     }
 
