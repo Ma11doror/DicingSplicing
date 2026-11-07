@@ -1,6 +1,6 @@
 //! Rendering the edit to a file with ffmpeg, always from the original source.
 
-use crate::core::edit::{Clip, ClipId, Sequence, Span};
+use crate::core::edit::{Clip, ClipId, Curve, Edge, Sequence, Span};
 use crate::core::export::{ExportSettings, FrameRate, Rate, VideoCodec};
 use crate::core::preset::Preset;
 use crate::core::tools;
@@ -84,32 +84,48 @@ fn pull_in(position: f64, max: f64) -> f64 {
     }
 }
 
-/// A run of the result's frames that come from one clip, or are black.
+/// A run of the result's frames that come from one clip, or are black. While the clip fades, what
+/// is `under` it shows through; with nothing under it, it fades into black.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Piece {
     first: u64,
     count: u64,
     clip: Option<ClipId>,
+    under: Option<ClipId>,
 }
 
-/// The result's picture, frame by frame: the clip each run of frames shows. Where one clip gives
-/// way to another falls on the frame nearest to where it is on the timeline.
+/// The result's picture, frame by frame: the clip each run of frames shows, and while it fades, the
+/// clip under it. Where one clip gives way to another, or a fade begins or ends, falls on the frame
+/// nearest to where it is on the timeline.
 fn pieces(sequence: &Sequence, fps: f64) -> Vec<Piece> {
     let export = sequence.export;
     let frame_at = |t: f64| ((t - export.start) * fps).round().max(0.0) as u64;
+    let mut cuts = vec![export.start, export.end];
+    for (span, _) in sequence.picture(export) {
+        cuts.extend([span.start, span.end]);
+    }
+    for (_, clip) in sequence.clips().filter(|(id, _)| !sequence.tracks[id.track].hidden) {
+        let (fade_in, fade_out) = clip.fade_lengths();
+        cuts.extend([clip.start + fade_in, clip.end() - fade_out].into_iter().filter(|&t| export.contains(t)));
+    }
+    cuts.sort_by(f64::total_cmp);
     let mut pieces: Vec<Piece> = Vec::new();
-    for (span, clip) in sequence.picture(export) {
-        let (first, end) = (frame_at(span.start), frame_at(span.end));
+    for pair in cuts.windows(2) {
+        let (first, end) = (frame_at(pair[0]), frame_at(pair[1]));
         if end <= first {
             continue;
         }
+        let middle = (pair[0] + pair[1]) / 2.0;
+        let clip = sequence.shown_at(middle);
+        let fading = clip.filter(|&id| sequence.clip(id).opacity(middle) < 1.0);
+        let under = fading.and_then(|id| sequence.shown_under(middle, id.track));
         match pieces.last_mut() {
-            Some(last) if last.clip == clip => last.count = end - last.first,
-            _ => pieces.push(Piece { first, count: end - first, clip }),
+            Some(last) if (last.clip, last.under) == (clip, under) => last.count = end - last.first,
+            _ => pieces.push(Piece { first, count: end - first, clip, under }),
         }
     }
     if pieces.is_empty() {
-        pieces.push(Piece { first: 0, count: frame_at(export.end).max(1), clip: None });
+        pieces.push(Piece { first: 0, count: frame_at(export.end).max(1), clip: None, under: None });
     }
     pieces
 }
@@ -201,11 +217,11 @@ pub struct RenderPlan {
     pub total: f64,
 }
 
-/// Adds an input that starts a little before `start`: seeking before the input saves decoding
-/// everything up to it, and decoding covers the rest exactly. Timestamps then count from where the
-/// seek landed. Returns the input's number and where it starts.
-fn add_input(args: &mut Vec<OsString>, inputs: &mut usize, path: &Path, start: f64, end: f64) -> (usize, f64) {
-    let seek = (start - SEEK_MARGIN).max(0.0);
+/// Adds an input that starts a little before `start`, and not after `latest`: seeking before the
+/// input saves decoding everything up to it, and decoding covers the rest exactly. Timestamps then
+/// count from where the seek landed. Returns the input's number and where it starts.
+fn add_input(args: &mut Vec<OsString>, inputs: &mut usize, path: &Path, start: f64, end: f64, latest: f64) -> (usize, f64) {
+    let seek = (start - SEEK_MARGIN).min(latest).max(0.0);
     if seek > 0.0 {
         args.push("-ss".into());
         args.push(format!("{seek:.6}").into());
@@ -217,6 +233,163 @@ fn add_input(args: &mut Vec<OsString>, inputs: &mut usize, path: &Path, start: f
     args.push(path.into());
     *inputs += 1;
     (*inputs - 1, seek)
+}
+
+/// A fade of a clip as the filters see it: from source time `at`, for `length` seconds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FadeAt {
+    edge: Edge,
+    at: f64,
+    length: f64,
+    curve: Curve,
+}
+
+impl FadeAt {
+    /// How much of the clip shows, or sounds, at the time `t` of an input that starts at source time
+    /// `seek`: the fade's curve as an ffmpeg expression, the same formula as `Curve::ease`.
+    fn level(&self, seek: f64) -> String {
+        let x = format!("clip((t-{:.6})/{:.6},0,1)", self.at - seek, self.length);
+        let ease = match self.curve {
+            Curve::Linear => x,
+            Curve::EaseIn => format!("pow({x},2)"),
+            Curve::EaseOut => format!("1-pow(1-{x},2)"),
+            Curve::EaseInOut => format!("(1-cos(PI*{x}))/2"),
+            Curve::StrongEaseIn => format!("pow({x},3)"),
+            Curve::StrongEaseOut => format!("1-pow(1-{x},3)"),
+            Curve::StrongEaseInOut => format!("if(lt({x},0.5),4*pow({x},3),1-4*pow(1-{x},3))"),
+        };
+        match self.edge {
+            Edge::In => ease,
+            Edge::Out => format!("1-({ease})"),
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self.edge {
+            Edge::In => "in",
+            Edge::Out => "out",
+        }
+    }
+
+    /// The sound filter: ffmpeg's own for a straight fade, the formula sample by sample for a curve.
+    fn sound_filter(&self, seek: f64) -> String {
+        match self.curve {
+            Curve::Linear => format!(",afade=t={}:st={:.6}:d={:.6}", self.kind(), self.at - seek, self.length),
+            _ => format!(",aeval=exprs='val(ch)*({})':c=same", self.level(seek)),
+        }
+    }
+}
+
+/// The fades of `clip` that reach into its source time `start..end`, for `sound` or the picture, and
+/// the latest a seek may land so that their timestamps are not before the input's start.
+fn fade_filters_of(clip: &Clip, start: f64, end: f64, sound: bool) -> (Vec<FadeAt>, f64) {
+    let (fade_in, fade_out) = clip.fade_lengths();
+    let applies = |edge| clip.fade(edge).is_some_and(|fade| if sound { fade.sound } else { fade.picture });
+    let mut fades = Vec::new();
+    let mut latest = f64::INFINITY;
+    if fade_in > 0.0 && applies(Edge::In) && start < clip.source_in + fade_in {
+        fades.push(FadeAt { edge: Edge::In, at: clip.source_in, length: fade_in, curve: clip.fade_curve(Edge::In) });
+        latest = latest.min(clip.source_in);
+    }
+    if fade_out > 0.0 && applies(Edge::Out) && end > clip.source_out - fade_out {
+        fades.push(FadeAt { edge: Edge::Out, at: clip.source_out - fade_out, length: fade_out, curve: clip.fade_curve(Edge::Out) });
+        latest = latest.min(clip.source_out - fade_out);
+    }
+    (fades, latest)
+}
+
+/// Settings for drawing the frames of one clip in the result.
+struct Frames<'a> {
+    files: &'a SourceFiles,
+    sequence: &'a Sequence,
+    /// The result's frame rate, as ffmpeg takes it and as a number.
+    fps: &'a str,
+    rate: f64,
+    pixels: [u32; 2],
+}
+
+/// The filters that make the frames of `clip` for the run of result frames `(first, count)`, ending
+/// in `label`. Its fades take its picture into black, or with `alpha` into transparency, for what is
+/// under it to show through.
+///
+/// A straight fade is ffmpeg's `fade`. One by another curve is a mask of how much shows, made frame by
+/// frame by the curve's formula; with nothing under the clip, it is laid over black.
+fn clip_frames(frames: &Frames, args: &mut Vec<OsString>, inputs: &mut usize, id: ClipId, (first, count): (u64, u64), alpha: bool, label: &str) -> Result<String> {
+    let (sequence, rate, fps) = (frames.sequence, frames.rate, frames.fps);
+    let clip = sequence.clip(id);
+    let file = file_of(frames.files, clip)?;
+    // The source's moment at the first frame. Frames before it stay until `fps`, which needs them to
+    // know what is on screen at that moment; a source that ends a frame early has its last frame held.
+    let start = clip.source_time(sequence.export.start + first as f64 / rate);
+    let end = start + count as f64 / rate;
+    let (fades, latest) = fade_filters_of(clip, start, end, false);
+    let (input, seek) = add_input(args, inputs, &file.path, start, end, latest);
+    let (from, to) = (start - seek, end - seek);
+    // Fades go by the input's own timestamps, before they are moved to the result's.
+    let curved = fades.iter().any(|fade| fade.curve != Curve::Linear);
+    let transparent = alpha || curved;
+    let name = label.trim_matches(['[', ']']);
+    let mut fade = String::new();
+    if transparent && !fades.is_empty() {
+        fade += ",format=yuva420p";
+    }
+    let mut mask = String::new();
+    for f in &fades {
+        if f.curve == Curve::Linear {
+            fade += &format!(",fade=t={}:st={:.6}:d={:.6}{}", f.kind(), f.at - seek, f.length, if transparent { ":alpha=1" } else { "" });
+        } else {
+            // White, its contrast around mid gray taken from 1 to -1: the mask's value is the level
+            // times 255. Brightness stays 0: ffmpeg rounds it to whole percents.
+            mask += &format!(",eq=contrast='2*({})-1':eval=frame", f.level(seek));
+        }
+    }
+    if !mask.is_empty() {
+        fade += &format!(",split[{name}c][{name}m];[{name}m]alphaextract{mask}[{name}a];[{name}c][{name}a]alphamerge");
+    }
+    let frame = frame_filter(file.info.width as f64, file.info.height as f64, &clip.transform, sequence.output.outline(), frames.pixels);
+    let format = if transparent { "yuva420p" } else { "yuv420p" };
+    let over_black = curved && !alpha;
+    let out = if over_black { format!("[{name}o]") } else { label.to_owned() };
+    let mut filters = format!(
+        "[{input}:V:0]trim=end={to:.6}{fade},setpts=PTS{:+.6}/TB,fps={fps}:start_time=0,{frame},\
+         tpad=stop=-1:stop_mode=clone,trim=end_frame={count},format={format}{out}",
+        -from
+    );
+    if over_black {
+        let [px, py] = frames.pixels;
+        filters += &format!(
+            ";color=c=black:s={px}x{py}:r={fps},trim=end_frame={count},format=yuv420p,setsar=1[{name}k];\
+             [{name}k][{name}o]overlay=format=auto,format=yuv420p{label}"
+        );
+    }
+    Ok(filters)
+}
+
+/// The picture of the edit as filters into `[v]`: its pieces one after another, a fading clip over
+/// the clip under it.
+fn picture_graph(frames: &Frames, args: &mut Vec<OsString>, inputs: &mut usize, graph: &mut Vec<String>) -> Result<()> {
+    let [px, py] = frames.pixels;
+    let pieces = pieces(frames.sequence, frames.rate);
+    let mut labels = String::new();
+    for (n, piece) in pieces.iter().enumerate() {
+        let count = piece.count;
+        let label = if pieces.len() == 1 { "[v]".to_owned() } else { format!("[p{n}]") };
+        match (piece.clip, piece.under) {
+            (None, _) => graph.push(format!("color=c=black:s={px}x{py}:r={},trim=end_frame={count},format=yuv420p,setsar=1{label}", frames.fps)),
+            (Some(id), None) => graph.push(clip_frames(frames, args, inputs, id, (piece.first, count), false, &label)?),
+            // The clip comes in or goes out over the one under it, which may be fading into black itself.
+            (Some(id), Some(under)) => {
+                graph.push(clip_frames(frames, args, inputs, under, (piece.first, count), false, &format!("[u{n}]"))?);
+                graph.push(clip_frames(frames, args, inputs, id, (piece.first, count), true, &format!("[o{n}]"))?);
+                graph.push(format!("[u{n}][o{n}]overlay=format=auto,format=yuv420p{label}"));
+            }
+        }
+        labels += &label;
+    }
+    if pieces.len() > 1 {
+        graph.push(format!("{labels}concat=n={}:v=1:a=0[v]", pieces.len()));
+    }
+    Ok(())
 }
 
 /// What ffmpeg has to do to write the edit to `output`.
@@ -231,8 +404,6 @@ pub fn plan(files: &SourceFiles, sequence: &Sequence, output: &Path) -> Result<R
     let export = sequence.export;
     let total = export.len();
     let pixels = settings.pixels(sequence.output);
-    let [px, py] = pixels;
-    let outline = sequence.output.outline();
     let (fps, rate) = frame_rate(sequence, files);
     for (_, clip) in reaching(sequence) {
         file_of(files, clip)?;
@@ -241,37 +412,7 @@ pub fn plan(files: &SourceFiles, sequence: &Sequence, output: &Path) -> Result<R
     let mut args: Vec<OsString> = ["-v", "error", "-nostdin", "-nostats", "-progress", "pipe:1", "-y"].map(OsString::from).to_vec();
     let mut inputs = 0;
     let mut graph = Vec::new();
-
-    let pieces = pieces(sequence, rate);
-    let mut labels = String::new();
-    for (n, piece) in pieces.iter().enumerate() {
-        let count = piece.count;
-        let label = if pieces.len() == 1 { "[v]".to_owned() } else { format!("[p{n}]") };
-        match piece.clip {
-            None => graph.push(format!("color=c=black:s={px}x{py}:r={fps},trim=end_frame={count},format=yuv420p,setsar=1{label}")),
-            Some(id) => {
-                let clip = sequence.clip(id);
-                let file = file_of(files, clip)?;
-                // The source's moment at the piece's first frame. Frames before it stay until `fps`,
-                // which needs them to know what is on screen at that moment; a source that ends a
-                // frame early has its last frame held.
-                let start = clip.source_time(export.start + piece.first as f64 / rate);
-                let end = start + count as f64 / rate;
-                let (input, seek) = add_input(&mut args, &mut inputs, &file.path, start, end);
-                let (from, to) = (start - seek, end - seek);
-                let frame = frame_filter(file.info.width as f64, file.info.height as f64, &clip.transform, outline, pixels);
-                graph.push(format!(
-                    "[{input}:V:0]trim=end={to:.6},setpts=PTS{:+.6}/TB,fps={fps}:start_time=0,{frame},\
-                     tpad=stop=-1:stop_mode=clone,trim=end_frame={count},format=yuv420p{label}",
-                    -from
-                ));
-            }
-        }
-        labels += &label;
-    }
-    if pieces.len() > 1 {
-        graph.push(format!("{labels}concat=n={}:v=1:a=0[v]", pieces.len()));
-    }
+    picture_graph(&Frames { files, sequence, fps: &fps, rate, pixels }, &mut args, &mut inputs, &mut graph)?;
 
     let has_sound = settings.audio_codec.encoder().is_some()
         && reaching(sequence).any(|(_, clip)| files.get(&clip.source).is_some_and(|file| file.info.has_audio));
@@ -282,15 +423,18 @@ pub fn plan(files: &SourceFiles, sequence: &Sequence, output: &Path) -> Result<R
         for (n, (clip, span)) in heard.iter().enumerate() {
             let file = file_of(files, clip)?;
             let (start, end) = (clip.source_time(span.start), clip.source_time(span.end));
-            let (input, seek) = add_input(&mut args, &mut inputs, &file.path, start, end);
+            let (clip_fades, latest) = fade_filters_of(clip, start, end, true);
+            let (input, seek) = add_input(&mut args, &mut inputs, &file.path, start, end, latest);
             let (from, to) = (start - seek, end - seek);
             let lead = span.start - export.start;
+            // The clip's own fades, by the input's timestamps, which `atrim` leaves as they are.
+            let fade: String = clip_fades.iter().map(|fade| fade.sound_filter(seek)).collect();
             // Moved to its place, then filled from 0: adelay only shifts the timestamps, which would
             // leave a hole in the stream instead of silence. The filling also evens out gaps in the
             // source's own sound, so that it stays with the picture.
             let label = if heard.len() == 1 { format!("{fades}[a]") } else { format!("[s{n}]") };
             graph.push(format!(
-                "[{input}:a:0]atrim=start={from:.6}:end={to:.6},asetpts=PTS-{from:.6}/TB+{lead:.6}/TB,\
+                "[{input}:a:0]atrim=start={from:.6}:end={to:.6}{fade},asetpts=PTS-{from:.6}/TB+{lead:.6}/TB,\
                  aresample=48000:async=1:first_pts=0,aformat=channel_layouts=stereo,volume={:.4},\
                  apad=whole_dur={total:.6},atrim=end={total:.6}{label}",
                 clip.gain()
@@ -370,24 +514,24 @@ pub fn video_task(files: &SourceFiles, sequence: &Sequence, output: &Path) -> Re
     Ok(RenderTask { plan: plan(files, sequence, &part)?, part, output: output.to_owned() })
 }
 
-/// Saves the output's picture at timeline `time` as an image, from the original source.
+/// Saves the output's picture at timeline `time` as an image, from the original sources: the frame
+/// the edit has there, fades and what shows through them included.
 pub fn frame_task(files: &SourceFiles, sequence: &Sequence, time: f64, output: &Path) -> Result<RenderTask> {
-    let Some(id) = sequence.shown_at(time) else { bail!("There is no picture at the playhead.") };
-    let clip = sequence.clip(id);
-    let file = file_of(files, clip)?;
-    let info = &file.info;
+    if sequence.shown_at(time).is_none() {
+        bail!("There is no picture at the playhead.");
+    }
+    let (fps, rate) = frame_rate(sequence, files);
+    // An edit of one frame, from `time` on.
+    let mut moment = sequence.clone();
+    moment.export = Span { start: time, end: time + 1.0 / rate };
     let part = part_path(output);
-    let last_frame = (info.duration - 1.0 / info.fps.as_f64()).max(0.0);
-    let source_time = clip.source_time(time).clamp(0.0, last_frame);
-    let filter = frame_filter(info.width as f64, info.height as f64, &clip.transform, sequence.output.outline(), sequence.settings.pixels(sequence.output));
-
-    let mut args: Vec<OsString> = ["-v", "error", "-nostdin", "-nostats", "-progress", "pipe:1", "-y", "-ss"].map(OsString::from).to_vec();
-    args.push(format!("{source_time:.6}").into());
-    args.push("-i".into());
-    args.push((&file.path).into());
-    args.push("-vf".into());
-    args.push(filter.into());
-    args.extend(["-frames:v", "1", "-update", "1"].map(OsString::from));
+    let mut args: Vec<OsString> = ["-v", "error", "-nostdin", "-nostats", "-progress", "pipe:1", "-y"].map(OsString::from).to_vec();
+    let mut graph = Vec::new();
+    let frames = Frames { files, sequence: &moment, fps: &fps, rate, pixels: sequence.settings.pixels(sequence.output) };
+    picture_graph(&frames, &mut args, &mut 0, &mut graph)?;
+    args.push("-filter_complex".into());
+    args.push(graph.join(";").into());
+    args.extend(["-map", "[v]", "-frames:v", "1", "-update", "1"].map(OsString::from));
     args.push((&part).into());
     Ok(RenderTask { plan: RenderPlan { args, total: 1.0 }, part, output: output.to_owned() })
 }
@@ -741,14 +885,14 @@ mod tests {
     fn pieces_follow_the_clips_on_the_frame_grid() {
         let id = ClipId { track: 0, index: 0 };
         let mut s = sequence(10.0);
-        assert_eq!(pieces(&s, 30.0), [Piece { first: 0, count: 300, clip: Some(id) }]);
+        assert_eq!(pieces(&s, 30.0), [Piece { first: 0, count: 300, clip: Some(id), under: None }]);
 
         // The clip trimmed to source 2..4 in place, the range around it: black on both sides.
         s.trim_start(id, 2.0, 0.1);
         s.trim_end(id, 4.0, 0.1);
         s.export = Span { start: 1.0, end: 5.0 };
-        let black = |first, count| Piece { first, count, clip: None };
-        assert_eq!(pieces(&s, 25.0), [black(0, 25), Piece { first: 25, count: 50, clip: Some(id) }, black(75, 25)]);
+        let black = |first, count| Piece { first, count, clip: None, under: None };
+        assert_eq!(pieces(&s, 25.0), [black(0, 25), Piece { first: 25, count: 50, clip: Some(id), under: None }, black(75, 25)]);
 
         // Out of the range: all black, and the warning says so.
         s.export = Span { start: 6.0, end: 8.0 };
@@ -763,7 +907,7 @@ mod tests {
         s.tracks.push(Track { id: 1, clips: vec![Clip { start: 4.01, source_out: 2.01, ..Clip::of(1, "b".into(), 5.0) }], ..Track::default() });
         s.export = Span { start: -1.0, end: 12.0 };
         let (below, above) = (Some(ClipId { track: 0, index: 0 }), Some(ClipId { track: 1, index: 0 }));
-        let piece = |first, count, clip| Piece { first, count, clip };
+        let piece = |first, count, clip| Piece { first, count, clip, under: None };
         let expected = [piece(0, 30, None), piece(30, 120, below), piece(150, 61, above), piece(211, 119, below), piece(330, 60, None)];
         assert_eq!(pieces(&s, 30.0), expected);
         assert_eq!(pieces(&s, 30.0).iter().map(|p| p.count).sum::<u64>(), 390);
@@ -780,6 +924,99 @@ mod tests {
         assert_eq!(heard(&s, &files).iter().map(|(clip, _)| clip.name.as_str()).collect::<Vec<_>>(), ["b"]);
         s.clip_mut(ClipId { track: 1, index: 0 }).muted = true;
         assert!(heard(&s, &files).is_empty());
+    }
+
+    #[test]
+    fn a_fade_is_a_piece_of_its_own_with_what_shows_through() {
+        // Below: 0..10 s. Above: 4..8 s, fading in over 1 s and out over 2 s. At 10 fps.
+        let mut s = sequence(10.0);
+        let mut above = Clip { start: 4.0, ..Clip::of(1, "b".into(), 4.0) };
+        above.add_fade(Edge::In);
+        above.add_fade(Edge::Out);
+        above.set_fade_length(Edge::Out, 2.0);
+        s.tracks.push(Track { id: 1, clips: vec![above], ..Track::default() });
+        let (below, top) = (Some(ClipId { track: 0, index: 0 }), Some(ClipId { track: 1, index: 0 }));
+        let piece = |first, count, clip, under| Piece { first, count, clip, under };
+        let expected = [piece(0, 40, below, None), piece(40, 10, top, below), piece(50, 10, top, None), piece(60, 20, top, below), piece(80, 20, below, None)];
+        assert_eq!(pieces(&s, 10.0), expected);
+
+        // Nothing under it: it fades into black, in one piece with the rest of it.
+        s.tracks[0].hidden = true;
+        let black = |first, count| Piece { first, count, clip: None, under: None };
+        assert_eq!(pieces(&s, 10.0), [black(0, 40), piece(40, 40, top, None), black(80, 20)]);
+        // Only the sound fades: the picture is whole.
+        s.tracks[0].hidden = false;
+        for crate::core::edit::Effect::Fade(fade) in &mut s.tracks[1].clips[0].effects {
+            fade.picture = false;
+        }
+        assert_eq!(pieces(&s, 10.0), [piece(0, 40, below, None), piece(40, 40, top, None), piece(80, 20, below, None)]);
+    }
+
+    #[test]
+    fn fades_go_into_the_filters_by_the_inputs_own_time() {
+        // A clip of source 2..12 s at 0 s, fading in over 1 s and out over 2 s, a 10 s range at 25 fps.
+        let mut s = Sequence::new(Clip { source_in: 2.0, source_out: 12.0, ..Clip::new("a".into(), 30.0) });
+        s.clip_mut(ClipId { track: 0, index: 0 }).add_fade(Edge::In);
+        s.clip_mut(ClipId { track: 0, index: 0 }).add_fade(Edge::Out);
+        s.clip_mut(ClipId { track: 0, index: 0 }).set_fade_length(Edge::Out, 2.0);
+        let files = files(Path::new("a.mp4"), &info(30.0));
+        let plan = plan(&files, &s, Path::new("out.mp4")).unwrap();
+        let graph = plan.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ");
+        // The input starts at 0 s, no later than the fade in: the fades are at 2 s and at 10 s of it.
+        assert!(graph.contains("fade=t=in:st=2.000000:d=1.000000,"), "{graph}");
+        assert!(graph.contains("fade=t=out:st=10.000000:d=2.000000,"), "{graph}");
+        assert!(graph.contains("afade=t=in:st=2.000000:d=1.000000"), "{graph}");
+        assert!(!graph.contains("alpha=1"), "nothing under it: into black. {graph}");
+    }
+
+    #[test]
+    fn curved_fades_are_a_mask_by_their_formula() {
+        // The same clip, fading in with an ease in and out with a strong ease out.
+        let mut s = Sequence::new(Clip { source_in: 2.0, source_out: 12.0, ..Clip::new("a".into(), 30.0) });
+        let id = ClipId { track: 0, index: 0 };
+        s.clip_mut(id).add_fade(Edge::In);
+        s.clip_mut(id).add_fade(Edge::Out);
+        s.clip_mut(id).set_fade_length(Edge::Out, 2.0);
+        s.clip_mut(id).set_fade_curve(Edge::In, Curve::EaseIn);
+        s.clip_mut(id).set_fade_curve(Edge::Out, Curve::StrongEaseOut);
+        let files = files(Path::new("a.mp4"), &info(30.0));
+        let plan = plan(&files, &s, Path::new("out.mp4")).unwrap();
+        let graph = plan.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ");
+        let rise = "pow(clip((t-2.000000)/1.000000,0,1),2)";
+        let fall = "1-(1-pow(1-clip((t-10.000000)/2.000000,0,1),3))";
+        assert!(graph.contains(&format!("eq=contrast='2*({rise})-1':eval=frame")), "{graph}");
+        assert!(graph.contains(&format!("eq=contrast='2*({fall})-1':eval=frame")), "{graph}");
+        assert!(graph.contains("alphamerge") && graph.contains("color=c=black"), "over black: {graph}");
+        assert!(!graph.contains(",fade=t="), "no straight fades of the picture: {graph}");
+        assert!(graph.contains(&format!("aeval=exprs='val(ch)*({rise})':c=same")), "{graph}");
+        assert!(graph.contains(&format!("aeval=exprs='val(ch)*({fall})':c=same")), "{graph}");
+    }
+
+    /// Every curve's formula, run by ffmpeg the way a mask is made, gives what the preview shows.
+    #[test]
+    fn ffmpeg_follows_every_curve_like_the_preview() {
+        if !have_ffmpeg() {
+            return;
+        }
+        for curve in Curve::ALL {
+            for edge in [Edge::In, Edge::Out] {
+                let fade = FadeAt { edge, at: 0.5, length: 2.0, curve };
+                let level = fade.level(0.0);
+                let filter = format!("eq=contrast='2*({level})-1':eval=frame");
+                let output = tools::command(tools::FFMPEG)
+                    .args(["-v", "error", "-f", "lavfi", "-i", "color=c=white:s=8x8:r=10:d=3,format=gray", "-vf", &filter])
+                    .args(["-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"])
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{curve:?}: {}", String::from_utf8_lossy(&output.stderr));
+                let frames: Vec<u8> = output.stdout.chunks_exact(64).map(|frame| frame[0]).collect();
+                assert_eq!(frames.len(), 30);
+                for (n, &got) in frames.iter().enumerate() {
+                    let want = 255.0 * curve.level(edge, (n as f64 / 10.0 - 0.5) / 2.0);
+                    assert!((got as f64 - want).abs() <= 2.0, "{curve:?} {edge:?} at frame {n}: {got}, should be {want:.1}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -1166,6 +1403,122 @@ mod tests {
         assert!((mean_level(&rgb) - 128.0).abs() < 30.0, "{}", mean_level(&rgb));
         let rms = |from: f64, to: f64| sound_level(&path, from, to);
         assert!(rms(0.5, 1.5) < 5.0 && rms(2.5, 3.5) > 100.0, "{} {}", rms(0.5, 1.5), rms(2.5, 3.5));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The mean colour of a frame, as red, green and blue.
+    fn mean_color(path: &Path, t: f64, width: u32, height: u32) -> [f64; 3] {
+        let rgb = rgb_at(path, t, width, height);
+        let channel = |c: usize| rgb.iter().skip(c).step_by(3).map(|v| *v as f64).sum::<f64>() / (rgb.len() / 3) as f64;
+        [channel(0), channel(1), channel(2)]
+    }
+
+    /// A clip fades out of black on its own track, and over another clip on a track above it.
+    #[test]
+    fn fades_are_seen_and_heard_in_the_result() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let dir = temp_dir("fades_of_clips");
+        let gray = make_solid(&dir, "gray.mp4", "0x808080", 25, (320, 180), Some(300));
+        let red = make_solid(&dir, "red.mp4", "0xff0000", 25, (320, 180), None);
+        let files: SourceFiles = [(0, &gray), (1, &red)]
+            .into_iter()
+            .map(|(id, path)| (id, SourceFile { path: path.clone(), info: probe::probe(path).unwrap() }))
+            .collect();
+
+        // Gray 0..4 s alone, fading in over 2 s and out over 2 s.
+        let mut s = Sequence::new(Clip { source_out: 4.0, ..Clip::of(0, "gray".into(), 10.0) });
+        let id = ClipId { track: 0, index: 0 };
+        s.clip_mut(id).add_fade(Edge::In);
+        s.clip_mut(id).add_fade(Edge::Out);
+        s.clip_mut(id).set_fade_length(Edge::In, 2.0);
+        s.clip_mut(id).set_fade_length(Edge::Out, 2.0);
+        s.output = Output { preset: PresetId::Landscape, ..Output::default() };
+        s.settings.size = OutputSize::LongSide(320);
+        s.settings.speed = Speed::Ultrafast;
+        s.settings.fades = (0.0, 0.0);
+        s.settings.frame_rate = FrameRate::Fixed(25.0);
+        let path = render_all(&files, &s, &dir.join("alone.mp4"));
+        let level = |t: f64| mean_level(&rgb_at(&path, t, 320, 180));
+        assert!(level(0.0) < 8.0, "starts black: {}", level(0.0));
+        assert!((level(1.0) - 64.0).abs() < 12.0, "half way: {}", level(1.0));
+        assert!((level(2.0) - 128.0).abs() < 12.0, "whole: {}", level(2.0));
+        assert!((level(3.0) - 64.0).abs() < 12.0, "half way out: {}", level(3.0));
+        let rms = |from: f64, to: f64| sound_level(&path, from, to);
+        let (quiet, full) = (rms(0.0, 0.3), rms(1.9, 2.1));
+        assert!(quiet < full * 0.3 && rms(0.9, 1.1) > full * 0.35 && rms(0.9, 1.1) < full * 0.65, "{quiet} {} {full}", rms(0.9, 1.1));
+
+        // Red under it, 0..4 s: the gray clip comes in over the red one instead of out of black.
+        s.tracks.insert(0, Track { id: 1, clips: vec![Clip { source_out: 4.0, ..Clip::of(1, "red".into(), 10.0) }], ..Track::default() });
+        let path = render_all(&files, &s, &dir.join("over.mp4"));
+        let color = |t: f64| mean_color(&path, t, 320, 180);
+        let near = |got: [f64; 3], want: [f64; 3]| got.iter().zip(want).all(|(g, w)| (g - w).abs() < 20.0);
+        assert!(near(color(0.0), [255.0, 0.0, 0.0]), "red first: {:?}", color(0.0));
+        assert!(near(color(1.0), [191.0, 64.0, 64.0]), "half and half: {:?}", color(1.0));
+        assert!(near(color(2.0), [128.0, 128.0, 128.0]), "gray: {:?}", color(2.0));
+
+        // A saved frame is what the file has there.
+        let frame = dir.join("frame.png");
+        let job = RenderJob::start(frame_task(&files, &s, 1.0, &frame).unwrap(), Arc::new(|| {}));
+        assert!(matches!(wait_for_end(&job), RenderStatus::Done { .. }));
+        assert!(near(mean_color(&frame, 0.0, 320, 180), [191.0, 64.0, 64.0]), "{:?}", mean_color(&frame, 0.0, 320, 180));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Fades by curves: out of black and into it alone, over another clip, and in the sound; the file
+    /// has what the preview's formula says.
+    #[test]
+    fn curved_fades_are_seen_and_heard_as_the_preview_has_them() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let dir = temp_dir("curved_fades");
+        let gray = make_solid(&dir, "gray.mp4", "0x808080", 25, (320, 180), Some(300));
+        let red = make_solid(&dir, "red.mp4", "0xff0000", 25, (320, 180), None);
+        let files: SourceFiles = [(0, &gray), (1, &red)]
+            .into_iter()
+            .map(|(id, path)| (id, SourceFile { path: path.clone(), info: probe::probe(path).unwrap() }))
+            .collect();
+
+        // Gray 0..4 s alone, in over 2 s with an ease in, out over 2 s with an ease out.
+        let mut s = Sequence::new(Clip { source_out: 4.0, ..Clip::of(0, "gray".into(), 10.0) });
+        let id = ClipId { track: 0, index: 0 };
+        for (edge, curve) in [(Edge::In, Curve::EaseIn), (Edge::Out, Curve::EaseOut)] {
+            s.clip_mut(id).add_fade(edge);
+            s.clip_mut(id).set_fade_length(edge, 2.0);
+            s.clip_mut(id).set_fade_curve(edge, curve);
+        }
+        s.output = Output { preset: PresetId::Landscape, ..Output::default() };
+        s.settings.size = OutputSize::LongSide(320);
+        s.settings.speed = Speed::Ultrafast;
+        s.settings.fades = (0.0, 0.0);
+        s.settings.frame_rate = FrameRate::Fixed(25.0);
+        let path = render_all(&files, &s, &dir.join("alone.mp4"));
+        let level = |t: f64| mean_level(&rgb_at(&path, t, 320, 180));
+        let full = level(2.0);
+        assert!((full - 128.0).abs() < 12.0, "whole: {full}");
+        for t in [0.0, 0.5, 1.0, 1.5, 2.5, 3.0, 3.5] {
+            let want = full * s.clip(id).opacity(t);
+            assert!((level(t) - want).abs() < 6.0, "at {t} s: {}, should be {want:.1}", level(t));
+        }
+        // The sound goes by the same curves: a quarter of the way in at 1 s, not a half.
+        let rms = |from: f64, to: f64| sound_level(&path, from, to);
+        let (early, loud) = (rms(0.95, 1.05), rms(1.95, 2.05));
+        assert!((early / loud - 0.25).abs() < 0.06, "at 1 s: {early} of {loud}");
+        assert!((rms(2.95, 3.05) / loud - 0.25).abs() < 0.06, "at 3 s: {} of {loud}", rms(2.95, 3.05));
+
+        // Red under it, 0..4 s, and a strong ease in-out: the gray clip comes in over the red one.
+        s.clip_mut(id).set_fade_curve(Edge::In, Curve::StrongEaseInOut);
+        s.tracks.insert(0, Track { id: 1, clips: vec![Clip { source_out: 4.0, ..Clip::of(1, "red".into(), 10.0) }], ..Track::default() });
+        let path = render_all(&files, &s, &dir.join("over.mp4"));
+        let top = ClipId { track: 1, index: 0 };
+        for t in [0.5, 1.0, 1.5] {
+            let a = s.clip(top).opacity(t);
+            let want = [255.0 * (1.0 - a) + 128.0 * a, 128.0 * a, 128.0 * a];
+            let got = mean_color(&path, t, 320, 180);
+            assert!(got.iter().zip(want).all(|(g, w)| (g - w).abs() < 20.0), "at {t} s: {got:?}, should be {want:?}");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

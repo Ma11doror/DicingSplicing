@@ -716,9 +716,36 @@ fn paint_label(painter: &Painter, at: Pos2, text: String, color: Color32, lock: 
 #[derive(Default)]
 pub struct OutputView;
 
+/// A clip's picture under the one shown, which shows through while that one fades.
+pub struct Layer<'a> {
+    pub texture: &'a TextureHandle,
+    pub size: [f64; 2],
+    pub transform: Transform,
+    /// It may be fading itself, out of black.
+    pub opacity: f32,
+}
+
+/// The whole picture of a source, placed where its frame sees it in `rect`, tinted with `color`.
+fn placed_picture(texture: &TextureHandle, rect: Rect, size: [f64; 2], t: &Transform, outline: Outline, color: Color32) -> Shape {
+    let [w, h] = size;
+    let pixels_per_source = rect.width() as f64 / t.size(w, h, outline)[0];
+    let mut mesh = Mesh::with_texture(texture.id());
+    for [x, y] in [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]] {
+        let [u, v] = t.source_to_output(w, h, [x, y]);
+        let pos = rect.center() + vec2((u * pixels_per_source) as f32, (v * pixels_per_source) as f32);
+        let uv = pos2((x / w) as f32, (y / h) as f32);
+        mesh.vertices.push(Vertex { pos, uv, color });
+    }
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    Shape::mesh(mesh)
+}
+
 impl OutputView {
     /// What the output looks like: the transformed picture under the frame's mask, `box_size` pixels
-    /// large. Dragging moves the picture, the wheel zooms. Returns whether the user did either.
+    /// large, `opacity` of it over what is `under` it, or over black. Dragging moves the picture, the
+    /// wheel zooms. Returns whether the user did either.
+    #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -727,6 +754,8 @@ impl OutputView {
         outline: Outline,
         t: &mut Transform,
         box_size: egui::Vec2,
+        opacity: f32,
+        under: Option<Layer>,
     ) -> bool {
         let [w, h] = size;
         let (rect, response) = ui.allocate_exact_size(box_size, Sense::drag());
@@ -751,20 +780,22 @@ impl OutputView {
 
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, Color32::BLACK);
+        // What is under it, itself over black. Its bars are black.
+        if let Some(under) = &under {
+            let tint = Color32::WHITE.gamma_multiply(under.opacity.clamp(0.0, 1.0));
+            painter.add(placed_picture(under.texture, rect, under.size, &under.transform, outline, tint));
+        }
+        // The picture, placed where the frame sees it: the painter cuts it to the box, and with bars
+        // what is left of the box is black. While it fades, the whole box, bars included, is that much
+        // of it: first the box darkens by its opacity, then its picture adds that much of itself.
+        let opacity = opacity.clamp(0.0, 1.0);
+        if opacity < 1.0 {
+            painter.rect_filled(rect, 0.0, Color32::from_black_alpha((opacity * 255.0).round() as u8));
+        }
         if let Some(texture) = texture {
-            // The whole picture, placed where the frame sees it. The painter cuts it to the box, and
-            // with bars what is left of the box stays black.
-            let pixels_per_source = box_size.x as f64 / t.size(w, h, outline)[0];
-            let mut mesh = Mesh::with_texture(texture.id());
-            for [x, y] in [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]] {
-                let [u, v] = t.source_to_output(w, h, [x, y]);
-                let pos = rect.center() + vec2((u * pixels_per_source) as f32, (v * pixels_per_source) as f32);
-                let uv = pos2((x / w) as f32, (y / h) as f32);
-                mesh.vertices.push(Vertex { pos, uv, color: Color32::WHITE });
-            }
-            mesh.add_triangle(0, 1, 2);
-            mesh.add_triangle(0, 2, 3);
-            painter.add(Shape::mesh(mesh));
+            let level = (opacity * 255.0).round() as u8;
+            let add = if opacity < 1.0 { Color32::from_rgba_premultiplied(level, level, level, 0) } else { Color32::WHITE };
+            painter.add(placed_picture(texture, rect, [w, h], t, outline, add));
         }
         let border = Stroke::new(1.0, ui.visuals().weak_text_color());
         match outline.mask {

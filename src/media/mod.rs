@@ -7,6 +7,7 @@ pub mod player;
 pub mod probe;
 pub mod render;
 pub mod timecode;
+pub mod waveform;
 
 use crate::core::edit::SourceId;
 use crate::media::probe::MediaInfo;

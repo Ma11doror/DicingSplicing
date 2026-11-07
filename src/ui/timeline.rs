@@ -7,25 +7,43 @@
 //! of the selected clip trim it, the anchors on the ruler move the edges of the export range, the
 //! strip between them moves all of it. Dragged with the right or the middle button, it is always
 //! the tape. A click on the ruler takes the playhead there; in the rows it picks a clip, or nothing.
-//! The wheel zooms; over the headers it scrolls the rows. A row moves by dragging its name.
+//! The wheel zooms; over the headers or the scroll bar right of the rows it scrolls them. A row
+//! moves by dragging its name.
+//! With the Blade tool, a click on a clip cuts it there, with Shift every clip there. A right click
+//! on a clip opens its menu: fades and their curves, a cut there, delete. The selected clip's fades are dragged by
+//! the dots on its top edge.
 //!
-//! A row is a header and lanes: a lane for each thing its clips show. There is the picture now; the
-//! sound gets a lane of its own. Drawing, grabbing and dragging go through the lanes of the rows.
+//! A row is a header and lanes: a lane for each thing its clips show. Folded, there is the picture;
+//! unfolded, also the effects of each clip and its sound as a graph. A clip covers all the lanes of
+//! its row, and is grabbed, cut and trimmed by any of them.
 
-use crate::core::edit::{Clip, ClipId, SourceId, Sequence, Span, Track, TrackId};
+use crate::core::edit::{Clip, ClipId, Curve, Edge, Effect, SourceId, Sequence, Span, Track, TrackId};
+use crate::media::geometry::Transform;
 use crate::media::timecode;
-use egui::{pos2, vec2, Align2, Color32, CursorIcon, FontId, PointerButton, Pos2, Rect, RichText, Rounding, Sense, Shape, Stroke};
+use crate::media::waveform::Peaks;
+use crate::ui::{curve_choice, grip_dots};
+use egui::{pos2, vec2, Align2, Color32, CursorIcon, FontId, Mesh, PointerButton, Pos2, Rect, RichText, Rounding, Sense, Shape, Stroke};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, OnceLock};
 
 const LABEL_HEIGHT: f32 = 26.0;
 const RULER_HEIGHT: f32 = 32.0;
 /// Bottom of the ruler, where the export range is drawn; dragging it moves the range.
 const STRIP_HEIGHT: f32 = 12.0;
 const PICTURE_LANE_HEIGHT: f32 = 44.0;
+const EFFECTS_LANE_HEIGHT: f32 = 24.0;
+const SOUND_LANE_HEIGHT: f32 = 52.0;
 /// Left of the rows: the name of each track and what can be done with it.
-const HEADER_WIDTH: f32 = 172.0;
+const HEADER_WIDTH: f32 = 204.0;
+/// The six dots a row is dragged by, left of its name.
+const ROW_GRIP_SIZE: [f32; 2] = [14.0, 16.0];
+/// The triangle that folds and unfolds a row.
+const FOLD_SIZE: [f32; 2] = [16.0, 16.0];
 /// When the rows need more than this, they scroll.
 const ROWS_MAX_HEIGHT: f32 = 4.0 * PICTURE_LANE_HEIGHT;
+/// The scroll bar of the rows, over their right edge, and the shortest its thumb gets.
+const SCROLL_BAR_WIDTH: f32 = 10.0;
+const SCROLL_THUMB_MIN: f32 = 24.0;
 const CLIP_MARGIN: f32 = 4.0;
 const HANDLE_WIDTH: f32 = 12.0;
 const ANCHOR_WIDTH: f32 = 9.0;
@@ -50,12 +68,62 @@ const EXPORT_COLOR: Color32 = Color32::from_rgb(64, 150, 240);
 const CLIP_COLOR: Color32 = Color32::from_rgb(72, 88, 128);
 const HANDLE_COLOR: Color32 = Color32::from_rgb(255, 200, 40);
 const MISSING_COLOR: Color32 = Color32::from_rgb(230, 80, 70);
+const CUT_COLOR: Color32 = Color32::from_rgb(255, 120, 60);
+/// A fade's slope over a clip, and the part of the clip it darkens.
+const FADE_LINE: Color32 = Color32::from_rgb(255, 200, 40);
+const FADE_SHADE: Color32 = Color32::from_black_alpha(90);
+/// The handle a fade's length is dragged by, on the clip's top edge.
+const FADE_HANDLE_SIZE: [f32; 2] = [18.0, 10.0];
+const CHIP_COLOR: Color32 = Color32::from_rgb(96, 80, 150);
+const WAVE_COLOR: Color32 = Color32::from_rgb(90, 200, 160);
+/// Under the effects and the sound of a clip, darker than its picture lane.
+const LANE_SHADE: Color32 = Color32::from_black_alpha(70);
 /// Laid over everything outside the export range.
 const OUTSIDE_EXPORT_TINT: Color32 = Color32::from_rgba_premultiplied(56, 56, 56, 110);
 
+/// What a click on a clip does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Tool {
+    /// Picks it; dragging moves it, its edges trim it.
+    #[default]
+    Select,
+    /// Cuts it in two where it was clicked.
+    Blade,
+}
+
+/// A part of the Output tab that an effect's plaque leads to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Frame,
+    Sound,
+    Effects,
+}
+
+/// What the graph of a source's sound can be.
+#[derive(Clone)]
+pub enum SourceSound {
+    /// The source has no sound.
+    Silent,
+    /// The graph, once it is made.
+    Graph(Arc<OnceLock<Peaks>>),
+}
+
+/// Where a cut would go, under the pointer with the Blade tool.
+#[derive(Clone, Copy)]
+struct Cut {
+    time: f64,
+    track: usize,
+    /// Shift is held: every clip there is cut.
+    all: bool,
+}
+
 pub struct Timeline {
+    pub tool: Tool,
     /// Pixels per second. Set from the bar width on first show.
     pps: Option<f32>,
+    /// The tracks whose rows show their clips' effects and sound.
+    expanded: BTreeSet<TrackId>,
+    cut: Option<Cut>,
     /// How far the rows are scrolled down, in pixels.
     scroll: f32,
     drag: Option<Drag>,
@@ -79,6 +147,43 @@ pub struct Timeline {
     row_drag: Option<TrackId>,
     /// The pointer is over the ruler here: a click takes the playhead to it.
     ruler_hover: Option<f32>,
+    /// Where the thumb of the rows' scroll bar was grabbed, from its top.
+    thumb_grab: f32,
+    /// The clip whose menu is open, and the time it was opened at: a cut from the menu goes there.
+    menu: Option<(ClipId, f64)>,
+    /// The rows' scroll bar as it is drawn: the bar, its thumb, and whether the pointer is on it.
+    scroll_bar: Option<(Rect, Rect, bool)>,
+}
+
+/// The scroll bar of the rows: where its thumb is for a scroll, and the scroll for where the thumb is.
+#[derive(Debug, Clone, Copy)]
+struct RowsBar {
+    track: Rect,
+    thumb_height: f32,
+    max_scroll: f32,
+}
+
+impl RowsBar {
+    /// For rows `total` pixels tall, of which `shown` are in sight.
+    fn new(track: Rect, shown: f32, total: f32) -> Self {
+        let thumb_height = (track.height() * shown / total).max(SCROLL_THUMB_MIN).min(track.height());
+        Self { track, thumb_height, max_scroll: (total - shown).max(0.0) }
+    }
+
+    /// How far the thumb can go.
+    fn travel(&self) -> f32 {
+        (self.track.height() - self.thumb_height).max(1.0)
+    }
+
+    fn thumb(&self, scroll: f32) -> Rect {
+        let top = self.track.top() + scroll / self.max_scroll.max(1.0) * self.travel();
+        Rect::from_x_y_ranges(self.track.x_range(), top..=top + self.thumb_height)
+    }
+
+    /// The scroll that puts the thumb's top at `top`.
+    fn scroll_at(&self, top: f32) -> f32 {
+        ((top - self.track.top()) / self.travel() * self.max_scroll).clamp(0.0, self.max_scroll)
+    }
 }
 
 /// Where a clip let go over the rows goes.
@@ -108,13 +213,15 @@ enum Drag {
     ClipStart(ClipId),
     ClipEnd(ClipId),
     ClipMove(ClipId),
+    /// The length of a clip's fade, by its handle.
+    Fade(ClipId, Edge),
 }
 
 impl Drag {
     /// The clip this drag is about.
     fn clip(self) -> Option<ClipId> {
         match self {
-            Drag::ClipStart(id) | Drag::ClipEnd(id) | Drag::ClipMove(id) => Some(id),
+            Drag::ClipStart(id) | Drag::ClipEnd(id) | Drag::ClipMove(id) | Drag::Fade(id, _) => Some(id),
             _ => None,
         }
     }
@@ -124,10 +231,12 @@ impl Drag {
 pub struct TimelineResponse {
     /// The user moved the playhead.
     pub seeked: bool,
-    /// The user grabbed an edge, a clip or the export range, or changed a track.
+    /// The user grabbed an edge, a clip or the export range, cut a clip, or changed a track.
     pub edit_started: bool,
     /// While an edge is dragged: the time whose frame the preview should show instead of the playhead's.
     pub peek: Option<f64>,
+    /// A plaque of an effect was clicked: the part of the Output tab it stands for.
+    pub open: Option<Section>,
 }
 
 /// What the timeline needs to know besides the edit.
@@ -137,6 +246,8 @@ pub struct TimelineEnv<'a> {
     pub missing: &'a BTreeSet<SourceId>,
     /// Sources that can be dropped on the timeline, with what their clip is called and how long it is.
     pub placeable: &'a BTreeMap<SourceId, (String, f64)>,
+    /// The graph of each source's sound, for unfolded rows.
+    pub sounds: &'a BTreeMap<SourceId, SourceSound>,
 }
 
 /// What a track's menu or the buttons over the rows asked for, done once the rows are drawn.
@@ -170,23 +281,102 @@ impl View {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lane {
     Picture,
+    Effects,
+    Sound,
 }
 
 impl Lane {
     fn height(self) -> f32 {
         match self {
             Lane::Picture => PICTURE_LANE_HEIGHT,
+            Lane::Effects => EFFECTS_LANE_HEIGHT,
+            Lane::Sound => SOUND_LANE_HEIGHT,
         }
     }
 }
 
-/// The lanes of a track's row, top to bottom.
-fn lanes_of(_track: &Track) -> Vec<Lane> {
-    vec![Lane::Picture]
+/// The lanes of a track's row, top to bottom: the picture, and when it is unfolded the effects and
+/// the sound.
+fn lanes_of(track: &Track, expanded: &BTreeSet<TrackId>) -> Vec<Lane> {
+    if expanded.contains(&track.id) {
+        vec![Lane::Picture, Lane::Effects, Lane::Sound]
+    } else {
+        vec![Lane::Picture]
+    }
 }
 
-fn row_height(track: &Track) -> f32 {
-    lanes_of(track).into_iter().map(Lane::height).sum()
+fn row_height(track: &Track, expanded: &BTreeSet<TrackId>) -> f32 {
+    lanes_of(track, expanded).into_iter().map(Lane::height).sum()
+}
+
+/// A plaque for something done to a clip, in the effects lane.
+#[derive(Debug, Clone, PartialEq)]
+struct Chip {
+    text: String,
+    section: Section,
+}
+
+/// What is done to a clip, as plaques: its framing if it is not the plain one, the mirror, the bars,
+/// a volume other than 100 %, mute. Effects to come join them here.
+fn effects_of(clip: &Clip) -> Vec<Chip> {
+    let (t, plain) = (clip.transform, Transform::default());
+    let chip = |text: String, section| Chip { text, section };
+    let mut chips = Vec::new();
+    for Effect::Fade(fade) in &clip.effects {
+        let name = if fade.edge == Edge::In { "Fade in" } else { "Fade out" };
+        let mut text = format!("{name} {:.1} s", fade.seconds);
+        if fade.curve != Curve::Linear {
+            text += &format!(" · {}", fade.curve.name());
+        }
+        chips.push(chip(text, Section::Effects));
+    }
+    if (t.cx, t.cy, t.zoom, t.angle_deg) != (plain.cx, plain.cy, plain.zoom, plain.angle_deg) {
+        let mut text = "Frame".to_owned();
+        if (t.zoom - 1.0).abs() > 1e-6 {
+            text += &format!(" ×{:.2}", t.zoom);
+        }
+        if t.angle_deg.abs() > 1e-6 {
+            text += &format!(" {:.0}°", t.angle_deg);
+        }
+        chips.push(chip(text, Section::Frame));
+    }
+    if t.mirror {
+        chips.push(chip("Mirror".to_owned(), Section::Frame));
+    }
+    if t.bars {
+        chips.push(chip("Bars".to_owned(), Section::Frame));
+    }
+    if clip.muted {
+        chips.push(chip("Muted".to_owned(), Section::Sound));
+    } else if (clip.volume - 1.0).abs() > 1e-6 {
+        chips.push(chip(format!("Volume {:.0} %", clip.volume * 100.0), Section::Sound));
+    }
+    chips
+}
+
+/// Where the plaques go in `area`, left to right from `from`, as many as fit.
+fn place_chips(ui: &egui::Ui, area: Rect, from: f32, chips: Vec<Chip>) -> Vec<(Rect, Chip)> {
+    let mut x = from.max(area.left()) + 4.0;
+    let mut placed = Vec::new();
+    for chip in chips {
+        let width = ui.fonts(|fonts| fonts.layout_no_wrap(chip.text.clone(), FontId::proportional(11.0), Color32::WHITE).size().x) + 12.0;
+        if x + width > area.right() - 4.0 {
+            break;
+        }
+        placed.push((Rect::from_min_size(pos2(x, area.center().y - 8.0), vec2(width, 16.0)), chip));
+        x += width + 4.0;
+    }
+    placed
+}
+
+/// Where a cut at `t` falls: on the playhead, a clip's edge or the export range's when one is within
+/// `range`, or else on a frame.
+fn cut_time(sequence: &Sequence, t: f64, playhead: f64, range: f64, frame: f64) -> f64 {
+    let mut targets = vec![playhead, sequence.export.start, sequence.export.end];
+    for (_, clip) in sequence.clips() {
+        targets.extend([clip.start, clip.end()]);
+    }
+    snap(t, &targets, range).unwrap_or((t / frame).round() * frame)
 }
 
 /// Where a track's row is: its header on the left, its lanes on the timeline.
@@ -199,6 +389,10 @@ struct Row {
 }
 
 impl Row {
+    fn lane(&self, lane: Lane) -> Option<Rect> {
+        self.lanes.iter().find(|(kind, _)| *kind == lane).map(|(_, rect)| *rect)
+    }
+
     /// Where a clip of this row is drawn and grabbed: across its lanes.
     fn block(&self, span: Span, view: View) -> Rect {
         let top = self.lanes.first().map_or(self.body.top(), |(_, lane)| lane.top());
@@ -220,7 +414,7 @@ struct Layout {
 }
 
 impl Layout {
-    fn new(rect: Rect, sequence: &Sequence, scroll: f32) -> Self {
+    fn new(rect: Rect, sequence: &Sequence, expanded: &BTreeSet<TrackId>, scroll: f32) -> Self {
         let left = rect.left() + HEADER_WIDTH;
         let body = Rect::from_min_max(pos2(left, rect.top() + LABEL_HEIGHT), rect.max);
         let ruler = Rect::from_min_size(body.min, vec2(body.width(), RULER_HEIGHT));
@@ -231,7 +425,7 @@ impl Layout {
         for (track, clips) in sequence.tracks.iter().enumerate().rev() {
             let top = y;
             let mut lanes = Vec::new();
-            for lane in lanes_of(clips) {
+            for lane in lanes_of(clips, expanded) {
                 lanes.push((lane, Rect::from_x_y_ranges(left..=rect.right(), y..=y + lane.height())));
                 y += lane.height();
             }
@@ -243,8 +437,8 @@ impl Layout {
     }
 
     /// How tall the rows of `sequence` are together.
-    fn rows_height(sequence: &Sequence) -> f32 {
-        sequence.tracks.iter().map(row_height).sum()
+    fn rows_height(sequence: &Sequence, expanded: &BTreeSet<TrackId>) -> f32 {
+        sequence.tracks.iter().map(|track| row_height(track, expanded)).sum()
     }
 
     fn row(&self, track: usize) -> Option<&Row> {
@@ -266,9 +460,12 @@ impl Layout {
 
 impl Timeline {
     /// `scale` is the pixels per second to start with, if they are known from before.
-    pub fn new(scale: Option<f32>) -> Self {
+    pub fn new(scale: Option<f32>, expanded: &[TrackId]) -> Self {
         Self {
+            tool: Tool::default(),
             pps: scale,
+            expanded: expanded.iter().copied().collect(),
+            cut: None,
             scroll: 0.0,
             drag: None,
             grab: 0.0,
@@ -279,11 +476,26 @@ impl Timeline {
             new_row: None,
             row_drag: None,
             ruler_hover: None,
+            thumb_grab: 0.0,
+            menu: None,
+            scroll_bar: None,
         }
     }
 
     pub fn scale(&self) -> Option<f32> {
         self.pps
+    }
+
+    /// The tracks whose rows are unfolded.
+    pub fn expanded(&self) -> impl Iterator<Item = TrackId> + '_ {
+        self.expanded.iter().copied()
+    }
+
+    /// Folds or unfolds a track's row.
+    fn toggle(&mut self, track: TrackId) {
+        if !self.expanded.remove(&track) {
+            self.expanded.insert(track);
+        }
     }
 
     /// Draws the timeline and applies input to the playhead, the sequence and the selection.
@@ -298,12 +510,12 @@ impl Timeline {
         let fps = env.fps;
         let frame = 1.0 / fps;
         let width = ui.available_width();
-        let rows_height = Layout::rows_height(sequence);
+        let rows_height = Layout::rows_height(sequence, &self.expanded);
         let shown_rows = rows_height.clamp(PICTURE_LANE_HEIGHT, ROWS_MAX_HEIGHT);
         self.scroll = self.scroll.clamp(0.0, (rows_height - shown_rows).max(0.0));
         let height = LABEL_HEIGHT + RULER_HEIGHT + shown_rows;
         let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click_and_drag());
-        let mut layout = Layout::new(rect, sequence, self.scroll);
+        let mut layout = Layout::new(rect, sequence, &self.expanded, self.scroll);
         let mut out = TimelineResponse::default();
         let body_width = layout.body.width();
 
@@ -320,7 +532,7 @@ impl Timeline {
         if over_headers && rows_height > shown_rows {
             let scroll = ui.input_mut(|i| std::mem::take(&mut i.smooth_scroll_delta).y);
             self.scroll = (self.scroll - scroll).clamp(0.0, rows_height - shown_rows);
-            layout = Layout::new(rect, sequence, self.scroll);
+            layout = Layout::new(rect, sequence, &self.expanded, self.scroll);
         } else if response.hovered() {
             let (scroll, zoom) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta()));
             pps = (pps * (scroll.y * 0.004).exp() * zoom).clamp(min_pps, max_pps);
@@ -329,9 +541,40 @@ impl Timeline {
                 out.seeked = true;
             }
         }
+        // A scroll bar over the right edge of the rows, when they are taller than the room they have.
+        // Its thumb is dragged; a click beside it turns a page; the wheel over it scrolls.
+        self.scroll_bar = None;
+        if rows_height > shown_rows {
+            let track = Rect::from_x_y_ranges(rect.right() - SCROLL_BAR_WIDTH..=rect.right(), layout.rows_area.y_range());
+            let bar = RowsBar::new(track, shown_rows, rows_height);
+            let response = ui.interact(track, ui.id().with("rows scroll bar"), Sense::click_and_drag());
+            if let (true, Some(p)) = (response.drag_started(), response.interact_pointer_pos()) {
+                let thumb = bar.thumb(self.scroll);
+                // By the thumb, it keeps where it was grabbed; elsewhere its middle comes to the pointer.
+                self.thumb_grab = if thumb.y_range().contains(p.y) { p.y - thumb.top() } else { bar.thumb_height / 2.0 };
+            }
+            if let (true, Some(p)) = (response.dragged(), response.interact_pointer_pos()) {
+                self.scroll = bar.scroll_at(p.y - self.thumb_grab);
+            }
+            if let (true, Some(p)) = (response.clicked(), response.interact_pointer_pos()) {
+                let thumb = bar.thumb(self.scroll);
+                let page = if p.y < thumb.top() { -shown_rows } else if p.y > thumb.bottom() { shown_rows } else { 0.0 };
+                self.scroll = (self.scroll + page).clamp(0.0, bar.max_scroll);
+            }
+            if response.hovered() {
+                let wheel = ui.input_mut(|i| std::mem::take(&mut i.smooth_scroll_delta).y);
+                self.scroll = (self.scroll - wheel).clamp(0.0, bar.max_scroll);
+            }
+            let hot = response.hovered() || response.dragged();
+            response.on_hover_text("Scroll the tracks. The wheel over their names does it too");
+            layout = Layout::new(rect, sequence, &self.expanded, self.scroll);
+            self.scroll_bar = Some((track, bar.thumb(self.scroll), hot));
+        }
+
         // The rows scroll up and down only: the playhead stays where it is.
         let center_x = layout.body.center().x;
         let view = |pos: f64| View { center_x, pps, pos };
+        let snap_range = if ui.input(|i| i.modifiers.alt) { 0.0 } else { (SNAP_DISTANCE / pps) as f64 };
 
         if response.drag_started() {
             let press = ui.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos());
@@ -339,7 +582,9 @@ impl Timeline {
             let tape = response.drag_started_by(PointerButton::Secondary) || response.drag_started_by(PointerButton::Middle);
             // The headers are not the tape: nothing to drag there.
             if let Some(p) = press.filter(|p| p.x >= layout.body.left()) {
-                let grabbed = if tape { None } else { hit(p, &layout, view(pos), sequence, *selected) };
+                // The Blade cuts with a click: a drag in the rows is the tape.
+                let blade = self.tool == Tool::Blade && !layout.ruler.contains(p);
+                let grabbed = if tape || blade { None } else { hit(p, &layout, view(pos), sequence, *selected) };
                 let drag = grabbed.unwrap_or(Drag::Scrub { start_time: pos, start_x: p.x });
                 if let Some(edge) = edge_time(sequence, drag) {
                     self.grab = edge - view(pos).t(p.x);
@@ -373,7 +618,7 @@ impl Timeline {
                     if row_speed != 0.0 && rows_height > shown_rows {
                         let dt = ui.input(|i| i.stable_dt).min(0.1);
                         self.scroll = (self.scroll + row_speed * dt).clamp(0.0, rows_height - shown_rows);
-                        layout = Layout::new(rect, sequence, self.scroll);
+                        layout = Layout::new(rect, sequence, &self.expanded, self.scroll);
                         ui.ctx().request_repaint();
                     }
                     let target = layout.row_at(p.y.clamp(layout.rows_area.top() + 1.0, layout.rows_area.bottom() - 1.0)).map(|row| row.track);
@@ -388,7 +633,6 @@ impl Timeline {
                         }
                     }
                 }
-                let snap_range = if ui.input(|i| i.modifiers.alt) { 0.0 } else { (SNAP_DISTANCE / pps) as f64 };
                 self.snapped = edit(sequence, drag, wanted, pos, snap_range, frame);
                 self.stuck = edge_time(sequence, drag).is_some_and(|edge| (edge - wanted).abs() > snap_range + frame);
             }
@@ -410,18 +654,123 @@ impl Timeline {
                     pos = view(pos).t(p.x);
                     out.seeked = true;
                 } else if layout.rows_area.contains(p) {
-                    // In the rows a click picks the clip under it, or nothing; the playhead stays.
-                    *selected = hit(p, &layout, view(pos), sequence, *selected).and_then(Drag::clip);
+                    let clicked = hit(p, &layout, view(pos), sequence, *selected).and_then(Drag::clip);
+                    match (self.tool, clicked) {
+                        // The Blade cuts the clip there, with Shift every clip there. The part after
+                        // the cut is what is picked: it is what gets moved or removed next.
+                        (Tool::Blade, Some(id)) => {
+                            let t = cut_time(sequence, view(pos).t(p.x), pos, snap_range, frame);
+                            if ui.input(|i| i.modifiers.shift) {
+                                *selected = sequence.split_all(t, frame).into_iter().find(|part| part.track == id.track);
+                            } else if let Some(part) = sequence.split(id, t, frame) {
+                                *selected = Some(part);
+                            }
+                            out.edit_started = true;
+                        }
+                        // A click picks the clip under it, or nothing; the playhead stays. A plaque
+                        // of an effect also opens what it stands for.
+                        (_, clicked) => {
+                            *selected = clicked;
+                            out.open = clicked.and_then(|id| self.chip_at(ui, &layout, view(pos), sequence, id, p)).map(|chip| chip.section);
+                        }
+                    }
                 }
+            }
+        }
+        // A right click on a clip opens its menu.
+        if response.secondary_clicked() {
+            let clicked = response.interact_pointer_pos().filter(|p| layout.rows_area.contains(*p) && p.x >= layout.body.left());
+            self.menu = clicked.and_then(|p| Some((hit(p, &layout, view(pos), sequence, *selected).and_then(Drag::clip)?, view(pos).t(p.x))));
+            if let Some((id, _)) = self.menu {
+                *selected = Some(id);
+            }
+        }
+        if let Some((id, at)) = self.menu.filter(|(id, _)| sequence.has(*id)) {
+            let mut changed = false;
+            // In this egui it gives something back only as the menu closes: whether it is still
+            // open is asked separately.
+            response.context_menu(|ui| {
+                let clip = sequence.clip_mut(id);
+                for (edge, name) in [(Edge::In, "fade in"), (Edge::Out, "fade out")] {
+                    let present = clip.fade(edge).is_some();
+                    let label = if present { format!("Remove {name}") } else { format!("Add {name}") };
+                    if ui.button(label).clicked() {
+                        if present {
+                            clip.remove_fade(edge);
+                        } else {
+                            clip.add_fade(edge);
+                        }
+                        changed = true;
+                        ui.close_menu();
+                    }
+                }
+                // How each fade the clip has goes.
+                for (edge, name) in [(Edge::In, "Fade in curve"), (Edge::Out, "Fade out curve")] {
+                    let Some(now) = clip.fade(edge).map(|fade| fade.curve) else { continue };
+                    ui.menu_button(name, |ui| {
+                        for curve in Curve::ALL {
+                            if curve_choice(ui, curve, edge, curve == now).clicked() {
+                                clip.set_fade_curve(edge, curve);
+                                changed = true;
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                }
+                ui.separator();
+                if ui.button("Split here").on_hover_text("Cut the clip where the menu was opened").clicked() {
+                    let t = cut_time(sequence, at, pos, snap_range, frame);
+                    if let Some(part) = sequence.split(id, t, frame) {
+                        *selected = Some(part);
+                    }
+                    changed = true;
+                    ui.close_menu();
+                }
+                if ui.button("Delete").clicked() {
+                    sequence.remove_clip(id);
+                    *selected = None;
+                    changed = true;
+                    ui.close_menu();
+                }
+            });
+            if !response.context_menu_opened() {
+                self.menu = None;
+            }
+            out.edit_started |= changed;
+        }
+        // A double click on a clip folds or unfolds its row.
+        if response.double_clicked() && self.tool == Tool::Select {
+            let clicked = response.interact_pointer_pos().filter(|p| layout.rows_area.contains(*p) && p.x >= layout.body.left());
+            if let Some(id) = clicked.and_then(|p| hit(p, &layout, view(pos), sequence, *selected)).and_then(Drag::clip) {
+                self.toggle(sequence.tracks[id.track].id);
+                out.edit_started = true;
             }
         }
         pos = keep_in_sight(pos, sequence.reach(), body_width, pps);
         let view = view(pos);
         self.ruler_hover = pointer.filter(|p| self.drag.is_none() && layout.ruler.contains(*p)).map(|p| p.x);
 
-        let hovered = response.hover_pos().filter(|p| p.x >= layout.body.left()).and_then(|p| hit(p, &layout, view, sequence, *selected));
-        if response.hover_pos().is_some_and(|p| p.x >= layout.body.left()) {
-            ui.ctx().set_cursor_icon(cursor(self.drag.or(hovered)));
+        let hover = response.hover_pos().filter(|p| p.x >= layout.body.left());
+        let hovered = hover.and_then(|p| hit(p, &layout, view, sequence, *selected));
+        // With the Blade, a line shows where a click would cut.
+        self.cut = None;
+        if let (Tool::Blade, Some(p), None) = (self.tool, hover, self.drag) {
+            if let Some(id) = hovered.and_then(Drag::clip).filter(|_| layout.rows_area.contains(p)) {
+                let time = cut_time(sequence, view.t(p.x), pos, snap_range, frame);
+                self.cut = Some(Cut { time, track: id.track, all: ui.input(|i| i.modifiers.shift) });
+            }
+        }
+        let on_chip = match (self.tool, hover, hovered.and_then(Drag::clip)) {
+            (Tool::Select, Some(p), Some(id)) => self.chip_at(ui, &layout, view, sequence, id, p).is_some(),
+            _ => false,
+        };
+        if hover.is_some() {
+            let icon = match (self.cut, on_chip) {
+                (Some(_), _) => CursorIcon::Crosshair,
+                (None, true) if self.drag.is_none() => CursorIcon::PointingHand,
+                _ => cursor(self.drag.or(hovered)),
+            };
+            ui.ctx().set_cursor_icon(icon);
         }
 
         // A source dragged from the list: where it would go, and there it goes when let go.
@@ -464,6 +813,16 @@ impl Timeline {
         out
     }
 
+    /// The plaque of an effect of clip `id` under `p`, if there is one there.
+    fn chip_at(&self, ui: &egui::Ui, layout: &Layout, view: View, sequence: &Sequence, id: ClipId, p: Pos2) -> Option<Chip> {
+        let row = layout.row(id.track)?;
+        let clip = sequence.clip(id);
+        let lane = row.lane(Lane::Effects)?;
+        let area = Rect::from_x_y_ranges(row.block(clip.span(), view).x_range(), lane.y_range());
+        let from = area.left().max(layout.body.left());
+        place_chips(ui, area, from, effects_of(clip)).into_iter().find(|(rect, _)| rect.contains(p)).map(|(_, chip)| chip)
+    }
+
     /// The buttons over the headers and the header of each row: its name, Hide, Mute and a menu.
     /// Returns whether a track changed.
     fn headers(&mut self, ui: &mut egui::Ui, layout: &Layout, sequence: &mut Sequence, selected: &mut Option<ClipId>) -> bool {
@@ -488,28 +847,52 @@ impl Timeline {
             action = near.map(TrackAction::Add);
         }
 
+        let mut fold = None;
         for row in &layout.rows {
             let visible = row.header.intersect(layout.rows_area);
             if visible.height() <= 0.0 {
                 continue;
             }
-            let area = row.header.shrink2(vec2(8.0, 0.0));
+            // The controls stand by the picture lane; the other lanes have their names under them.
+            let picture = row.lane(Lane::Picture).unwrap_or(row.body);
+            let area = Rect::from_x_y_ranges(row.header.x_range(), picture.y_range()).shrink2(vec2(8.0, 0.0));
             let id = sequence.tracks[row.track].id;
+            let expanded = self.expanded.contains(&id);
             // Named after the track and not its place: a row dragged by its name keeps the drag.
             let builder = egui::UiBuilder::new().id_salt(("track header", id)).max_rect(area).layout(egui::Layout::left_to_right(egui::Align::Center));
             let mut header = ui.new_child(builder);
             header.set_clip_rect(visible);
             header.spacing_mut().item_spacing.x = 4.0;
             let track = &mut sequence.tracks[row.track];
-            // Numbered from the top, as they are seen. Dragged up or down, the row moves.
+            // The triangle folds and unfolds the row: pointing right folded, down unfolded.
+            let (fold_rect, folding) = header.allocate_exact_size(FOLD_SIZE.into(), Sense::click());
+            let color = if folding.hovered() { header.visuals().strong_text_color() } else { header.visuals().text_color() };
+            let c = fold_rect.center();
+            let points = if expanded {
+                vec![pos2(c.x - 4.5, c.y - 2.5), pos2(c.x + 4.5, c.y - 2.5), pos2(c.x, c.y + 3.5)]
+            } else {
+                vec![pos2(c.x - 2.5, c.y - 4.5), pos2(c.x + 3.5, c.y), pos2(c.x - 2.5, c.y + 4.5)]
+            };
+            header.painter().add(Shape::convex_polygon(points, color, Stroke::NONE));
+            let hint = if expanded { "Fold: only the picture" } else { "Unfold: the effects and the sound of the clips" };
+            if folding.on_hover_text(hint).clicked() {
+                fold = Some(id);
+            }
+            // Numbered from the top, as they are seen. Dragged up or down by its dots or its name, the
+            // row moves.
+            let (grip_rect, grip) = header.allocate_exact_size(ROW_GRIP_SIZE.into(), Sense::drag());
             let name = header.add(egui::Label::new(RichText::new(format!("Track {}", count - row.track)).small()).sense(Sense::drag()));
-            if name.drag_started() {
+            let handle = grip.union(name);
+            if handle.drag_started() {
                 self.row_drag = Some(id);
             }
-            if name.dragged() || name.hovered() {
-                header.ctx().set_cursor_icon(if name.dragged() { CursorIcon::Grabbing } else { CursorIcon::Grab });
+            let held = self.row_drag == Some(id);
+            if handle.hovered() || held {
+                header.ctx().set_cursor_icon(if held { CursorIcon::Grabbing } else { CursorIcon::Grab });
             }
-            name.on_hover_text("Drag up or down to put the track elsewhere");
+            let dots = if handle.hovered() || held { header.visuals().strong_text_color() } else { header.visuals().weak_text_color() };
+            grip_dots(header.painter(), grip_rect.center(), 3, 2, dots);
+            handle.on_hover_text("Drag up or down to put the track elsewhere");
             let hide = header.add(egui::Button::new(RichText::new("Hide").small()).selected(track.hidden));
             if hide.on_hover_text("Leave this track's picture out: what is under it shows").clicked() {
                 track.hidden = !track.hidden;
@@ -536,6 +919,21 @@ impl Timeline {
                     ui.close_menu();
                 }
             });
+            // The names of the lanes of an unfolded row, by the lanes.
+            let painter = ui.painter_at(visible);
+            for (lane, rect) in &row.lanes {
+                let name = match lane {
+                    Lane::Picture => continue,
+                    Lane::Effects => "effects",
+                    Lane::Sound => "sound",
+                };
+                let at = pos2(row.header.left() + 8.0 + FOLD_SIZE[0] + 4.0, rect.center().y);
+                painter.text(at, Align2::LEFT_CENTER, name, FontId::proportional(11.0), ui.visuals().weak_text_color());
+            }
+        }
+        if let Some(id) = fold {
+            self.toggle(id);
+            changed = true;
         }
         // A row dragged by its name goes wherever the pointer is, row by row.
         let pointer = ui.input(|i| i.pointer.primary_down().then(|| i.pointer.hover_pos()).flatten());
@@ -632,31 +1030,89 @@ impl Timeline {
             let Some(row) = layout.row(id.track) else { continue };
             let block = row.block(clip.span(), view);
             let is_selected = selected == Some(id);
-            let hidden = sequence.tracks[id.track].hidden;
+            let track = &sequence.tracks[id.track];
             let missing = env.missing.contains(&clip.source);
             if is_selected {
                 let ghost = row.block(clip.source_span(), view);
                 rows_painter.rect_filled(ghost, 4.0, CLIP_COLOR.gamma_multiply(0.25));
                 rows_painter.rect_stroke(ghost, 4.0, Stroke::new(1.0, CLIP_COLOR.gamma_multiply(0.7)));
             }
-            let fill = if hidden { CLIP_COLOR.gamma_multiply(0.45) } else { CLIP_COLOR };
+            let fill = if track.hidden { CLIP_COLOR.gamma_multiply(0.45) } else { CLIP_COLOR };
             rows_painter.rect_filled(block, 4.0, fill);
+            let inside = rows_painter.with_clip_rect(block.shrink(2.0).intersect(layout.rows_area).intersect(body));
+            let text_x = block.left().max(body.left()) + if is_selected { HANDLE_WIDTH + 6.0 } else { 6.0 };
+            let weak = Color32::from_white_alpha(110);
+            for &(lane, lane_rect) in &row.lanes {
+                let area = Rect::from_x_y_ranges(block.x_range(), lane_rect.y_range()).intersect(block);
+                match lane {
+                    Lane::Picture => {
+                        let mut text = format!("{}  ·  {}", clip.name, timecode::format(clip.span().len()));
+                        if missing {
+                            text += "  ·  file missing";
+                        }
+                        let color = if missing { MISSING_COLOR } else { Color32::from_white_alpha(if track.hidden { 120 } else { 220 }) };
+                        inside.text(pos2(text_x, area.center().y), Align2::LEFT_CENTER, text, FontId::proportional(12.0), color);
+                    }
+                    Lane::Effects => {
+                        inside.rect_filled(area, 0.0, LANE_SHADE);
+                        let from = text_x - 6.0;
+                        let chips = place_chips(ui, area, from, effects_of(clip));
+                        if chips.is_empty() && effects_of(clip).is_empty() {
+                            inside.text(pos2(text_x, area.center().y), Align2::LEFT_CENTER, "no effects", FontId::proportional(11.0), weak);
+                        }
+                        for (rect, chip) in chips {
+                            inside.rect_filled(rect, 4.0, CHIP_COLOR);
+                            inside.text(rect.center(), Align2::CENTER_CENTER, chip.text, FontId::proportional(11.0), Color32::WHITE);
+                        }
+                    }
+                    Lane::Sound => {
+                        inside.rect_filled(area, 0.0, LANE_SHADE);
+                        let muted = clip.muted || track.muted;
+                        match env.sounds.get(&clip.source) {
+                            Some(SourceSound::Silent) => {
+                                inside.text(pos2(text_x, area.center().y), Align2::LEFT_CENTER, "no sound", FontId::proportional(11.0), weak);
+                            }
+                            Some(SourceSound::Graph(graph)) => match graph.get() {
+                                Some(peaks) => paint_sound(&inside, area.intersect(body), clip, view, peaks, muted),
+                                None => {
+                                    inside.text(pos2(text_x, area.center().y), Align2::LEFT_CENTER, "reading the sound…", FontId::proportional(11.0), weak);
+                                }
+                            },
+                            None => {}
+                        }
+                    }
+                }
+            }
+            // A fade is its curve from the clip's corner, how much shows from the bottom up, and the
+            // part it hides darkened.
+            let (fade_in, fade_out) = clip.fade_lengths();
+            for (edge, from, to) in [(Edge::In, clip.start, clip.start + fade_in), (Edge::Out, clip.end() - fade_out, clip.end())] {
+                let (Some(fade), x0, x1) = (clip.fade(edge), view.x(from), view.x(to)) else { continue };
+                if x1 - x0 < 1.0 {
+                    continue;
+                }
+                let steps = ((x1 - x0) / 3.0).ceil().clamp(1.0, 64.0) as usize;
+                let points: Vec<Pos2> = (0..=steps)
+                    .map(|i| {
+                        let x = i as f64 / steps as f64;
+                        pos2(x0 + (x1 - x0) * x as f32, block.bottom() - block.height() * fade.curve.level(edge, x) as f32)
+                    })
+                    .collect();
+                let mut shade = Mesh::default();
+                for pair in points.windows(2) {
+                    let first = shade.vertices.len() as u32;
+                    for p in [pair[0], pos2(pair[0].x, block.top()), pair[1], pos2(pair[1].x, block.top())] {
+                        shade.colored_vertex(p, FADE_SHADE);
+                    }
+                    shade.add_triangle(first, first + 1, first + 2);
+                    shade.add_triangle(first + 1, first + 3, first + 2);
+                }
+                inside.add(shade);
+                inside.add(Shape::line(points, Stroke::new(1.5, FADE_LINE)));
+            }
             if missing {
                 rows_painter.rect_stroke(block.shrink(1.0), 4.0, Stroke::new(2.0, MISSING_COLOR));
             }
-            let mut text = format!("{}  ·  {}", clip.name, timecode::format(clip.span().len()));
-            if missing {
-                text += "  ·  file missing";
-            }
-            let text_x = block.left().max(body.left()) + if is_selected { HANDLE_WIDTH + 6.0 } else { 6.0 };
-            let text_color = if missing { MISSING_COLOR } else { Color32::from_white_alpha(if hidden { 120 } else { 220 }) };
-            rows_painter.with_clip_rect(block.shrink(2.0).intersect(layout.rows_area)).text(
-                pos2(text_x, block.center().y),
-                Align2::LEFT_CENTER,
-                text,
-                FontId::proportional(12.0),
-                text_color,
-            );
             if is_selected {
                 rows_painter.rect_stroke(block, 4.0, Stroke::new(2.0, HANDLE_COLOR));
                 let left = Rect::from_x_y_ranges(block.left()..=block.left() + HANDLE_WIDTH, block.y_range());
@@ -666,8 +1122,25 @@ impl Timeline {
                 for (handle, rounding, drag) in [(left, left_rounding, Drag::ClipStart(id)), (right, right_rounding, Drag::ClipEnd(id))] {
                     let color = if active == Some(drag) { Color32::WHITE } else { HANDLE_COLOR };
                     rows_painter.rect_filled(handle, rounding, color);
-                    grip(&rows_painter, handle.center(), 8.0);
+                    grip_dots(&rows_painter, handle.center(), 1, 3, Color32::from_black_alpha(150));
                 }
+                // The fades' lengths are dragged by these, a row of three dots each.
+                for edge in [Edge::In, Edge::Out] {
+                    if let Some(handle) = fade_handle(block, clip, edge, view) {
+                        let color = if active == Some(Drag::Fade(id, edge)) { Color32::WHITE } else { HANDLE_COLOR };
+                        rows_painter.rect_filled(handle, 3.0, color);
+                        grip_dots(&rows_painter, handle.center(), 3, 1, Color32::from_black_alpha(150));
+                    }
+                }
+            }
+        }
+
+        // With the Blade: where a click would cut, across the row, or every row with Shift.
+        if let Some(cut) = self.cut {
+            let x = view.x(cut.time);
+            let rows: Vec<&Row> = if cut.all { layout.rows.iter().collect() } else { layout.row(cut.track).into_iter().collect() };
+            for row in rows {
+                rows_painter.line_segment([pos2(x, row.body.top()), pos2(x, row.body.bottom())], Stroke::new(2.0, CUT_COLOR));
             }
         }
 
@@ -676,7 +1149,8 @@ impl Timeline {
             for gap in sequence.gaps() {
                 let (from, to) = (view.x(gap.start).max(body.left()), view.x(gap.end).min(body.right()));
                 if to - from >= GAP_LABEL_WIDTH {
-                    let at = pos2((from + to) / 2.0, bottom.body.center().y);
+                    let picture = bottom.lane(Lane::Picture).unwrap_or(bottom.body);
+                    let at = pos2((from + to) / 2.0, picture.center().y);
                     rows_painter.text(at, Align2::CENTER_CENTER, "black", FontId::proportional(12.0), tick_color);
                 }
             }
@@ -709,7 +1183,7 @@ impl Timeline {
             let color = if active == Some(drag) { Color32::WHITE } else { EXPORT_COLOR };
             body_painter.line_segment(across(x), Stroke::new(2.0, color));
             body_painter.rect_filled(tab, 2.0, color);
-            grip(&body_painter, tab.center(), 10.0);
+            grip_dots(&body_painter, tab.center(), 1, 3, Color32::from_black_alpha(150));
         }
 
         if let Some(t) = self.snapped {
@@ -756,6 +1230,16 @@ impl Timeline {
             }
         }
 
+        // The rows' scroll bar, with the dots of a thing that is dragged on its thumb.
+        if let Some((track, thumb, hot)) = self.scroll_bar {
+            painter.rect_filled(track, 3.0, Color32::from_white_alpha(22));
+            let thumb = thumb.shrink2(vec2(2.0, 1.0));
+            painter.rect_filled(thumb, 3.0, Color32::from_gray(if hot { 190 } else { 130 }));
+            if thumb.height() >= SCROLL_THUMB_MIN - 2.0 {
+                grip_dots(&painter, thumb.center(), 1, 3, Color32::from_black_alpha(170));
+            }
+        }
+
         // Playhead: fixed in the center, with an arrow and the current time above the bar.
         let center_x = view.center_x;
         painter.line_segment(across(center_x), Stroke::new(2.0, PLAYHEAD_COLOR));
@@ -795,9 +1279,14 @@ fn hit(p: Pos2, layout: &Layout, view: View, sequence: &Sequence, selected: Opti
     if !layout.rows_area.contains(p) || p.x < layout.body.left() {
         return None;
     }
-    // Edges only on the selected clip: the others show no handles to grab.
+    // Edges and fades only on the selected clip: the others show no handles to grab.
     if let Some(id) = selected.filter(|&id| sequence.has(id)) {
         let block = layout.block(id, sequence.clip(id).span(), view);
+        for edge in [Edge::In, Edge::Out] {
+            if fade_handle(block, sequence.clip(id), edge, view).is_some_and(|handle| handle.expand(2.0).contains(p)) {
+                return Some(Drag::Fade(id, edge));
+            }
+        }
         if block.y_range().contains(p.y) {
             if let Some(start) = nearer_edge(p.x, block.left(), block.right(), HANDLE_WIDTH) {
                 return Some(if start { Drag::ClipStart(id) } else { Drag::ClipEnd(id) });
@@ -805,6 +1294,41 @@ fn hit(p: Pos2, layout: &Layout, view: View, sequence: &Sequence, selected: Opti
         }
     }
     sequence.clips().find(|&(id, clip)| layout.block(id, clip.span(), view).contains(p)).map(|(id, _)| Drag::ClipMove(id))
+}
+
+/// Where the handle of the fade at `edge` of a clip drawn as `block` is, if it has that fade: on the
+/// top edge, where the fade ends.
+fn fade_handle(block: Rect, clip: &Clip, edge: Edge, view: View) -> Option<Rect> {
+    clip.fade(edge)?;
+    let (fade_in, fade_out) = clip.fade_lengths();
+    let x = match edge {
+        Edge::In => view.x(clip.start + fade_in),
+        Edge::Out => view.x(clip.end() - fade_out),
+    };
+    // Kept off the corners, where the edges are trimmed. A clip too narrow for that on screen has
+    // none: its fades are set in the Clip tab, or after zooming in.
+    let (lo, hi) = (block.left() + HANDLE_WIDTH + FADE_HANDLE_SIZE[0] / 2.0, block.right() - HANDLE_WIDTH - FADE_HANDLE_SIZE[0] / 2.0);
+    if lo > hi {
+        return None;
+    }
+    let x = x.clamp(lo, hi);
+    Some(Rect::from_center_size(pos2(x, block.top() + FADE_HANDLE_SIZE[1] / 2.0 + 1.0), FADE_HANDLE_SIZE.into()))
+}
+
+/// A clip's sound as a graph in `area`: for each pixel, the loudest the source gets in the time it
+/// stands for, times the clip's volume and its fades. Pale when the clip or its track is muted.
+fn paint_sound(painter: &egui::Painter, area: Rect, clip: &Clip, view: View, peaks: &Peaks, muted: bool) {
+    let color = if muted { WAVE_COLOR.gamma_multiply(0.35) } else { WAVE_COLOR };
+    let (middle, half) = (area.center().y, area.height() / 2.0 - 3.0);
+    let mut x = area.left().floor();
+    while x < area.right() {
+        let (from, to) = (clip.source_time(view.t(x)), clip.source_time(view.t(x + 1.0)));
+        let fade = clip.sound_fade(view.t(x + 0.5)) as f32;
+        let level = (peaks.level(from, to) * clip.volume as f32 * fade).min(1.0);
+        let height = (level * half).max(0.5);
+        painter.line_segment([pos2(x + 0.5, middle - height), pos2(x + 0.5, middle + height)], Stroke::new(1.0, color));
+        x += 1.0;
+    }
 }
 
 /// Where a source `len` seconds long dropped at `p` goes: its start at the pointer, on the frame
@@ -891,7 +1415,7 @@ fn cursor(target: Option<Drag>) -> CursorIcon {
         None => CursorIcon::Grab,
         Some(Drag::Scrub { .. }) => CursorIcon::Grabbing,
         Some(Drag::ClipMove(_) | Drag::ExportMove) => CursorIcon::Move,
-        Some(Drag::ClipStart(_) | Drag::ClipEnd(_) | Drag::ExportStart | Drag::ExportEnd) => CursorIcon::ResizeHorizontal,
+        Some(Drag::ClipStart(_) | Drag::ClipEnd(_) | Drag::ExportStart | Drag::ExportEnd | Drag::Fade(..)) => CursorIcon::ResizeHorizontal,
     }
 }
 
@@ -923,6 +1447,11 @@ fn edge_time(sequence: &Sequence, drag: Drag) -> Option<f64> {
         Drag::ExportEnd => Some(sequence.export.end),
         Drag::ClipStart(id) | Drag::ClipMove(id) => Some(sequence.clip(id).start),
         Drag::ClipEnd(id) => Some(sequence.clip(id).end()),
+        Drag::Fade(id, edge) => {
+            let clip = sequence.clip(id);
+            let (fade_in, fade_out) = clip.fade_lengths();
+            Some(if edge == Edge::In { clip.start + fade_in } else { clip.end() - fade_out })
+        }
     }
 }
 
@@ -976,6 +1505,13 @@ fn edit(sequence: &mut Sequence, drag: Drag, t: f64, playhead: f64, snap_range: 
             sequence.move_clip(id, start);
             snapped
         }
+        Drag::Fade(id, edge) => {
+            let (t, snapped) = place(t);
+            let clip = sequence.clip_mut(id);
+            let seconds = if edge == Edge::In { t - clip.start } else { clip.end() - t };
+            clip.set_fade_length(edge, seconds);
+            snapped
+        }
     }
 }
 
@@ -1024,15 +1560,6 @@ fn autoscroll_speed(x: f32, press_x: f32, left: f32, right: f32) -> f32 {
         0.0
     };
     (depth / AUTOSCROLL_ZONE).clamp(-1.0, 1.0) * AUTOSCROLL_SPEED
-}
-
-/// Two short vertical lines, the "grab here" mark on handles.
-fn grip(painter: &egui::Painter, center: Pos2, height: f32) {
-    let stroke = Stroke::new(1.0, Color32::from_black_alpha(150));
-    for dx in [-1.5, 1.5] {
-        let x = center.x + dx;
-        painter.line_segment([pos2(x, center.y - height / 2.0), pos2(x, center.y + height / 2.0)], stroke);
-    }
 }
 
 /// Labelled and unlabelled tick steps, in seconds, for the current zoom.
@@ -1123,7 +1650,7 @@ mod tests {
 
     /// Label 26, ruler 32, then the rows: with one track, its clips are drawn from y = 62 to 98.
     fn layout(sequence: &Sequence, height: f32) -> Layout {
-        Layout::new(Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, height)), sequence, 0.0)
+        Layout::new(Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, height)), sequence, &BTreeSet::new(), 0.0)
     }
 
     #[test]
@@ -1179,9 +1706,10 @@ mod tests {
         for _ in 0..5 {
             sequence.add_below(Clip::new("b".into(), 1.0));
         }
-        assert_eq!(Layout::rows_height(&sequence), 6.0 * PICTURE_LANE_HEIGHT);
+        let folded = BTreeSet::new();
+        assert_eq!(Layout::rows_height(&sequence, &folded), 6.0 * PICTURE_LANE_HEIGHT);
         let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 58.0 + ROWS_MAX_HEIGHT));
-        let layout = Layout::new(rect, &sequence, 0.0);
+        let layout = Layout::new(rect, &sequence, &folded, 0.0);
         assert_eq!(layout.rows.iter().map(|row| row.track).collect::<Vec<_>>(), [5, 4, 3, 2, 1, 0]);
         assert_eq!(layout.row_at(60.0).map(|row| row.track), Some(5));
         assert_eq!(layout.row_at(110.0).map(|row| row.track), Some(4));
@@ -1191,7 +1719,7 @@ mod tests {
         assert_eq!(layout.rows[0].lanes.iter().map(|(lane, _)| *lane).collect::<Vec<_>>(), [Lane::Picture]);
 
         // Scrolled by two rows, the third one is at the top.
-        let layout = Layout::new(rect, &sequence, 2.0 * PICTURE_LANE_HEIGHT);
+        let layout = Layout::new(rect, &sequence, &folded, 2.0 * PICTURE_LANE_HEIGHT);
         assert_eq!(layout.row_at(60.0).map(|row| row.track), Some(3));
         assert!(layout.row_at(30.0).is_none());
     }
@@ -1201,7 +1729,7 @@ mod tests {
         // A clip at 38..43 s on the top track, one at 30..35 s under it; the rows scrolled by 20 px.
         let mut sequence = Sequence::new(Clip { start: 30.0, source_out: 5.0, ..Clip::new("a".into(), 60.0) });
         sequence.tracks.push(crate::core::edit::Track { id: 1, clips: vec![Clip { start: 38.0, source_out: 5.0, ..Clip::new("b".into(), 60.0) }], ..Default::default() });
-        let layout = Layout::new(Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 100.0)), &sequence, 20.0);
+        let layout = Layout::new(Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 100.0)), &sequence, &BTreeSet::new(), 20.0);
         let at = |x: f32, y: f32| hit(pos2(x, y), &layout, view(), &sequence, None);
         let upper = ClipId { track: 1, index: 0 };
         // Upper row: 38..82, its clips 42..78. Lower row: 82..126, seen down to 100.
@@ -1251,6 +1779,109 @@ mod tests {
         // And back up.
         assert_eq!([0, 1, 2, 3, 4].map(|t| after_move(t, 3, 1)), [0, 2, 3, 1, 4]);
         assert_eq!([0, 1, 2].map(|t| after_move(t, 1, 1)), [0, 1, 2]);
+    }
+
+    #[test]
+    fn the_scroll_bar_thumb_goes_with_the_rows() {
+        // Rows 400 px tall, 100 of them in sight, a bar from y = 50 to 150.
+        let bar = RowsBar::new(Rect::from_min_max(pos2(990.0, 50.0), pos2(1000.0, 150.0)), 100.0, 400.0);
+        assert_eq!(bar.max_scroll, 300.0);
+        assert_eq!(bar.thumb_height, 25.0);
+        assert_eq!(bar.thumb(0.0).top(), 50.0);
+        assert_eq!(bar.thumb(300.0).bottom(), 150.0);
+        assert_eq!(bar.thumb(150.0).top(), 87.5);
+        // And back: where the thumb is put says the scroll, and no further than the rows go.
+        assert_eq!(bar.scroll_at(87.5), 150.0);
+        assert_eq!(bar.scroll_at(10.0), 0.0);
+        assert_eq!(bar.scroll_at(500.0), 300.0);
+        // Many rows: the thumb stays big enough to grab.
+        assert_eq!(RowsBar::new(Rect::from_min_max(pos2(0.0, 0.0), pos2(10.0, 100.0)), 100.0, 5000.0).thumb_height, SCROLL_THUMB_MIN);
+    }
+
+    #[test]
+    fn an_unfolded_row_has_the_effects_and_the_sound_under_its_picture() {
+        // Two tracks; the lower one, id 0, is unfolded.
+        let mut sequence = Sequence::new(Clip { start: 30.0, source_out: 5.0, ..Clip::new("a".into(), 60.0) });
+        sequence.tracks.push(crate::core::edit::Track { id: 1, clips: vec![Clip { start: 38.0, source_out: 5.0, ..Clip::new("b".into(), 60.0) }], ..Default::default() });
+        let unfolded = BTreeSet::from([0]);
+        let tall = PICTURE_LANE_HEIGHT + EFFECTS_LANE_HEIGHT + SOUND_LANE_HEIGHT;
+        assert_eq!(Layout::rows_height(&sequence, &unfolded), PICTURE_LANE_HEIGHT + tall);
+        let layout = Layout::new(Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 400.0)), &sequence, &unfolded, 0.0);
+        let lower = layout.row(0).unwrap();
+        assert_eq!(lower.lanes.iter().map(|(lane, _)| *lane).collect::<Vec<_>>(), [Lane::Picture, Lane::Effects, Lane::Sound]);
+        assert_eq!(layout.row(1).unwrap().lanes.len(), 1);
+        // The lower row starts under the upper one; its clip covers all three lanes and is grabbed by any.
+        let top = 58.0 + PICTURE_LANE_HEIGHT;
+        assert_eq!((lower.body.top(), lower.body.bottom()), (top, top + tall));
+        let at = |y: f32| hit(pos2(425.0, y), &layout, view(), &sequence, None);
+        for y in [top + 20.0, top + PICTURE_LANE_HEIGHT + 10.0, top + tall - 10.0] {
+            assert!(matches!(at(y), Some(Drag::ClipMove(CLIP))), "at {y}");
+        }
+    }
+
+    #[test]
+    fn plaques_say_what_is_done_to_a_clip() {
+        let mut clip = Clip::new("a".into(), 10.0);
+        assert!(effects_of(&clip).is_empty());
+        clip.transform = Transform { cx: 0.7, zoom: 1.4, angle_deg: 20.0, mirror: true, ..Transform::default() };
+        clip.volume = 0.8;
+        let texts: Vec<String> = effects_of(&clip).into_iter().map(|chip| chip.text).collect();
+        assert_eq!(texts, ["Frame ×1.40 20°", "Mirror", "Volume 80 %"]);
+        assert_eq!(effects_of(&clip)[2].section, Section::Sound);
+        clip.muted = true;
+        assert_eq!(effects_of(&clip).last().map(|chip| chip.text.as_str()), Some("Muted"));
+        // Only moved: the frame is there, without numbers.
+        let moved = Clip { transform: Transform { cy: 0.3, ..Transform::default() }, ..Clip::new("b".into(), 1.0) };
+        assert_eq!(effects_of(&moved), [Chip { text: "Frame".into(), section: Section::Frame }]);
+    }
+
+    #[test]
+    fn a_fade_is_dragged_by_its_handle_to_whole_frames() {
+        // A clip 30..50 s (x = 400..600), selected, with a fade in of 1 s and a fade out of 1 s.
+        let mut sequence = Sequence::new(Clip { start: 30.0, source_out: 20.0, ..Clip::new("a".into(), 60.0) });
+        sequence.clip_mut(CLIP).add_fade(Edge::In);
+        sequence.clip_mut(CLIP).add_fade(Edge::Out);
+        let layout = layout(&sequence, 102.0);
+        let block = layout.block(CLIP, sequence.clip(CLIP).span(), view());
+        // The handles sit on the top edge where the fades end, but keep off the corners.
+        let handle_in = fade_handle(block, sequence.clip(CLIP), Edge::In, view()).unwrap();
+        assert_eq!(handle_in.center().x, 400.0 + HANDLE_WIDTH + FADE_HANDLE_SIZE[0] / 2.0);
+        assert!(matches!(hit(handle_in.center(), &layout, view(), &sequence, Some(CLIP)), Some(Drag::Fade(CLIP, Edge::In))));
+        // Not on a clip that is not selected.
+        assert!(matches!(hit(handle_in.center(), &layout, view(), &sequence, None), Some(Drag::ClipMove(CLIP))));
+        // None on a clip narrower than its trim handles and a fade handle together.
+        let narrow = Rect::from_x_y_ranges(400.0..=440.0, block.y_range());
+        assert_eq!(fade_handle(narrow, sequence.clip(CLIP), Edge::In, view()), None);
+
+        // Dragged to 33.01 s: 3 s, on the frame. The fade out leaves no more than 19 s for it.
+        edit(&mut sequence, Drag::Fade(CLIP, Edge::In), 33.01, 100.0, 0.0, 0.04);
+        assert!((sequence.clip(CLIP).fade_lengths().0 - 3.0).abs() < 1e-9);
+        edit(&mut sequence, Drag::Fade(CLIP, Edge::In), 80.0, 100.0, 0.0, 0.04);
+        assert!((sequence.clip(CLIP).fade_lengths().0 - 19.0).abs() < 1e-9);
+        edit(&mut sequence, Drag::Fade(CLIP, Edge::Out), 45.0, 100.0, 0.0, 0.04);
+        assert!((sequence.clip(CLIP).fade_lengths().1 - 1.0).abs() < 1e-9, "no room left for more");
+        assert_eq!(cursor(Some(Drag::Fade(CLIP, Edge::Out))), CursorIcon::ResizeHorizontal);
+    }
+
+    #[test]
+    fn plaques_show_the_fades() {
+        let mut clip = Clip::new("a".into(), 10.0);
+        clip.add_fade(Edge::Out);
+        clip.set_fade_length(Edge::Out, 0.5);
+        assert_eq!(effects_of(&clip), [Chip { text: "Fade out 0.5 s".into(), section: Section::Effects }]);
+        clip.set_fade_curve(Edge::Out, Curve::EaseInOut);
+        assert_eq!(effects_of(&clip)[0].text, "Fade out 0.5 s · Ease in-out");
+    }
+
+    #[test]
+    fn a_cut_lands_on_what_is_near_or_on_a_frame() {
+        // A clip 30..50 s, the playhead at 42 s; 0.1 s is near enough.
+        let sequence = Sequence::new(Clip { start: 30.0, source_out: 20.0, ..Clip::new("a".into(), 60.0) });
+        let cut = |t: f64| cut_time(&sequence, t, 42.0, 0.1, 0.04);
+        assert_eq!(cut(42.05), 42.0);
+        assert_eq!(cut(49.95), 50.0);
+        assert!((cut(37.013) - 37.0).abs() < 1e-9);
+        assert!((cut(37.03) - 37.04).abs() < 1e-9);
     }
 
     #[test]

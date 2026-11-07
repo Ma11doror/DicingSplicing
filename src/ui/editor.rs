@@ -4,7 +4,7 @@
 //! selected at a time: the middle shows its source with its frame, the side panel its transform and
 //! sound. The output preview shows what goes into the file: the clip seen at the playhead.
 
-use crate::core::edit::{Clip, ClipId, Sequence, SourceId, Span};
+use crate::core::edit::{Clip, ClipId, Curve, Edge, Effect, Sequence, SourceId, Span};
 use crate::core::history::History;
 use crate::core::plugins::Plugin;
 use crate::core::project::{self, Project, Source, ViewState, RENDERS_FOLDER};
@@ -17,22 +17,28 @@ use crate::media::player::Player;
 use crate::media::render;
 use crate::media::{timecode, Notify, SourceFiles};
 use crate::ui::export::{ExportEnv, ExportPanel};
+use crate::ui::flash;
 use crate::ui::framing::Framing;
 use crate::ui::picture::{frame_at, Picture};
-use crate::ui::pick_video;
+use crate::ui::{curve_choice, grip_dots, paint_curve, pick_video};
 use crate::ui::plugins::PublishEnv;
 use crate::ui::sources::{self, SourceAction, SourceRow};
-use crate::ui::timeline::{Timeline, TimelineEnv};
-use crate::ui::viewer::{OutputView, SourceView};
+use crate::ui::timeline::{Section, SourceSound, Timeline, TimelineEnv, Tool};
+use crate::ui::viewer::{Layer, OutputView, SourceView};
 use egui::{Color32, Key, Modifiers, RichText, TextureHandle};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The output preview's largest height: a tall frame should not push the controls out of the panel.
-const OUTPUT_MAX_HEIGHT: f64 = 340.0;
 const SIDE_PANEL_WIDTH: f32 = 380.0;
+/// The clip's panel before the timeline has been laid out once, and the least either panel of the
+/// right column keeps.
+const CLIP_PANEL_FIRST_HEIGHT: f32 = 320.0;
+const CLIP_PANEL_MIN_HEIGHT: f32 = 160.0;
+const OUTPUT_PANEL_MIN_HEIGHT: f32 = 200.0;
+/// The border between the result's panel and the clip's, dragged by its dots.
+const PANEL_BORDER_HEIGHT: f32 = 10.0;
 /// The export settings need this much to show without cutting anything.
 const SIDE_PANEL_MIN_WIDTH: f32 = 340.0;
 const TAB_TEXT_SIZE: f32 = 17.0;
@@ -50,7 +56,7 @@ enum PlayMode {
     Export,
 }
 
-/// What the side panel shows: setting up the result, then writing it.
+/// What the top of the right column shows: the result, then writing it. Under it is the selected clip.
 #[derive(Clone, Copy, Default, PartialEq)]
 enum SideTab {
     #[default]
@@ -87,6 +93,8 @@ pub struct Editor {
     output: Picture,
     /// The output shows the same frame as the middle, and takes it from there.
     output_shares_center: bool,
+    /// The clip under the one at the playhead, while that one fades and this shows through.
+    under: Picture,
     drawn: Option<Drawn>,
     /// The playhead, in timeline seconds.
     position: f64,
@@ -102,6 +110,11 @@ pub struct Editor {
     side_tab: SideTab,
     export: ExportPanel,
     timeline: Timeline,
+    /// Where the timeline began last frame: the clip's panel starts there too, until its border is
+    /// dragged.
+    timeline_top: Option<f32>,
+    /// How tall the clip's panel is, once its border has been dragged.
+    clip_panel_height: Option<f32>,
     source_view: SourceView,
     output_view: OutputView,
     /// The result's frame rate: the grid of the timeline. Updated every frame.
@@ -110,6 +123,10 @@ pub struct Editor {
     files: SourceFiles,
     /// Open the Sources list on the next frame: a video has just been added.
     show_sources: bool,
+    /// A part of the Clip tab that a plaque on the timeline led to: it flashes, from then.
+    flash: Option<(Section, f64)>,
+    /// That part is still to be scrolled into sight.
+    scroll_to: Option<Section>,
 }
 
 impl Editor {
@@ -139,8 +156,9 @@ impl Editor {
             save_error: None,
             player: Player::new(),
             center: Picture::new("source frame", notify.clone()),
-            output: Picture::new("output frame", notify),
+            output: Picture::new("output frame", notify.clone()),
             output_shares_center: false,
+            under: Picture::new("frame under", notify.clone()),
             drawn: None,
             position: view.playhead,
             peek: None,
@@ -153,12 +171,16 @@ impl Editor {
             framing: Framing::restored(&view.frames, view.ratio_locked),
             side_tab: SideTab::default(),
             export,
-            timeline: Timeline::new(view.timeline_scale),
+            timeline: Timeline::new(view.timeline_scale, &view.expanded_tracks),
+            timeline_top: None,
+            clip_panel_height: view.clip_panel_height,
             source_view: SourceView::default(),
             output_view: OutputView,
             fps: 30.0,
             files: SourceFiles::new(),
             show_sources: false,
+            flash: None,
+            scroll_to: None,
         }
     }
 
@@ -177,6 +199,9 @@ impl Editor {
                 export_path: self.export.saved_path(),
                 export_shown_frames: self.export.with_shown(),
                 loop_export: self.loop_export,
+                // Of the tracks that are there: a deleted one may come back with Undo, folded then.
+                expanded_tracks: self.timeline.expanded().filter(|id| self.sequence.tracks.iter().any(|track| track.id == *id)).collect(),
+                clip_panel_height: self.clip_panel_height,
             },
         }
     }
@@ -235,12 +260,13 @@ impl Editor {
         }
         self.center.poll(ctx);
         self.output.poll(ctx);
+        self.under.poll(ctx);
         self.check_selection();
 
         self.handle_keys(ctx);
         self.export.poll(ctx, settings);
-        self.timeline_panel(ctx);
         self.side_panel(ctx, plugins, workspace, settings);
+        self.timeline_panel(ctx);
         self.source_panel(ctx);
 
         let busy = ctx.input(|i| i.pointer.any_down()) || ctx.wants_keyboard_input();
@@ -289,6 +315,9 @@ impl Editor {
             }
         }
         self.output_shares_center = false;
+        if let Some((clip, cache)) = self.under_at(t).and_then(|id| Some((self.sequence.clip(id), self.library.cache(self.sequence.clip(id).source)?))) {
+            self.under.want(clip.source, clip.source_time(t), cache);
+        }
         if let Some(clip) = self.sequence.shown_at(t).map(|id| self.sequence.clip(id)) {
             if let Some(cache) = self.library.cache(clip.source) {
                 let time = clip.source_time(t);
@@ -304,13 +333,15 @@ impl Editor {
         1.0 / self.fps
     }
 
+    /// The clip that shows through at `t` while the clip seen there fades.
+    fn under_at(&self, t: f64) -> Option<ClipId> {
+        let top = self.sequence.shown_at(t).filter(|&id| self.sequence.clip(id).opacity(t) < 1.0)?;
+        self.sequence.shown_under(t, top.track)
+    }
+
     /// Start of the frame shown at `t`: where I, O and the trim keys put an edge.
     fn frame_start(&self, t: f64) -> f64 {
         timecode::frame_index(t, self.fps) as f64 / self.fps
-    }
-
-    fn clip(&self) -> Option<&Clip> {
-        self.selected.map(|id| self.sequence.clip(id))
     }
 
     /// What the previews show: the playhead, or the edge being dragged.
@@ -338,7 +369,17 @@ impl Editor {
             .clips()
             .filter(|(id, clip)| !self.sequence.tracks[id.track].muted && clip.gain() > 0.0)
             .filter_map(|(_, clip)| {
-                let segment = Segment { start: clip.start, end: clip.end(), source_start: clip.source_in, gain: clip.gain() as f32 };
+                let (fade_in, fade_out) = clip.fade_lengths();
+                let sounds = |edge| clip.fade(edge).is_some_and(|fade| fade.sound);
+                let segment = Segment {
+                    start: clip.start,
+                    end: clip.end(),
+                    source_start: clip.source_in,
+                    gain: clip.gain() as f32,
+                    fade_in: if sounds(Edge::In) { fade_in } else { 0.0 },
+                    fade_out: if sounds(Edge::Out) { fade_out } else { 0.0 },
+                    curves: (clip.fade_curve(Edge::In), clip.fade_curve(Edge::Out)),
+                };
                 Some(Sound { segment, pcm: self.library.cache(clip.source)?.audio.clone() })
             })
             .collect();
@@ -424,6 +465,17 @@ impl Editor {
         let frame = self.frame();
         if let Some(id) = self.selected {
             self.sequence.trim_end(id, t, frame);
+        }
+    }
+
+    /// Cuts the selected clip at the playhead, or if it is not there, the clip seen there. The part
+    /// after the cut is selected.
+    fn split_at_playhead(&mut self) {
+        let t = self.frame_start(self.position);
+        let target = self.selected.filter(|id| self.sequence.clip(*id).span().contains(t)).or_else(|| self.sequence.shown_at(t));
+        if let Some(part) = target.and_then(|id| self.sequence.split(id, t, self.frame())) {
+            self.pause();
+            self.selected = Some(part);
         }
     }
 
@@ -611,6 +663,14 @@ impl Editor {
         if pressed(none, Key::Delete) || pressed(none, Key::Backspace) {
             self.delete_selected();
         }
+        if pressed(Modifiers::COMMAND, Key::B) {
+            self.split_at_playhead();
+        } else if pressed(none, Key::B) {
+            self.timeline.tool = Tool::Blade;
+        }
+        if pressed(none, Key::V) || pressed(none, Key::Escape) {
+            self.timeline.tool = Tool::Select;
+        }
     }
 
     fn timeline_panel(&mut self, ctx: &egui::Context) {
@@ -622,20 +682,36 @@ impl Editor {
             .iter()
             .filter_map(|source| Some((source.id, (source.label(), self.library.info(source.id)?.duration))))
             .collect();
-        egui::TopBottomPanel::bottom("timeline").show(ctx, |ui| {
+        // The graph of each source's sound: none for a video without sound.
+        let sounds: BTreeMap<SourceId, SourceSound> = self
+            .sources
+            .iter()
+            .filter_map(|source| {
+                let info = self.library.info(source.id)?;
+                let sound = if info.has_audio { SourceSound::Graph(self.library.sound_graph(source.id)?) } else { SourceSound::Silent };
+                Some((source.id, sound))
+            })
+            .collect();
+        let panel = egui::TopBottomPanel::bottom("timeline").show(ctx, |ui| {
             ui.add_space(6.0);
-            let env = TimelineEnv { fps, missing: &missing, placeable: &placeable };
+            let env = TimelineEnv { fps, missing: &missing, placeable: &placeable, sounds: &sounds };
             let response = self.timeline.show(ui, &mut self.position, &mut self.sequence, &mut self.selected, &env);
             if (response.seeked || response.edit_started) && self.playing {
                 self.pause();
             }
             self.peek = response.peek;
+            if let Some(section) = response.open {
+                self.flash = Some((section, ui.input(|i| i.time)));
+                self.scroll_to = Some(section);
+                ui.ctx().request_repaint();
+            }
             ui.add_space(4.0);
 
             // Every time shown is time in the file: it counts from the export start.
             let zero = self.sequence.export.start;
 
-            ui.horizontal(|ui| {
+            // Wraps when the timeline is narrow: the right column takes the window's whole height.
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("⏮").on_hover_text("Go to the export start (Up)").clicked() {
                     self.seek(self.sequence.export.start);
                 }
@@ -668,21 +744,24 @@ impl Editor {
                 if ui.button("▶ Play export").on_hover_text("Play the export range with the fades from the export settings").clicked() {
                     self.play_export();
                 }
+                ui.separator();
+                let select = ui.selectable_value(&mut self.timeline.tool, Tool::Select, "Select (V)");
+                select.on_hover_text("A click picks a clip; a clip is dragged by its body, trimmed by its edges");
+                let blade = ui.selectable_value(&mut self.timeline.tool, Tool::Blade, "Blade (B)");
+                blade.on_hover_text("A click on a clip cuts it there; with Shift every clip there. Esc goes back to Select");
+                if ui.button("Split (Ctrl+B)").on_hover_text("Cut the selected clip at the playhead, or the clip seen there").clicked() {
+                    self.split_at_playhead();
+                }
             });
 
             let at_playhead = self.frame_start(self.position);
-            egui::Grid::new("ranges").num_columns(10).spacing([8.0, 4.0]).show(ui, |ui| {
+            ui.horizontal(|ui| {
                 // The export starts at the zero by definition, so In and Out would be 0 and the length.
-                // The columns line up with the row of the clip: the two kinds of Set and the two lengths.
                 let export = self.sequence.export;
                 ui.label(RichText::new("Export").strong());
-                ui.label("");
-                ui.label("");
                 if ui.button("Set In (I)").on_hover_text("Start the export at the playhead").clicked() {
                     self.set_export_start(at_playhead);
                 }
-                ui.label("");
-                ui.label("");
                 if ui.button("Set Out (O)").on_hover_text("End the export at the playhead").clicked() {
                     self.set_export_end(at_playhead);
                 }
@@ -698,78 +777,58 @@ impl Editor {
                 if fit.clicked() {
                     self.sequence.fit_export();
                 }
-                ui.end_row();
-
-                ui.label(RichText::new("Clip").strong());
-                let Some(clip) = self.clip() else {
-                    // The same row, unavailable: nothing moves when a clip is picked.
-                    let mut nothing = 0.0;
-                    ui.label("Start");
-                    ui.add_enabled(false, time_value(&mut nothing, fps));
-                    ui.add_enabled(false, egui::Button::new("Set ([)"));
-                    ui.label("End");
-                    ui.add_enabled(false, time_value(&mut nothing, fps));
-                    ui.add_enabled(false, egui::Button::new("Set (])"));
-                    ui.label("Length");
-                    ui.add_enabled(false, time_value(&mut nothing, fps));
-                    ui.label(RichText::new("Select a clip on the timeline").weak());
-                    ui.end_row();
-                    return;
-                };
-                let span = clip.span();
-                let (source_in, source_out) = (clip.source_in, clip.source_out);
-                ui.label("Start");
-                let mut start = span.start - zero;
-                if ui.add(time_value(&mut start, fps)).on_hover_text("Where the clip starts in the file. Changing it trims the clip").changed() {
-                    self.trim_start(zero + start);
-                }
-                if ui.button("Set ([)").on_hover_text("Trim the clip's start to the playhead").clicked() {
-                    self.trim_start(at_playhead);
-                }
-                ui.label("End");
-                let mut clip_end = span.end - zero;
-                if ui.add(time_value(&mut clip_end, fps)).on_hover_text("Where the clip ends in the file. Changing it trims the clip").changed() {
-                    self.trim_end(zero + clip_end);
-                }
-                if ui.button("Set (])").on_hover_text("Trim the clip's end to the playhead").clicked() {
-                    self.trim_end(at_playhead);
-                }
-                ui.label("Length");
-                let mut length = span.len();
-                if ui.add(time_value(&mut length, fps)).changed() {
-                    self.trim_end(span.start + length);
-                }
-                ui.label(RichText::new(format!("from source {} to {}", timecode::format(source_in), timecode::format(source_out))).weak())
-                    .on_hover_text("Delete removes the clip");
-                ui.end_row();
             });
             ui.add_space(6.0);
         });
+        // The clip's panel follows it on the next frame.
+        let top = panel.response.rect.top();
+        if self.timeline_top != Some(top) {
+            self.timeline_top = Some(top);
+            ctx.request_repaint();
+        }
     }
 
     fn side_panel(&mut self, ctx: &egui::Context, plugins: &[Plugin], workspace: Option<&Workspace>, settings: &Settings) {
         let shown = self.framing.shown_presets(self.sequence.output);
+        // The whole height of the window: the result on top, the selected clip under it.
         egui::SidePanel::right("output").resizable(true).default_width(SIDE_PANEL_WIDTH).min_width(SIDE_PANEL_MIN_WIDTH).show(ctx, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.side_tab, SideTab::Output, RichText::new("Output").size(TAB_TEXT_SIZE));
-                ui.selectable_value(&mut self.side_tab, SideTab::Export, RichText::new(self.export.tab_text()).size(TAB_TEXT_SIZE));
+            // The clip's panel is as tall as its border was dragged to. Until then it starts where the
+            // timeline does, as if the timeline's top went on across.
+            let area = ui.max_rect();
+            let top = self.timeline_top.unwrap_or(area.bottom() - CLIP_PANEL_FIRST_HEIGHT);
+            let most = (area.height() - OUTPUT_PANEL_MIN_HEIGHT).max(CLIP_PANEL_MIN_HEIGHT);
+            let height = self.clip_panel_height.unwrap_or(area.bottom() - top).clamp(CLIP_PANEL_MIN_HEIGHT, most);
+            let clip_panel = egui::TopBottomPanel::bottom("clip").exact_height(height).frame(egui::Frame::none()).show_separator_line(false);
+            clip_panel.show_inside(ui, |ui| {
+                if let Some(dragged) = panel_border(ui) {
+                    self.clip_panel_height = Some((height - dragged).clamp(CLIP_PANEL_MIN_HEIGHT, most));
+                }
+                ui.horizontal(|ui| {
+                    let _ = ui.selectable_label(true, RichText::new("Clip").size(TAB_TEXT_SIZE));
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().id_salt("clip tab").auto_shrink([false, false]).show(ui, |ui| self.clip_tab(ui));
             });
-            ui.separator();
-            match self.side_tab {
-                SideTab::Output => {
-                    egui::ScrollArea::vertical().show(ui, |ui| self.output_tab(ui));
+            egui::CentralPanel::default().frame(egui::Frame::none()).show_inside(ui, |ui| {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.side_tab, SideTab::Output, RichText::new("Output").size(TAB_TEXT_SIZE));
+                    ui.selectable_value(&mut self.side_tab, SideTab::Export, RichText::new(self.export.tab_text()).size(TAB_TEXT_SIZE));
+                });
+                ui.separator();
+                match self.side_tab {
+                    SideTab::Output => self.output_tab(ui),
+                    SideTab::Export => {
+                        // What the plugins are told about the result: the video it is mostly made of.
+                        let no_meta = BTreeMap::new();
+                        let main = self.sequence.main_source();
+                        let meta = self.sources.iter().find(|source| Some(source.id) == main).map_or(&no_meta, |source| &source.meta);
+                        let publish = workspace.map(|workspace| PublishEnv { workspace, settings, name: &self.name, meta });
+                        let env = ExportEnv { files: &self.files, shown: &shown, position: self.position, plugins, publish };
+                        self.export.show(ui, &mut self.sequence, &env);
+                    }
                 }
-                SideTab::Export => {
-                    // What the plugins are told about the result: the video it is mostly made of.
-                    let no_meta = BTreeMap::new();
-                    let main = self.sequence.main_source();
-                    let meta = self.sources.iter().find(|source| Some(source.id) == main).map_or(&no_meta, |source| &source.meta);
-                    let publish = workspace.map(|workspace| PublishEnv { workspace, settings, name: &self.name, meta });
-                    let env = ExportEnv { files: &self.files, shown: &shown, position: self.position, plugins, publish };
-                    self.export.show(ui, &mut self.sequence, &env);
-                }
-            }
+            });
         });
 
         // Whatever the tab: a preset on the other one can change the frame the pictures have to fill.
@@ -809,11 +868,14 @@ impl Editor {
         (None, Some(id), Drawn { source: clip.source, transform: clip.transform, size: size.unwrap_or(NO_SIZE) })
     }
 
+    /// The result: the frame at the playhead as it will be in the file, as large as the panel allows.
     fn output_tab(&mut self, ui: &mut egui::Ui) {
         let output = self.sequence.output;
         let settings = self.sequence.settings;
         let outline = output.outline();
-        let [box_w, box_h] = outline.fit(ui.available_width() as f64, OUTPUT_MAX_HEIGHT);
+        // Under the picture: its caption, and why there is no sound, if so.
+        let below = 28.0 + if self.player.audio_error.is_some() { 22.0 } else { 0.0 };
+        let [box_w, box_h] = outline.fit(ui.available_width() as f64, (ui.available_height() - below).max(80.0) as f64);
         let box_size = egui::vec2(box_w as f32, box_h as f32);
 
         let (texture, live, drawn) = self.output_picture();
@@ -821,14 +883,26 @@ impl Editor {
         if texture.is_some() && live.is_some() {
             self.drawn = Some(drawn);
         }
+        // While the clip fades: how much of it shows, and what shows through.
+        let now = self.shown_time();
+        let opacity = live.map_or(1.0, |id| self.sequence.clip(id).opacity(now) as f32);
+        let under_clip = self.under_at(now).map(|id| self.sequence.clip(id).clone());
+        let under_texture = under_clip.as_ref().and_then(|clip| self.under.of(clip.source)).cloned();
+        let under = match (&under_clip, &under_texture) {
+            (Some(clip), Some(texture)) => self.size_of(clip.source).map(|size| Layer { texture, size, transform: clip.transform, opacity: clip.opacity(now) as f32 }),
+            _ => None,
+        };
         ui.vertical_centered(|ui| {
             // Dragging or zooming the output edits the clip it shows, and selects it.
             let touched = match live {
-                Some(id) => self.output_view.show(ui, texture.as_ref(), drawn.size, outline, &mut self.sequence.clip_mut(id).transform, box_size),
+                Some(id) => {
+                    let t = &mut self.sequence.clip_mut(id).transform;
+                    self.output_view.show(ui, texture.as_ref(), drawn.size, outline, t, box_size, opacity, under)
+                }
                 None => {
                     // What was there before stays only to look at.
                     let mut still = drawn.transform;
-                    self.output_view.show(ui, texture.as_ref(), drawn.size, outline, &mut still, box_size);
+                    self.output_view.show(ui, texture.as_ref(), drawn.size, outline, &mut still, box_size, 1.0, None);
                     false
                 }
             };
@@ -839,84 +913,152 @@ impl Editor {
             let caption = format!("{} · {} · {px_w}×{px_h}", output.preset().name, output.ratio().label());
             ui.label(RichText::new(caption).weak());
         });
-        ui.separator();
+        if let Some(error) = &self.player.audio_error {
+            ui.colored_label(Color32::from_rgb(230, 120, 60), format!("No sound: {error}"));
+        }
+    }
 
+    /// The selected clip: where it is, its frame, its sound, its effects and its source.
+    fn clip_tab(&mut self, ui: &mut egui::Ui) {
         let Some(id) = self.selected else {
-            ui.label(RichText::new("Select a clip on the timeline to set its frame and sound.").weak());
+            ui.label(RichText::new("Select a clip on the timeline to set its timing, frame, sound and effects.").weak());
             return;
         };
+        // Every time shown is time in the file: it counts from the export start.
+        let zero = self.sequence.export.start;
+        let (fps, at_playhead) = (self.fps, self.frame_start(self.position));
+        let clip = self.sequence.clip(id);
+        let (span, source_in, source_out, name) = (clip.span(), clip.source_in, clip.source_out, clip.name.clone());
+        let track = format!("Track {}", self.sequence.tracks.len() - id.track);
+        ui.label(RichText::new(name).strong());
+        ui.label(RichText::new(format!("{track} · {} to {}", timecode::format(span.start - zero), timecode::format(span.end - zero))).weak());
+        ui.separator();
+
+        ui.heading("Timing");
+        egui::Grid::new("timing").num_columns(3).spacing([8.0, 6.0]).show(ui, |ui| {
+            ui.label("Start");
+            let mut start = span.start - zero;
+            if ui.add(time_value(&mut start, fps)).on_hover_text("Where the clip starts in the file. Changing it trims the clip").changed() {
+                self.trim_start(zero + start);
+            }
+            if ui.button("Set ([)").on_hover_text("Trim the clip's start to the playhead").clicked() {
+                self.trim_start(at_playhead);
+            }
+            ui.end_row();
+            ui.label("End");
+            let mut end = span.end - zero;
+            if ui.add(time_value(&mut end, fps)).on_hover_text("Where the clip ends in the file. Changing it trims the clip").changed() {
+                self.trim_end(zero + end);
+            }
+            if ui.button("Set (])").on_hover_text("Trim the clip's end to the playhead").clicked() {
+                self.trim_end(at_playhead);
+            }
+            ui.end_row();
+            ui.label("Length");
+            let mut length = span.len();
+            if ui.add(time_value(&mut length, fps)).changed() {
+                self.trim_end(span.start + length);
+            }
+            ui.end_row();
+        });
+        let from = format!("From its source {} to {}. Delete removes the clip.", timecode::format(source_in), timecode::format(source_out));
+        ui.label(RichText::new(from).weak().small());
+        ui.separator();
+
         let source = self.sequence.clip(id).source;
         let info = self.library.info(source).cloned();
-        ui.heading("Transform");
+        let flash_of = |section: Section| self.flash.filter(|(flashed, _)| *flashed == section).map(|(_, started)| started);
+        let (frame_flash, sound_flash, effects_flash) = (flash_of(Section::Frame), flash_of(Section::Sound), flash_of(Section::Effects));
         let t = &mut self.sequence.clip_mut(id).transform;
-        let (mut x, mut y) = (t.cx * 100.0, t.cy * 100.0);
-        egui::Grid::new("transform").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-            ui.label("X");
-            if ui.add(egui::DragValue::new(&mut x).speed(0.1).fixed_decimals(1).suffix(" %")).changed() {
-                t.cx = x / 100.0;
-            }
-            ui.end_row();
-            ui.label("Y");
-            if ui.add(egui::DragValue::new(&mut y).speed(0.1).fixed_decimals(1).suffix(" %")).changed() {
-                t.cy = y / 100.0;
-            }
-            ui.end_row();
-            ui.label("Zoom");
-            ui.add(egui::DragValue::new(&mut t.zoom).speed(0.01).range(geometry::MIN_ZOOM_WITH_BARS..=geometry::MAX_ZOOM).fixed_decimals(2).prefix("×"));
-            ui.end_row();
-            ui.label("Angle");
-            ui.add(egui::DragValue::new(&mut t.angle_deg).speed(0.2).fixed_decimals(1).suffix("°"));
-            ui.end_row();
+        let frame_section = flash::frame(ui, frame_flash, false).show(ui, |ui| {
+            ui.heading("Transform");
+            let (mut x, mut y) = (t.cx * 100.0, t.cy * 100.0);
+            egui::Grid::new("transform").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                ui.label("X");
+                if ui.add(egui::DragValue::new(&mut x).speed(0.1).fixed_decimals(1).suffix(" %")).changed() {
+                    t.cx = x / 100.0;
+                }
+                ui.end_row();
+                ui.label("Y");
+                if ui.add(egui::DragValue::new(&mut y).speed(0.1).fixed_decimals(1).suffix(" %")).changed() {
+                    t.cy = y / 100.0;
+                }
+                ui.end_row();
+                ui.label("Zoom");
+                ui.add(egui::DragValue::new(&mut t.zoom).speed(0.01).range(geometry::MIN_ZOOM_WITH_BARS..=geometry::MAX_ZOOM).fixed_decimals(2).prefix("×"));
+                ui.end_row();
+                ui.label("Angle");
+                ui.add(egui::DragValue::new(&mut t.angle_deg).speed(0.2).fixed_decimals(1).suffix("°"));
+                ui.end_row();
+            });
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Center").clicked() {
+                    t.cx = 0.5;
+                    t.cy = 0.5;
+                }
+                if ui.button("−90°").clicked() {
+                    t.angle_deg -= 90.0;
+                }
+                if ui.button("+90°").clicked() {
+                    t.angle_deg += 90.0;
+                }
+                if ui.button("0°").clicked() {
+                    t.angle_deg = 0.0;
+                }
+                let mirror = ui.add(egui::Button::new("Mirror").selected(t.mirror));
+                if mirror.on_hover_text("Flip the output left to right").clicked() {
+                    t.mirror = !t.mirror;
+                }
+                if ui.button("Reset").clicked() {
+                    *t = Transform::default();
+                }
+            });
+            ui.label(
+                RichText::new(
+                    "Drag inside the frame to move it (Alt: no snapping). Drag a side to resize it \
+                     (Ctrl: the opposite side stays); with the lock open that changes the proportions \
+                     (Shift: the opposite of the lock). Drag an arrow to rotate it (Shift: 15° steps). \
+                     Rest on the mark at its top for Fit, Fill, Bars and Reset; click it for 0°. Wheel to zoom.",
+                )
+                .weak()
+                .small(),
+            );
         });
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("Center").clicked() {
-                t.cx = 0.5;
-                t.cy = 0.5;
-            }
-            if ui.button("−90°").clicked() {
-                t.angle_deg -= 90.0;
-            }
-            if ui.button("+90°").clicked() {
-                t.angle_deg += 90.0;
-            }
-            if ui.button("0°").clicked() {
-                t.angle_deg = 0.0;
-            }
-            let mirror = ui.add(egui::Button::new("Mirror").selected(t.mirror));
-            if mirror.on_hover_text("Flip the output left to right").clicked() {
-                t.mirror = !t.mirror;
-            }
-            if ui.button("Reset").clicked() {
-                *t = Transform::default();
-            }
-        });
-        ui.label(
-            RichText::new(
-                "Drag inside the frame to move it (Alt: no snapping). Drag a side to resize it \
-                 (Ctrl: the opposite side stays); with the lock open that changes the proportions \
-                 (Shift: the opposite of the lock). Drag an arrow to rotate it (Shift: 15° steps). \
-                 Rest on the mark at its top for Fit, Fill, Bars and Reset; click it for 0°. Wheel to zoom.",
-            )
-            .weak()
-            .small(),
-        );
+        if self.scroll_to == Some(Section::Frame) {
+            frame_section.response.scroll_to_me(Some(egui::Align::Center));
+            self.scroll_to = None;
+        }
         ui.separator();
 
         if info.as_ref().is_some_and(|info| info.has_audio) {
-            ui.heading("Sound");
             let clip = self.sequence.clip_mut(id);
-            ui.horizontal(|ui| {
-                let mut percent = clip.volume * 100.0;
-                ui.label("Volume");
-                if ui.add(egui::Slider::new(&mut percent, 0.0..=200.0).fixed_decimals(0).suffix(" %")).changed() {
-                    clip.volume = percent / 100.0;
-                }
-                if ui.add(egui::Button::new("Mute").selected(clip.muted)).clicked() {
-                    clip.muted = !clip.muted;
-                }
+            let sound_section = flash::frame(ui, sound_flash, false).show(ui, |ui| {
+                ui.heading("Sound");
+                ui.horizontal(|ui| {
+                    let mut percent = clip.volume * 100.0;
+                    ui.label("Volume");
+                    if ui.add(egui::Slider::new(&mut percent, 0.0..=200.0).fixed_decimals(0).suffix(" %")).changed() {
+                        clip.volume = percent / 100.0;
+                    }
+                    if ui.add(egui::Button::new("Mute").selected(clip.muted)).clicked() {
+                        clip.muted = !clip.muted;
+                    }
+                });
             });
+            if self.scroll_to == Some(Section::Sound) {
+                sound_section.response.scroll_to_me(Some(egui::Align::Center));
+                self.scroll_to = None;
+            }
             ui.separator();
         }
+
+        let clip = self.sequence.clip_mut(id);
+        let effects_section = flash::frame(ui, effects_flash, false).show(ui, |ui| effects_editor(ui, clip));
+        if self.scroll_to == Some(Section::Effects) {
+            effects_section.response.scroll_to_me(Some(egui::Align::Center));
+            self.scroll_to = None;
+        }
+        ui.separator();
 
         ui.heading("Source");
         let label = self.sources.iter().find(|s| s.id == source).map_or_else(|| "removed from the project".to_owned(), Source::label);
@@ -942,9 +1084,6 @@ impl Editor {
             ui.label(if info.has_audio { "yes" } else { "no" });
             ui.end_row();
         });
-        if let Some(error) = &self.player.audio_error {
-            ui.colored_label(Color32::from_rgb(230, 120, 60), format!("No sound: {error}"));
-        }
     }
 
     fn source_panel(&mut self, ctx: &egui::Context) {
@@ -997,6 +1136,93 @@ impl Editor {
             self.redo();
         }
     }
+}
+
+/// The border between the panels of the right column: a line with dots in its middle, dragged up and
+/// down. Returns how far it was dragged down this frame.
+fn panel_border(ui: &mut egui::Ui) -> Option<f32> {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), PANEL_BORDER_HEIGHT), egui::Sense::drag());
+    let response = response.on_hover_cursor(egui::CursorIcon::ResizeVertical);
+    let visuals = ui.visuals();
+    let active = response.hovered() || response.dragged();
+    let color = if active { visuals.strong_text_color() } else { visuals.weak_text_color() };
+    let line = if active { visuals.widgets.hovered.fg_stroke } else { visuals.widgets.noninteractive.bg_stroke };
+    ui.painter().hline(rect.x_range(), rect.center().y, line);
+    let dots = egui::Rect::from_center_size(rect.center(), egui::vec2(18.0, PANEL_BORDER_HEIGHT));
+    ui.painter().rect_filled(dots, 3.0, visuals.panel_fill);
+    grip_dots(ui.painter(), rect.center(), 3, 1, color);
+    if response.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        return Some(response.drag_delta().y);
+    }
+    None
+}
+
+/// The effects of a clip, in order, each with its settings, and a way to add more.
+fn effects_editor(ui: &mut egui::Ui, clip: &mut Clip) {
+    ui.heading("Effects");
+    let len = clip.span().len();
+    let (fade_in, fade_out) = clip.fade_lengths();
+    let mut remove = None;
+    for (i, effect) in clip.effects.iter_mut().enumerate() {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            match effect {
+                Effect::Fade(fade) => {
+                    let (name, room) = match fade.edge {
+                        Edge::In => ("Fade in", len - fade_out),
+                        Edge::Out => ("Fade out", len - fade_in),
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(name).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Remove").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Length");
+                        let length = egui::DragValue::new(&mut fade.seconds).speed(0.01).range(0.0..=room.max(0.0)).fixed_decimals(2).suffix(" s");
+                        ui.add(length).on_hover_text("No longer than the clip leaves after the other fade");
+                        ui.checkbox(&mut fade.picture, "Picture").on_hover_text("The picture comes out of, or goes into, what is under the clip: black if there is nothing");
+                        ui.checkbox(&mut fade.sound, "Sound").on_hover_text("The sound rises from, or falls into, silence");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Curve");
+                        let (icon, _) = ui.allocate_exact_size(egui::vec2(28.0, 16.0), egui::Sense::hover());
+                        ui.painter().rect_stroke(icon, 2.0, egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color));
+                        paint_curve(ui.painter(), icon.shrink(2.0), fade.curve, fade.edge, ui.visuals().text_color());
+                        egui::ComboBox::from_id_salt(("fade curve", i)).selected_text(fade.curve.name()).width(150.0).show_ui(ui, |ui| {
+                            for curve in Curve::ALL {
+                                if curve_choice(ui, curve, fade.edge, curve == fade.curve).clicked() {
+                                    fade.curve = curve;
+                                }
+                            }
+                        });
+                    })
+                    .response
+                    .on_hover_text("How it goes: an ease in starts slowly, an ease out ends slowly");
+                }
+            }
+        });
+    }
+    if let Some(i) = remove {
+        clip.effects.remove(i);
+    }
+    clip.fit_fades();
+    if clip.effects.is_empty() {
+        ui.label(RichText::new("No effects. Also from the clip's menu: right click on it.").weak());
+    }
+    ui.menu_button("Add effect", |ui| {
+        for (edge, name) in [(Edge::In, "Fade in"), (Edge::Out, "Fade out")] {
+            let add = ui.add_enabled(clip.fade(edge).is_none(), egui::Button::new(name));
+            if add.on_disabled_hover_text("The clip has one").clicked() {
+                clip.add_fade(edge);
+                ui.close_menu();
+            }
+        }
+    });
 }
 
 /// A time field: drag to change, click to type `mm:ss.cc`, `mm:ss:ff` or seconds.

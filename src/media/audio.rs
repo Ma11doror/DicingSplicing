@@ -1,5 +1,6 @@
 //! Audio output through cpal. The stream position is the playback clock; video follows it.
 
+use crate::core::edit::{Curve, Edge};
 use crate::media::cache::{Pcm, AUDIO_RATE};
 use anyhow::{bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -28,19 +29,35 @@ pub struct Sound {
     pub pcm: Pcm,
 }
 
-/// Timeline `start..end` plays the source from `source_start` on, multiplied by `gain`.
+/// Timeline `start..end` plays the source from `source_start` on, multiplied by `gain`, rising
+/// over its first `fade_in` seconds and falling over its last `fade_out`, each by its curve.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Segment {
     pub start: f64,
     pub end: f64,
     pub source_start: f64,
     pub gain: f32,
+    pub fade_in: f64,
+    pub fade_out: f64,
+    pub curves: (Curve, Curve),
 }
 
 impl Segment {
     /// Source time at timeline time `t`, if the segment covers it.
     pub fn source_time(&self, t: f64) -> Option<f64> {
         (t >= self.start && t < self.end).then_some(t - self.start + self.source_start)
+    }
+
+    /// What the segment's sound is multiplied by at `t`: its gain and its fades.
+    pub fn level(&self, t: f64) -> f32 {
+        let mut fade = 1.0f64;
+        if self.fade_in > 0.0 {
+            fade = fade.min(self.curves.0.level(Edge::In, (t - self.start) / self.fade_in));
+        }
+        if self.fade_out > 0.0 {
+            fade = fade.min(self.curves.1.level(Edge::Out, (t - (self.end - self.fade_out)) / self.fade_out));
+        }
+        self.gain * fade.clamp(0.0, 1.0) as f32
     }
 }
 
@@ -65,8 +82,9 @@ impl PlayRange {
             // A source whose sound is still being decoded is silent until it is there.
             if let (Some(pcm), Some(source)) = (sound.pcm.get(), sound.segment.source_time(t)) {
                 let (left, right) = sample_at(pcm, source * AUDIO_RATE as f64);
-                sum.0 += left * sound.segment.gain;
-                sum.1 += right * sound.segment.gain;
+                let level = sound.segment.level(t);
+                sum.0 += left * level;
+                sum.1 += right * level;
             }
         }
         sum
@@ -255,7 +273,7 @@ mod tests {
 
     #[test]
     fn segment_maps_to_source_time() {
-        let sound = Segment { start: 5.0, end: 15.0, source_start: 2.0, gain: 1.0 };
+        let sound = Segment { start: 5.0, end: 15.0, source_start: 2.0, gain: 1.0, ..Segment::default() };
         assert_eq!(sound.source_time(5.0), Some(2.0));
         assert_eq!(sound.source_time(10.5), Some(7.5));
         assert_eq!(sound.source_time(4.9), None);
@@ -265,7 +283,7 @@ mod tests {
     #[test]
     fn time_before_the_zero_of_the_timeline_plays_like_any_other() {
         // A clip moved to -5..5 s, playing its source from 2 s on.
-        let sound = Segment { start: -5.0, end: 5.0, source_start: 2.0, gain: 1.0 };
+        let sound = Segment { start: -5.0, end: 5.0, source_start: 2.0, gain: 1.0, ..Segment::default() };
         assert_eq!(sound.source_time(-5.0), Some(2.0));
         assert_eq!(sound.source_time(0.0), Some(7.0));
         assert_eq!(sound.source_time(-5.1), None);
@@ -283,9 +301,9 @@ mod tests {
         let pcm = |level: i16| -> Pcm { Arc::new(OnceLock::from(Arc::new(vec![level; 2 * AUDIO_RATE as usize * 20]))) };
         // One clip at 0..10 s at half volume, another at 5..15 s; a third whose sound is not decoded yet.
         let sounds: Vec<Sound> = vec![
-            Sound { segment: Segment { start: 0.0, end: 10.0, source_start: 0.0, gain: 0.5 }, pcm: pcm(8192) },
-            Sound { segment: Segment { start: 5.0, end: 15.0, source_start: 3.0, gain: 1.0 }, pcm: pcm(4096) },
-            Sound { segment: Segment { start: 0.0, end: 15.0, source_start: 0.0, gain: 1.0 }, pcm: Arc::new(OnceLock::new()) },
+            Sound { segment: Segment { start: 0.0, end: 10.0, source_start: 0.0, gain: 0.5, ..Segment::default() }, pcm: pcm(8192) },
+            Sound { segment: Segment { start: 5.0, end: 15.0, source_start: 3.0, gain: 1.0, ..Segment::default() }, pcm: pcm(4096) },
+            Sound { segment: Segment { start: 0.0, end: 15.0, source_start: 0.0, gain: 1.0, ..Segment::default() }, pcm: Arc::new(OnceLock::new()) },
         ];
         let range = PlayRange { start: 0.0, end: 20.0, sounds: sounds.into(), ..PlayRange::default() };
         assert_eq!(range.mix(2.0), (0.125, 0.125));
@@ -293,6 +311,23 @@ mod tests {
         assert_eq!(range.mix(12.0), (0.125, 0.125));
         assert_eq!(range.mix(16.0), (0.0, 0.0));
         assert_eq!(PlayRange::default().mix(1.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn a_clip_fades_in_and_out_on_its_own() {
+        let pcm: Pcm = Arc::new(OnceLock::from(Arc::new(vec![16384i16; 2 * AUDIO_RATE as usize * 20])));
+        // A clip at 2..12 s at full volume, rising over 2 s and falling over 4 s.
+        let segment = Segment { start: 2.0, end: 12.0, source_start: 0.0, gain: 1.0, fade_in: 2.0, fade_out: 4.0, ..Segment::default() };
+        let range = PlayRange { start: 0.0, end: 20.0, sounds: vec![Sound { segment, pcm }].into(), ..PlayRange::default() };
+        assert_eq!(range.mix(2.0), (0.0, 0.0));
+        assert_eq!(range.mix(3.0), (0.25, 0.25));
+        assert_eq!(range.mix(6.0), (0.5, 0.5));
+        assert_eq!(range.mix(10.0), (0.25, 0.25));
+        assert_eq!(Segment { gain: 0.5, ..segment }.level(3.0), 0.25);
+        // By curves: an ease in rises slowly, an ease out falls fast and lingers.
+        let eased = Segment { curves: (Curve::EaseIn, Curve::EaseOut), ..segment };
+        assert_eq!((eased.level(3.0), eased.level(10.0)), (0.25, 0.25));
+        assert_eq!((eased.level(2.5), eased.level(8.5)), (0.0625, 0.765625));
     }
 
     #[test]

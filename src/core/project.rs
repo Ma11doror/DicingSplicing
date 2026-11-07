@@ -1,6 +1,6 @@
 //! A project: what is edited, saved in a folder of its own.
 
-use crate::core::edit::{Clip, Sequence, SourceId};
+use crate::core::edit::{Clip, Sequence, SourceId, TrackId};
 use crate::core::files;
 use crate::core::preset::{FrameOptions, PresetId};
 use anyhow::{bail, Context, Result};
@@ -11,9 +11,9 @@ use std::path::{Path, PathBuf};
 
 pub const PROJECT_FILE: &str = "project.json";
 pub const RENDERS_FOLDER: &str = "renders";
-/// 2: several tracks, each with an id of its own. An editor that knows only one track can't open
-/// such a file, and so can't lose the other tracks by saving it.
-pub const VERSION: u32 = 2;
+/// 2: several tracks, each with an id of its own. 3: effects on clips. 4: curves of fades. An editor
+/// that knows less can't open such a file, and so can't lose what it does not know by saving it.
+pub const VERSION: u32 = 4;
 
 /// A video the project uses. It is not copied: the project remembers where it is.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -64,6 +64,10 @@ pub struct ViewState {
     pub export_path: Option<PathBuf>,
     pub export_shown_frames: bool,
     pub loop_export: bool,
+    /// The tracks whose rows show their clips' effects and sound.
+    pub expanded_tracks: Vec<TrackId>,
+    /// How tall the clip's panel is, once its border has been dragged.
+    pub clip_panel_height: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -182,6 +186,7 @@ mod tests {
         clip.transform = Transform { cx: 0.25, cy: 0.75, zoom: 1.5, angle_deg: -33.5, mirror: true, bars: true };
         clip.volume = 0.5;
         clip.muted = true;
+        clip.add_fade(crate::core::edit::Edge::Out);
         project.view = ViewState {
             playhead: 7.25,
             timeline_scale: Some(44.0),
@@ -190,6 +195,8 @@ mod tests {
             export_path: Some("D:/out/final.mp4".into()),
             export_shown_frames: true,
             loop_export: true,
+            expanded_tracks: vec![0],
+            clip_panel_height: Some(280.0),
         };
         project
     }

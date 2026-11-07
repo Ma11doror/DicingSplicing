@@ -68,6 +68,91 @@ impl Span {
 /// Which of a project's sources something comes from.
 pub type SourceId = u32;
 
+/// How long a fade is when it is added, like the sound fades of the export.
+pub const DEFAULT_FADE: f64 = 1.0;
+
+/// An edge of a clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Edge {
+    In,
+    Out,
+}
+
+/// The clip comes in (at its start) or goes out (at its end) gradually: its picture from or into
+/// what is under it, its sound from or into silence.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Fade {
+    pub edge: Edge,
+    pub seconds: f64,
+    pub picture: bool,
+    pub sound: bool,
+    /// How it goes over its length, for the picture and the sound alike.
+    #[serde(default)]
+    pub curve: Curve,
+}
+
+/// How a fade goes over its length. The names are about time, as in animation: an ease in starts
+/// slowly and an ease out ends slowly, whether the clip comes in or goes out. Strong ones are
+/// cubic, the others quadratic, and the ease in-out a half of a sine wave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Curve {
+    #[default]
+    Linear,
+    EaseIn,
+    EaseOut,
+    EaseInOut,
+    StrongEaseIn,
+    StrongEaseOut,
+    StrongEaseInOut,
+}
+
+impl Curve {
+    pub const ALL: [Curve; 7] =
+        [Curve::Linear, Curve::EaseIn, Curve::EaseOut, Curve::EaseInOut, Curve::StrongEaseIn, Curve::StrongEaseOut, Curve::StrongEaseInOut];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Curve::Linear => "Linear",
+            Curve::EaseIn => "Ease in",
+            Curve::EaseOut => "Ease out",
+            Curve::EaseInOut => "Ease in-out",
+            Curve::StrongEaseIn => "Strong ease in",
+            Curve::StrongEaseOut => "Strong ease out",
+            Curve::StrongEaseInOut => "Strong ease in-out",
+        }
+    }
+
+    /// How far the change has got when `x` of the fade's length has gone by: both from 0 to 1.
+    pub fn ease(self, x: f64) -> f64 {
+        let x = x.clamp(0.0, 1.0);
+        match self {
+            Curve::Linear => x,
+            Curve::EaseIn => x * x,
+            Curve::EaseOut => 1.0 - (1.0 - x).powi(2),
+            Curve::EaseInOut => (1.0 - (std::f64::consts::PI * x).cos()) / 2.0,
+            Curve::StrongEaseIn => x.powi(3),
+            Curve::StrongEaseOut => 1.0 - (1.0 - x).powi(3),
+            Curve::StrongEaseInOut if x < 0.5 => 4.0 * x.powi(3),
+            Curve::StrongEaseInOut => 1.0 - 4.0 * (1.0 - x).powi(3),
+        }
+    }
+
+    /// How much of the clip shows, or sounds, when `x` of a fade at `edge` has gone by.
+    pub fn level(self, edge: Edge, x: f64) -> f64 {
+        match edge {
+            Edge::In => self.ease(x),
+            Edge::Out => 1.0 - self.ease(x),
+        }
+    }
+}
+
+/// Something done to a clip. Effects apply in the order of the clip's list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum Effect {
+    Fade(Fade),
+}
+
 /// A piece of a source on a track.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Clip {
@@ -86,6 +171,9 @@ pub struct Clip {
     pub volume: f64,
     #[serde(default)]
     pub muted: bool,
+    /// What is done to it, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<Effect>,
 }
 
 fn full_volume() -> f64 {
@@ -110,6 +198,7 @@ impl Clip {
             transform: Transform::default(),
             volume: full_volume(),
             muted: false,
+            effects: Vec::new(),
         }
     }
 
@@ -157,11 +246,99 @@ impl Clip {
         self.start - self.source_in
     }
 
+    /// The fade at `edge`, if the clip has one.
+    pub fn fade(&self, edge: Edge) -> Option<&Fade> {
+        self.effects.iter().map(|Effect::Fade(fade)| fade).find(|fade| fade.edge == edge)
+    }
+
+    fn fade_mut(&mut self, edge: Edge) -> Option<&mut Fade> {
+        self.effects.iter_mut().map(|Effect::Fade(fade)| fade).find(|fade| fade.edge == edge)
+    }
+
+    /// The lengths of the fade in and the fade out as they play: together no longer than the clip.
+    pub fn fade_lengths(&self) -> (f64, f64) {
+        let len = self.span().len();
+        let fade_in = self.fade(Edge::In).map_or(0.0, |fade| fade.seconds.max(0.0)).min(len);
+        let fade_out = self.fade(Edge::Out).map_or(0.0, |fade| fade.seconds.max(0.0)).min(len - fade_in);
+        (fade_in, fade_out)
+    }
+
+    /// How much of the clip's picture shows at timeline time `t`, from 0 to 1, by its fades' curves.
+    pub fn opacity(&self, t: f64) -> f64 {
+        self.fade_level(t, |fade| fade.picture)
+    }
+
+    /// What the clip's fades multiply its sound by at `t`, besides its volume.
+    pub fn sound_fade(&self, t: f64) -> f64 {
+        self.fade_level(t, |fade| fade.sound)
+    }
+
+    fn fade_level(&self, t: f64, applies: impl Fn(&Fade) -> bool) -> f64 {
+        let (fade_in, fade_out) = self.fade_lengths();
+        let (local, len) = (t - self.start, self.span().len());
+        let mut level = 1.0f64;
+        if let Some(fade) = self.fade(Edge::In).filter(|fade| fade_in > 0.0 && applies(fade)) {
+            level = level.min(fade.curve.level(Edge::In, local / fade_in));
+        }
+        if let Some(fade) = self.fade(Edge::Out).filter(|fade| fade_out > 0.0 && applies(fade)) {
+            level = level.min(fade.curve.level(Edge::Out, (local - (len - fade_out)) / fade_out));
+        }
+        level.clamp(0.0, 1.0)
+    }
+
+    /// The curve of the fade at `edge`; Linear if there is none.
+    pub fn fade_curve(&self, edge: Edge) -> Curve {
+        self.fade(edge).map_or(Curve::Linear, |fade| fade.curve)
+    }
+
+    /// Makes the fade at `edge` go by `curve`, if the clip has one.
+    pub fn set_fade_curve(&mut self, edge: Edge, curve: Curve) {
+        if let Some(fade) = self.fade_mut(edge) {
+            fade.curve = curve;
+        }
+    }
+
+    /// Adds a fade of the picture and the sound at `edge`, unless there is one already. Returns
+    /// whether it was added.
+    pub fn add_fade(&mut self, edge: Edge) -> bool {
+        if self.fade(edge).is_some() {
+            return false;
+        }
+        self.effects.push(Effect::Fade(Fade { edge, seconds: DEFAULT_FADE, picture: true, sound: true, curve: Curve::Linear }));
+        self.fit_fades();
+        true
+    }
+
+    /// Takes the fade at `edge` off, if there is one.
+    pub fn remove_fade(&mut self, edge: Edge) {
+        self.effects.retain(|Effect::Fade(fade)| fade.edge != edge);
+    }
+
+    /// Sets the length of the fade at `edge`, as long as the clip and the other fade leave room for.
+    pub fn set_fade_length(&mut self, edge: Edge, seconds: f64) {
+        let (fade_in, fade_out) = self.fade_lengths();
+        let room = self.span().len() - if edge == Edge::In { fade_out } else { fade_in };
+        if let Some(fade) = self.fade_mut(edge) {
+            fade.seconds = seconds.clamp(0.0, room.max(0.0));
+        }
+    }
+
+    /// Keeps the fades within the clip, after it has been trimmed shorter.
+    pub fn fit_fades(&mut self) {
+        let (fade_in, fade_out) = self.fade_lengths();
+        for (edge, seconds) in [(Edge::In, fade_in), (Edge::Out, fade_out)] {
+            if let Some(fade) = self.fade_mut(edge) {
+                fade.seconds = seconds;
+            }
+        }
+    }
+
     /// Moves the start edge to `t`, not before `lo`; the picture stays where it is on the timeline.
     fn trim_start(&mut self, t: f64, lo: f64, min_len: f64) {
         let offset = self.offset();
         self.start = clamp(t, lo.max(offset), self.end() - min_len);
         self.source_in = self.start - offset;
+        self.fit_fades();
     }
 
     /// Moves the end edge to `t`, not after `hi`.
@@ -169,6 +346,7 @@ impl Clip {
         let offset = self.offset();
         let end = clamp(t, self.start + min_len, hi.min(offset + self.source_duration));
         self.source_out = end - offset;
+        self.fit_fades();
     }
 }
 
@@ -293,6 +471,13 @@ impl Sequence {
     /// the whole frame, bars included, so nothing under it shows.
     pub fn shown_at(&self, t: f64) -> Option<ClipId> {
         let mut visible = self.tracks.iter().enumerate().rev().filter(|(_, track)| !track.hidden);
+        visible.find_map(|(track, clips)| Some(ClipId { track, index: clips.clip_at(t)? }))
+    }
+
+    /// The clip seen at `t` under the tracks from `track` up: what a clip on `track` shows through
+    /// while it fades.
+    pub fn shown_under(&self, t: f64, track: usize) -> Option<ClipId> {
+        let mut visible = self.tracks[..track.min(self.tracks.len())].iter().enumerate().rev().filter(|(_, track)| !track.hidden);
         visible.find_map(|(track, clips)| Some(ClipId { track, index: clips.clip_at(t)? }))
     }
 
@@ -508,6 +693,34 @@ impl Sequence {
         if fitted {
             self.fit_export();
         }
+    }
+
+    /// Cuts a clip in two at `t`. It keeps what is before the cut; a new clip right after it plays
+    /// the rest, with the same framing and sound. From then on they are two clips like any others.
+    /// None if `t` is closer than `min_len` to an edge. Returns the part after the cut.
+    pub fn split(&mut self, id: ClipId, t: f64, min_len: f64) -> Option<ClipId> {
+        let clip = self.clip(id);
+        if t - clip.start < min_len - SAME_TIME || clip.end() - t < min_len - SAME_TIME {
+            return None;
+        }
+        let cut = clip.source_time(t);
+        // The fade in stays with the part before the cut, the fade out goes with the part after it.
+        let mut after = Clip { start: t, source_in: cut, ..clip.clone() };
+        after.effects.retain(|Effect::Fade(fade)| fade.edge != Edge::In);
+        after.fit_fades();
+        let before = self.clip_mut(id);
+        before.source_out = cut;
+        before.effects.retain(|Effect::Fade(fade)| fade.edge != Edge::Out);
+        before.fit_fades();
+        self.tracks[id.track].clips.insert(id.index + 1, after);
+        Some(ClipId { track: id.track, index: id.index + 1 })
+    }
+
+    /// Cuts every clip that is under `t`, on every track. Returns the parts after the cuts.
+    pub fn split_all(&mut self, t: f64, min_len: f64) -> Vec<ClipId> {
+        let under: Vec<ClipId> = self.clips().filter(|(_, clip)| clip.span().contains(t)).map(|(id, _)| id).collect();
+        // One clip per track at most is under `t`, so the cuts do not move each other's ids.
+        under.into_iter().filter_map(|id| self.split(id, t, min_len)).collect()
     }
 
     /// Puts a clip's start at `t`. The export range stays: this is how a clip gets black around it.
@@ -879,6 +1092,146 @@ mod tests {
         assert_eq!(sequence.move_track(1, true), 1);
         assert_eq!(sequence.move_track(0, false), 0);
         assert_eq!((sequence.tracks[0].id, sequence.tracks[1].id), (top, bottom));
+    }
+
+    #[test]
+    fn a_cut_clip_is_two_clips_that_play_the_same() {
+        // Source 2..12 s at 10..20 s, framed and turned, quieter.
+        let mut clip = placed_clip();
+        clip.transform = Transform { cx: 0.3, angle_deg: 20.0, ..Transform::default() };
+        clip.volume = 0.5;
+        let mut sequence = Sequence::new(clip.clone());
+        sequence.tracks[0].clips.push(Clip { start: 30.0, ..Clip::new("b".into(), 5.0) });
+        let export = sequence.export;
+        let first = ClipId { track: 0, index: 0 };
+
+        let second = sequence.split(first, 14.0, 0.5).unwrap();
+        assert_eq!(second, ClipId { track: 0, index: 1 });
+        let (a, b) = (sequence.clip(first).clone(), sequence.clip(second).clone());
+        assert_eq!((a.span(), a.source_in, a.source_out), (span(10.0, 14.0), 2.0, 6.0));
+        assert_eq!((b.span(), b.source_in, b.source_out), (span(14.0, 20.0), 6.0, 12.0));
+        // The same picture at every moment, the same framing and sound.
+        for t in [10.0, 13.9, 14.0, 19.0] {
+            let part = if t < 14.0 { &a } else { &b };
+            assert_eq!(part.source_time(t), clip.source_time(t));
+        }
+        assert_eq!((b.transform, b.volume, b.source, b.name.as_str()), (clip.transform, 0.5, 0, "a"));
+        assert_eq!(sequence.export, export);
+        assert_eq!(sequence.clip(ClipId { track: 0, index: 2 }).name, "b");
+
+        // From now on each is its own: turning one leaves the other.
+        sequence.clip_mut(second).transform.angle_deg = -45.0;
+        assert_eq!(sequence.clip(first).transform.angle_deg, 20.0);
+        // Not closer than the minimum to an edge.
+        assert_eq!(sequence.split(first, 10.2, 0.5), None);
+        assert_eq!(sequence.split(first, 13.7, 0.5), None);
+        assert_eq!(sequence.tracks[0].clips.len(), 3);
+    }
+
+    #[test]
+    fn fades_rise_and_fall_straight_and_fit_the_clip() {
+        // A clip 10..20 s with a fade in of 2 s, picture and sound, and a fade out of 4 s, picture only.
+        let mut clip = placed_clip();
+        assert_eq!((clip.opacity(10.0), clip.sound_fade(19.9)), (1.0, 1.0));
+        assert!(clip.add_fade(Edge::In));
+        assert!(!clip.add_fade(Edge::In), "one fade in only");
+        clip.set_fade_length(Edge::In, 2.0);
+        clip.add_fade(Edge::Out);
+        clip.set_fade_length(Edge::Out, 4.0);
+        if let Some(fade) = clip.fade_mut(Edge::Out) {
+            fade.sound = false;
+        }
+        assert_eq!(clip.fade_lengths(), (2.0, 4.0));
+        assert_eq!((clip.opacity(10.0), clip.opacity(11.0), clip.opacity(12.0), clip.opacity(15.0)), (0.0, 0.5, 1.0, 1.0));
+        assert_eq!((clip.opacity(18.0), clip.opacity(20.0)), (0.5, 0.0));
+        assert_eq!((clip.sound_fade(11.0), clip.sound_fade(18.0)), (0.5, 1.0));
+        // Not longer than what the other fade leaves.
+        clip.set_fade_length(Edge::In, 9.0);
+        assert_eq!(clip.fade_lengths(), (6.0, 4.0));
+
+        // Trimmed shorter, the fades shrink to fit: the fade in keeps what it can.
+        let mut track = track_of(vec![clip]);
+        track.trim_end(0, 15.0, 0.5);
+        assert_eq!(track.clips[0].fade_lengths(), (5.0, 0.0));
+        assert_eq!(track.clips[0].fade(Edge::Out).map(|fade| fade.seconds), Some(0.0));
+    }
+
+    #[test]
+    fn fades_go_by_their_curves() {
+        for curve in Curve::ALL {
+            // From nothing to all, without going back or beyond.
+            assert_eq!((curve.ease(0.0), curve.ease(1.0)), (0.0, 1.0), "{curve:?}");
+            assert_eq!((curve.ease(-1.0), curve.ease(2.0)), (0.0, 1.0), "{curve:?}");
+            let steps: Vec<f64> = (0..=100).map(|i| curve.ease(i as f64 / 100.0)).collect();
+            assert!(steps.windows(2).all(|pair| pair[1] >= pair[0]), "{curve:?}");
+            // A fade out is the fade in turned upside down.
+            assert_eq!(curve.level(Edge::Out, 0.3), 1.0 - curve.level(Edge::In, 0.3));
+        }
+        let at = |curve: Curve, x| (curve.ease(x) * 1000.0).round() / 1000.0;
+        // Ease in starts slowly, ease out ends slowly; strong ones more so.
+        assert_eq!((at(Curve::Linear, 0.25), at(Curve::EaseIn, 0.25), at(Curve::StrongEaseIn, 0.25)), (0.25, 0.063, 0.016));
+        assert_eq!((at(Curve::EaseOut, 0.75), at(Curve::StrongEaseOut, 0.75)), (0.938, 0.984));
+        assert_eq!((at(Curve::EaseInOut, 0.25), at(Curve::EaseInOut, 0.5), at(Curve::StrongEaseInOut, 0.25)), (0.146, 0.5, 0.063));
+        assert_eq!(at(Curve::StrongEaseInOut, 0.5), 0.5);
+
+        // A clip 10..20 s fading in over 2 s with an ease in, out over 4 s with an ease out.
+        let mut clip = placed_clip();
+        clip.add_fade(Edge::In);
+        clip.set_fade_length(Edge::In, 2.0);
+        clip.add_fade(Edge::Out);
+        clip.set_fade_length(Edge::Out, 4.0);
+        assert_eq!(clip.fade_curve(Edge::Out), Curve::Linear, "a new fade is linear");
+        clip.set_fade_curve(Edge::In, Curve::EaseIn);
+        clip.set_fade_curve(Edge::Out, Curve::EaseOut);
+        assert_eq!((clip.opacity(10.0), clip.opacity(11.0), clip.opacity(12.0)), (0.0, 0.25, 1.0));
+        assert_eq!((clip.opacity(16.0), clip.opacity(18.0), clip.opacity(20.0)), (1.0, 0.25, 0.0));
+        assert_eq!(clip.sound_fade(11.0), 0.25, "the sound goes by the same curve");
+    }
+
+    #[test]
+    fn a_fade_saved_before_curves_is_linear() {
+        let fade: Fade = serde_json::from_str(r#"{"edge": "Out", "seconds": 2.0, "picture": true, "sound": false}"#).unwrap();
+        assert_eq!(fade.curve, Curve::Linear);
+        let mut saved = Fade { curve: Curve::StrongEaseInOut, ..fade };
+        saved = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(saved.curve, Curve::StrongEaseInOut);
+    }
+
+    #[test]
+    fn a_cut_keeps_the_fade_in_before_it_and_the_fade_out_after_it() {
+        let mut clip = placed_clip();
+        clip.add_fade(Edge::In);
+        clip.add_fade(Edge::Out);
+        let mut sequence = Sequence::new(clip);
+        let first = ClipId { track: 0, index: 0 };
+        let second = sequence.split(first, 14.0, 0.5).unwrap();
+        let edges = |id| sequence.clip(id).effects.iter().map(|Effect::Fade(fade)| fade.edge).collect::<Vec<_>>();
+        assert_eq!((edges(first), edges(second)), (vec![Edge::In], vec![Edge::Out]));
+        assert_eq!(sequence.clip(second).opacity(20.0), 0.0);
+        assert_eq!(sequence.clip(first).opacity(14.0 - 1e-9), 1.0);
+    }
+
+    #[test]
+    fn a_fading_clip_shows_what_is_under_it() {
+        let mut sequence = Sequence::new(Clip::new("a".into(), 10.0));
+        sequence.tracks.push(track_of(vec![Clip { start: 2.0, ..Clip::of(1, "b".into(), 4.0) }]));
+        sequence.tracks.push(track_of(vec![Clip { start: 3.0, ..Clip::of(2, "c".into(), 1.0) }]));
+        assert_eq!(sequence.shown_under(3.5, 2), Some(ClipId { track: 1, index: 0 }));
+        assert_eq!(sequence.shown_under(3.5, 1), Some(ClipId { track: 0, index: 0 }));
+        assert_eq!(sequence.shown_under(3.5, 0), None);
+        sequence.tracks[1].hidden = true;
+        assert_eq!(sequence.shown_under(3.5, 2), Some(ClipId { track: 0, index: 0 }));
+    }
+
+    #[test]
+    fn a_cut_through_all_tracks_cuts_what_is_under_it() {
+        let mut sequence = Sequence::new(Clip::new("a".into(), 10.0));
+        sequence.tracks.push(track_of(vec![Clip { start: 4.0, ..Clip::of(1, "b".into(), 4.0) }]));
+        sequence.tracks.push(track_of(vec![Clip { start: 20.0, ..Clip::of(2, "c".into(), 4.0) }]));
+        let parts = sequence.split_all(6.0, 0.1);
+        assert_eq!(parts, [ClipId { track: 0, index: 1 }, ClipId { track: 1, index: 1 }]);
+        assert_eq!(sequence.tracks.iter().map(|track| track.clips.len()).collect::<Vec<_>>(), [2, 2, 1]);
+        assert_eq!(sequence.clip(parts[1]).span(), span(6.0, 8.0));
     }
 
     #[test]

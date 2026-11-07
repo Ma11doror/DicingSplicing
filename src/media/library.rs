@@ -5,11 +5,13 @@
 use crate::core::edit::SourceId;
 use crate::media::cache::{CacheStatus, MediaCache};
 use crate::media::probe::{self, MediaInfo};
+use crate::media::waveform::Peaks;
 use crate::media::{Notify, SourceFile, SourceFiles};
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 
 /// Where a source is, as the user sees it.
@@ -45,6 +47,9 @@ struct Probed {
 struct Entry {
     path: PathBuf,
     item: Item,
+    /// The graph of its sound, made in the background once the sound is decoded.
+    peaks: Arc<OnceLock<Peaks>>,
+    peaks_started: bool,
 }
 
 pub struct Library {
@@ -73,7 +78,7 @@ impl Library {
         } else {
             Item::Missing
         };
-        self.entries.insert(id, Entry { path: path.to_owned(), item });
+        self.entries.insert(id, Entry { path: path.to_owned(), item, peaks: Arc::default(), peaks_started: false });
     }
 
     /// Forgets a source, and stops preparing its frames.
@@ -104,6 +109,18 @@ impl Library {
                 },
                 _ => {}
             }
+        }
+
+        // The graph of a sound that has just been decoded.
+        for entry in self.entries.values_mut().filter(|entry| !entry.peaks_started) {
+            let Item::Cache(cache) = &entry.item else { continue };
+            let Some(pcm) = cache.audio.get().cloned() else { continue };
+            entry.peaks_started = true;
+            let (peaks, notify) = (entry.peaks.clone(), self.notify.clone());
+            thread::spawn(move || {
+                let _ = peaks.set(Peaks::from_pcm(&pcm));
+                notify();
+            });
         }
 
         let busy = self.entries.values().any(|entry| match &entry.item {
@@ -149,6 +166,11 @@ impl Library {
             Item::Cache(cache) => Some(&cache.info),
             _ => None,
         }
+    }
+
+    /// Where the graph of the source's sound will be, once it is made.
+    pub fn sound_graph(&self, id: SourceId) -> Option<Arc<OnceLock<Peaks>>> {
+        Some(self.entries.get(&id)?.peaks.clone())
     }
 
     /// The frames and sound prepared for the editor, complete or still growing.
@@ -249,6 +271,15 @@ mod tests {
         assert_eq!(library.files().keys().copied().collect::<Vec<_>>(), [0, 1]);
         assert_eq!(library.preparing(), None);
         assert!(library.cache(0).unwrap().frame_count() >= 50);
+        // The graph of the sound follows; these videos have none, so it is silent.
+        let started = Instant::now();
+        let graph = library.sound_graph(0).unwrap();
+        while graph.get().is_none() {
+            library.poll();
+            assert!(started.elapsed() < Duration::from_secs(10), "no graph of the sound");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(graph.get().unwrap().level(0.0, 2.0), 0.0);
         drop(library);
 
         // Opened again: the frames are there, nothing waits.
