@@ -69,6 +69,8 @@ pub struct ViewState {
     pub expanded_tracks: Vec<TrackId>,
     /// How tall the clip's panel is, once its border has been dragged.
     pub clip_panel_height: Option<f32>,
+    /// How tall the timeline is, once its border has been dragged.
+    pub timeline_height: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -198,6 +200,7 @@ mod tests {
             loop_export: true,
             expanded_tracks: vec![0],
             clip_panel_height: Some(280.0),
+            timeline_height: Some(360.0),
         };
         project
     }

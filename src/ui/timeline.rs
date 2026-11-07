@@ -7,8 +7,10 @@
 //! of the selected clip trim it, the anchors on the ruler move the edges of the export range, the
 //! strip between them moves all of it. Dragged with the right or the middle button, it is always
 //! the tape. A click on the ruler takes the playhead there; in the rows it picks a clip, or nothing.
-//! The wheel zooms; over the headers or the scroll bar right of the rows it scrolls them. A row
-//! moves by dragging its name.
+//! The wheel zooms; over the headers or the scroll bar left of them it scrolls the rows. Dragged with
+//! the right or the middle button, or the left one on an empty place in the rows, the tape also
+//! moves the rows up and down. The rows give a little past their ends and spring back: there is
+//! nothing more there. A row moves by dragging its name.
 //! With the Blade tool, a click on a clip cuts it there, with Shift every clip there. A right click
 //! on a clip opens its menu: fades and their curves, a cut there, delete. The selected clip's fades are dragged by
 //! the dots on its top edge.
@@ -33,14 +35,22 @@ const STRIP_HEIGHT: f32 = 12.0;
 const PICTURE_LANE_HEIGHT: f32 = 44.0;
 const EFFECTS_LANE_HEIGHT: f32 = 24.0;
 const SOUND_LANE_HEIGHT: f32 = 52.0;
-/// Left of the rows: the name of each track and what can be done with it.
-const HEADER_WIDTH: f32 = 204.0;
+/// Left of the rows: their scroll bar, and the name of each track and what can be done with it.
+const HEADER_WIDTH: f32 = 218.0;
+/// The scroll bar and the gap after it, at the left of the headers.
+const SCROLL_BAR_SPACE: f32 = SCROLL_BAR_WIDTH + 4.0;
+/// How far the rows go past their ends before they stop, how much of a push they give way to
+/// there, and how fast they spring back, per second.
+const OVERSCROLL: f32 = 56.0;
+const OVERSCROLL_GIVE: f32 = 0.35;
+const SPRING: f32 = 14.0;
+/// How long after the last push the rows spring back: the wheel's steps come apart.
+const SPRING_DELAY: f64 = 0.12;
 /// The six dots a row is dragged by, left of its name.
 const ROW_GRIP_SIZE: [f32; 2] = [14.0, 16.0];
 /// The triangle that folds and unfolds a row.
 const FOLD_SIZE: [f32; 2] = [16.0, 16.0];
 /// When the rows need more than this, they scroll.
-const ROWS_MAX_HEIGHT: f32 = 4.0 * PICTURE_LANE_HEIGHT;
 /// The scroll bar of the rows, over their right edge, and the shortest its thumb gets.
 const SCROLL_BAR_WIDTH: f32 = 10.0;
 const SCROLL_THUMB_MIN: f32 = 24.0;
@@ -153,6 +163,40 @@ pub struct Timeline {
     menu: Option<(ClipId, f64)>,
     /// The rows' scroll bar as it is drawn: the bar, its thumb, and whether the pointer is on it.
     scroll_bar: Option<(Rect, Rect, bool)>,
+    /// While the tape is dragged over the rows: where the drag started and how far they were
+    /// scrolled then.
+    pan: Option<(f32, f32)>,
+    /// When the rows were last pushed: they spring back a little after.
+    pushed_at: f64,
+}
+
+/// The rows' scroll after a push by `delta`: past an end they give way less, and no further than
+/// `OVERSCROLL`.
+fn push(scroll: f32, delta: f32, max: f32) -> f32 {
+    let outward = (scroll < 0.0 && delta < 0.0) || (scroll > max && delta > 0.0);
+    (scroll + if outward { delta * OVERSCROLL_GIVE } else { delta }).clamp(-OVERSCROLL, max + OVERSCROLL)
+}
+
+/// Where the rows are when the pointer would take them to `raw`: past an end, only part of the way.
+fn rubber(raw: f32, max: f32) -> f32 {
+    if raw < 0.0 {
+        (raw * OVERSCROLL_GIVE).max(-OVERSCROLL)
+    } else if raw > max {
+        max + ((raw - max) * OVERSCROLL_GIVE).min(OVERSCROLL)
+    } else {
+        raw
+    }
+}
+
+/// The rows `dt` seconds on as they spring back within `0..=max`. At the end they stop.
+fn settle(scroll: f32, max: f32, dt: f32) -> f32 {
+    let target = scroll.clamp(0.0, max.max(0.0));
+    let next = scroll + (target - scroll) * (1.0 - (-SPRING * dt).exp());
+    if (next - target).abs() < 0.5 {
+        target
+    } else {
+        next
+    }
 }
 
 /// The scroll bar of the rows: where its thumb is for a scroll, and the scroll for where the thumb is.
@@ -425,6 +469,7 @@ impl Layout {
         let ruler = Rect::from_min_size(body.min, vec2(body.width(), RULER_HEIGHT));
         let strip = Rect::from_min_max(pos2(ruler.left(), ruler.bottom() - STRIP_HEIGHT), ruler.max);
         let rows_area = Rect::from_min_max(pos2(rect.left(), ruler.bottom()), rect.max);
+        let header_left = rect.left() + SCROLL_BAR_SPACE;
         let mut y = rows_area.top() - scroll;
         let mut rows = Vec::new();
         for (track, clips) in sequence.tracks.iter().enumerate().rev() {
@@ -434,7 +479,7 @@ impl Layout {
                 lanes.push((lane, Rect::from_x_y_ranges(left..=rect.right(), y..=y + lane.height())));
                 y += lane.height();
             }
-            let header = Rect::from_x_y_ranges(rect.left()..=left, top..=y);
+            let header = Rect::from_x_y_ranges(header_left..=left, top..=y);
             let body = Rect::from_x_y_ranges(left..=rect.right(), top..=y);
             rows.push(Row { track, header, body, lanes });
         }
@@ -484,6 +529,8 @@ impl Timeline {
             thumb_grab: 0.0,
             menu: None,
             scroll_bar: None,
+            pan: None,
+            pushed_at: 0.0,
         }
     }
 
@@ -515,10 +562,13 @@ impl Timeline {
         let fps = env.fps;
         let frame = 1.0 / fps;
         let width = ui.available_width();
+        // All the height it is given: the rows take what the ruler leaves, whether they fill it or not.
+        let height = ui.available_height().max(LABEL_HEIGHT + RULER_HEIGHT + PICTURE_LANE_HEIGHT);
+        let shown_rows = height - LABEL_HEIGHT - RULER_HEIGHT;
         let rows_height = Layout::rows_height(sequence, &self.expanded);
-        let shown_rows = rows_height.clamp(PICTURE_LANE_HEIGHT, ROWS_MAX_HEIGHT);
-        self.scroll = self.scroll.clamp(0.0, (rows_height - shown_rows).max(0.0));
-        let height = LABEL_HEIGHT + RULER_HEIGHT + shown_rows;
+        let max_scroll = (rows_height - shown_rows).max(0.0);
+        self.scroll = self.scroll.clamp(-OVERSCROLL, max_scroll + OVERSCROLL);
+        let now = ui.input(|i| i.time);
         let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click_and_drag());
         let mut layout = Layout::new(rect, sequence, &self.expanded, self.scroll);
         let mut out = TimelineResponse::default();
@@ -533,11 +583,14 @@ impl Timeline {
         let over_headers = pointer.is_some_and(|p| layout.rows_area.contains(p) && p.x < layout.body.left());
 
         // Wheel (or pinch, or ctrl+wheel) zooms; horizontal scrolling scrubs. Over the headers the
-        // wheel scrolls the rows instead.
-        if over_headers && rows_height > shown_rows {
-            let scroll = ui.input_mut(|i| std::mem::take(&mut i.smooth_scroll_delta).y);
-            self.scroll = (self.scroll - scroll).clamp(0.0, rows_height - shown_rows);
-            layout = Layout::new(rect, sequence, &self.expanded, self.scroll);
+        // wheel scrolls the rows instead, a little past their ends too.
+        if over_headers {
+            let wheel = ui.input_mut(|i| std::mem::take(&mut i.smooth_scroll_delta).y);
+            if wheel != 0.0 {
+                self.scroll = push(self.scroll, -wheel, max_scroll);
+                self.pushed_at = now;
+                layout = Layout::new(rect, sequence, &self.expanded, self.scroll);
+            }
         } else if response.hovered() {
             let (scroll, zoom) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta()));
             pps = (pps * (scroll.y * 0.004).exp() * zoom).clamp(min_pps, max_pps);
@@ -546,11 +599,11 @@ impl Timeline {
                 out.seeked = true;
             }
         }
-        // A scroll bar over the right edge of the rows, when they are taller than the room they have.
+        // A scroll bar at the left of the headers, when the rows are taller than the room they have.
         // Its thumb is dragged; a click beside it turns a page; the wheel over it scrolls.
         self.scroll_bar = None;
         if rows_height > shown_rows {
-            let track = Rect::from_x_y_ranges(rect.right() - SCROLL_BAR_WIDTH..=rect.right(), layout.rows_area.y_range());
+            let track = Rect::from_x_y_ranges(rect.left()..=rect.left() + SCROLL_BAR_WIDTH, layout.rows_area.y_range());
             let bar = RowsBar::new(track, shown_rows, rows_height);
             let response = ui.interact(track, ui.id().with("rows scroll bar"), Sense::click_and_drag());
             if let (true, Some(p)) = (response.drag_started(), response.interact_pointer_pos()) {
@@ -560,6 +613,7 @@ impl Timeline {
             }
             if let (true, Some(p)) = (response.dragged(), response.interact_pointer_pos()) {
                 self.scroll = bar.scroll_at(p.y - self.thumb_grab);
+                self.pushed_at = now;
             }
             if let (true, Some(p)) = (response.clicked(), response.interact_pointer_pos()) {
                 let thumb = bar.thumb(self.scroll);
@@ -568,12 +622,15 @@ impl Timeline {
             }
             if response.hovered() {
                 let wheel = ui.input_mut(|i| std::mem::take(&mut i.smooth_scroll_delta).y);
-                self.scroll = (self.scroll - wheel).clamp(0.0, bar.max_scroll);
+                if wheel != 0.0 {
+                    self.scroll = push(self.scroll, -wheel, bar.max_scroll);
+                    self.pushed_at = now;
+                }
             }
             let hot = response.hovered() || response.dragged();
-            response.on_hover_text("Scroll the tracks. The wheel over their names does it too");
+            response.on_hover_text("Scroll the tracks. The wheel over their names does it too, and a drag with the right button");
             layout = Layout::new(rect, sequence, &self.expanded, self.scroll);
-            self.scroll_bar = Some((track, bar.thumb(self.scroll), hot));
+            self.scroll_bar = Some((track, bar.thumb(self.scroll.clamp(0.0, bar.max_scroll)), hot));
         }
 
         // The rows scroll up and down only: the playhead stays where it is.
@@ -591,6 +648,8 @@ impl Timeline {
                 let blade = self.tool == Tool::Blade && !layout.ruler.contains(p);
                 let grabbed = if tape || blade { None } else { hit(p, &layout, view(pos), sequence, *selected) };
                 let drag = grabbed.unwrap_or(Drag::Scrub { start_time: pos, start_x: p.x });
+                // The tape over the rows takes them along up and down.
+                self.pan = (grabbed.is_none() && layout.rows_area.contains(p)).then_some((p.y, self.scroll));
                 if let Some(edge) = edge_time(sequence, drag) {
                     self.grab = edge - view(pos).t(p.x);
                     out.edit_started = true;
@@ -607,6 +666,11 @@ impl Timeline {
             if let Drag::Scrub { start_time, start_x } = drag {
                 pos = start_time - ((p.x - start_x) / pps) as f64;
                 out.seeked = true;
+                if let Some((start_y, start_scroll)) = self.pan {
+                    self.scroll = rubber(start_scroll - (p.y - start_y), max_scroll);
+                    self.pushed_at = now;
+                    layout = Layout::new(rect, sequence, &self.expanded, self.scroll);
+                }
             } else {
                 let speed = if self.stuck { 0.0 } else { autoscroll_speed(p.x, self.press_x, layout.body.left(), layout.body.right()) };
                 if speed != 0.0 {
@@ -622,7 +686,7 @@ impl Timeline {
                     let row_speed = row_autoscroll_speed(p.y, layout.rows_area);
                     if row_speed != 0.0 && rows_height > shown_rows {
                         let dt = ui.input(|i| i.stable_dt).min(0.1);
-                        self.scroll = (self.scroll + row_speed * dt).clamp(0.0, rows_height - shown_rows);
+                        self.scroll = (self.scroll + row_speed * dt).clamp(0.0, max_scroll);
                         layout = Layout::new(rect, sequence, &self.expanded, self.scroll);
                         ui.ctx().request_repaint();
                     }
@@ -651,6 +715,16 @@ impl Timeline {
             }
             self.drag = None;
             self.snapped = None;
+            self.pan = None;
+        }
+        // Past an end and let go: back to it, a little after the last push.
+        let held = self.pan.is_some() || now - self.pushed_at < SPRING_DELAY;
+        if !held && !(0.0..=max_scroll).contains(&self.scroll) {
+            self.scroll = settle(self.scroll, max_scroll, ui.input(|i| i.stable_dt).min(0.1));
+            layout = Layout::new(rect, sequence, &self.expanded, self.scroll);
+            ui.ctx().request_repaint();
+        } else if held && !(0.0..=max_scroll).contains(&self.scroll) {
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(SPRING_DELAY));
         }
         if response.clicked() {
             if let Some(p) = response.interact_pointer_pos().filter(|p| p.x >= layout.body.left()) {
@@ -1740,7 +1814,7 @@ mod tests {
         }
         let folded = BTreeSet::new();
         assert_eq!(Layout::rows_height(&sequence, &folded), 6.0 * PICTURE_LANE_HEIGHT);
-        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 58.0 + ROWS_MAX_HEIGHT));
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 58.0 + 4.0 * PICTURE_LANE_HEIGHT));
         let layout = Layout::new(rect, &sequence, &folded, 0.0);
         assert_eq!(layout.rows.iter().map(|row| row.track).collect::<Vec<_>>(), [5, 4, 3, 2, 1, 0]);
         assert_eq!(layout.row_at(60.0).map(|row| row.track), Some(5));
@@ -1828,6 +1902,28 @@ mod tests {
         assert_eq!(bar.scroll_at(500.0), 300.0);
         // Many rows: the thumb stays big enough to grab.
         assert_eq!(RowsBar::new(Rect::from_min_max(pos2(0.0, 0.0), pos2(10.0, 100.0)), 100.0, 5000.0).thumb_height, SCROLL_THUMB_MIN);
+    }
+
+    #[test]
+    fn the_rows_give_a_little_past_their_ends_and_spring_back() {
+        // Rows 300 px taller than their room.
+        assert_eq!(push(100.0, 50.0, 300.0), 150.0, "inside, as far as pushed");
+        assert_eq!(push(290.0, 40.0, 300.0), 330.0, "from inside, the push takes it past");
+        assert!((push(310.0, 40.0, 300.0) - 324.0).abs() < 1e-4, "past the end, it gives way less");
+        assert_eq!(push(300.0 + OVERSCROLL, 500.0, 300.0), 300.0 + OVERSCROLL, "and no further than this");
+        assert_eq!(push(0.0, -500.0, 0.0), -OVERSCROLL, "rows that fit give way too");
+        // Dragged: past an end only part of the way.
+        assert_eq!(rubber(150.0, 300.0), 150.0);
+        assert!((rubber(-40.0, 300.0) + 14.0).abs() < 1e-4);
+        assert_eq!(rubber(10_000.0, 300.0), 300.0 + OVERSCROLL);
+        // Let go, they come back to the end, and stop there.
+        let mut scroll = 300.0 + OVERSCROLL;
+        for _ in 0..60 {
+            scroll = settle(scroll, 300.0, 1.0 / 60.0);
+        }
+        assert_eq!(scroll, 300.0);
+        assert_eq!(settle(-20.0, 0.0, 1.0), 0.0);
+        assert_eq!(settle(120.0, 300.0, 0.016), 120.0, "inside, nothing moves");
     }
 
     #[test]

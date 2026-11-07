@@ -45,7 +45,8 @@ const GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("Drag the dots on its top edge", "Change the length of its fade"),
             ("Right click on a clip", "Its menu: fades and their curves, color, a cut there, delete"),
             ("Double click on a clip", "Unfold or fold its track: effects and sound"),
-            ("Drag the ruler or an empty place", "Move along the timeline; with the right or middle button, always"),
+            ("Drag the ruler or an empty place", "Move along the time, and over the tracks up and down too"),
+            ("Drag with the right or middle button", "The same, wherever it starts"),
             ("Wheel", "Zoom; over the track names or the scroll bar, scroll the tracks"),
             ("Drag the dots of a track", "Move the track up or down"),
             ("Drag a source from Sources", "Put it on the timeline there"),
@@ -60,7 +61,7 @@ const GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("Drag an arrow at a corner", "Rotate (Shift: 15 degree steps)"),
         ],
     ),
-    ("Window", &[("F1", "This list")]),
+    ("Window", &[("F1", "This list"), ("Drag the dots above the timeline", "Make it taller or lower"), ("Drag the dots above Clip", "Share the right column between Output and Clip")]),
 ];
 
 #[derive(Default)]

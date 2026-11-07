@@ -39,6 +39,11 @@ const CLIP_PANEL_MIN_HEIGHT: f32 = 160.0;
 const OUTPUT_PANEL_MIN_HEIGHT: f32 = 200.0;
 /// The border between the result's panel and the clip's, dragged by its dots.
 const PANEL_BORDER_HEIGHT: f32 = 10.0;
+/// The timeline before its border is dragged: about four rows. The least it keeps is one row with
+/// the ruler and the buttons under it, and the pictures above it keep this much.
+const TIMELINE_FIRST_HEIGHT: f32 = 300.0;
+const TIMELINE_MIN_HEIGHT: f32 = 200.0;
+const PREVIEW_MIN_HEIGHT: f32 = 160.0;
 /// The export settings need this much to show without cutting anything.
 const SIDE_PANEL_MIN_WIDTH: f32 = 340.0;
 const TAB_TEXT_SIZE: f32 = 17.0;
@@ -115,6 +120,8 @@ pub struct Editor {
     timeline_top: Option<f32>,
     /// How tall the clip's panel is, once its border has been dragged.
     clip_panel_height: Option<f32>,
+    /// How tall the timeline is, once its border has been dragged.
+    timeline_height: Option<f32>,
     source_view: SourceView,
     output_view: OutputView,
     /// The result's frame rate: the grid of the timeline. Updated every frame.
@@ -177,6 +184,7 @@ impl Editor {
             timeline: Timeline::new(view.timeline_scale, &view.expanded_tracks),
             timeline_top: None,
             clip_panel_height: view.clip_panel_height,
+            timeline_height: view.timeline_height,
             source_view: SourceView::default(),
             output_view: OutputView,
             fps: 30.0,
@@ -206,6 +214,7 @@ impl Editor {
                 // Of the tracks that are there: a deleted one may come back with Undo, folded then.
                 expanded_tracks: self.timeline.expanded().filter(|id| self.sequence.tracks.iter().any(|track| track.id == *id)).collect(),
                 clip_panel_height: self.clip_panel_height,
+                timeline_height: self.timeline_height,
             },
         }
     }
@@ -750,93 +759,103 @@ impl Editor {
                 Some((source.id, sound))
             })
             .collect();
-        let panel = egui::TopBottomPanel::bottom("timeline").show(ctx, |ui| {
-            ui.add_space(6.0);
-            let env = TimelineEnv { fps, missing: &missing, placeable: &placeable, sounds: &sounds };
-            let response = self.timeline.show(ui, &mut self.position, &mut self.sequence, &mut self.selected, &env);
-            if (response.seeked || response.edit_started) && self.playing {
-                self.pause();
+        // As tall as its border was dragged to, leaving the pictures above it some room.
+        let most = (ctx.available_rect().height() - PREVIEW_MIN_HEIGHT).max(TIMELINE_MIN_HEIGHT);
+        let height = self.timeline_height.unwrap_or(TIMELINE_FIRST_HEIGHT).clamp(TIMELINE_MIN_HEIGHT, most);
+        let panel = egui::TopBottomPanel::bottom("timeline").exact_height(height).show_separator_line(false).show(ctx, |ui| {
+            if let Some(dragged) = panel_border(ui) {
+                self.timeline_height = Some((height - dragged).clamp(TIMELINE_MIN_HEIGHT, most));
             }
-            self.peek = response.peek;
-            if let Some(section) = response.open {
-                self.flash = Some((section, ui.input(|i| i.time)));
-                self.scroll_to = Some(section);
-                ui.ctx().request_repaint();
-            }
-            ui.add_space(4.0);
+            // The buttons at the bottom; the timeline takes all the rest.
+            egui::TopBottomPanel::bottom("timeline buttons").frame(egui::Frame::none()).show_separator_line(false).show_inside(ui, |ui| {
+                ui.add_space(4.0);
 
-            // Every time shown is time in the file: it counts from the export start.
-            let zero = self.sequence.export.start;
+                // Every time shown is time in the file: it counts from the export start.
+                let zero = self.sequence.export.start;
 
-            // Wraps when the timeline is narrow: the right column takes the window's whole height.
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("⏮").on_hover_text("Go to the export start (Up)").clicked() {
-                    self.seek(self.sequence.export.start);
+                // Wraps when the timeline is narrow: the right column takes the window's whole height.
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("⏮").on_hover_text("Go to the export start (Up)").clicked() {
+                        self.seek(self.sequence.export.start);
+                    }
+                    if ui.button("⏪").on_hover_text("Previous frame (Left, Shift+Left for a second)").clicked() {
+                        self.step(-1);
+                    }
+                    let play = if self.playing { "⏸" } else { "▶" };
+                    let play_button = egui::Button::new(RichText::new(play).size(16.0)).min_size(egui::vec2(44.0, 0.0));
+                    if ui.add(play_button).on_hover_text("Play / pause (Space)").clicked() {
+                        self.toggle_play();
+                    }
+                    if ui.button("⏩").on_hover_text("Next frame (Right, Shift+Right for a second)").clicked() {
+                        self.step(1);
+                    }
+                    if ui.button("⏭").on_hover_text("Go to the export end (Down)").clicked() {
+                        self.seek(self.sequence.export.end);
+                    }
+                    ui.separator();
+                    let mut t = self.position - zero;
+                    if ui.add(time_value(&mut t, fps)).on_hover_text("Playhead").changed() {
+                        self.seek(zero + t);
+                    }
+                    ui.separator();
+                    let looped = ui
+                        .toggle_value(&mut self.loop_export, "🔁 Loop export")
+                        .on_hover_text("Space plays the export range in a loop, with the fades from the export settings");
+                    if looped.changed() && self.playing {
+                        self.play();
+                    }
+                    if ui.button("▶ Play export").on_hover_text("Play the export range with the fades from the export settings").clicked() {
+                        self.play_export();
+                    }
+                    ui.separator();
+                    let select = ui.selectable_value(&mut self.timeline.tool, Tool::Select, "Select (V)");
+                    select.on_hover_text("A click picks a clip; a clip is dragged by its body, trimmed by its edges");
+                    let blade = ui.selectable_value(&mut self.timeline.tool, Tool::Blade, "Blade (B)");
+                    blade.on_hover_text("A click on a clip cuts it there; with Shift every clip there. Esc goes back to Select");
+                    if ui.button("Split (Ctrl+B)").on_hover_text("Cut the selected clip at the playhead, or the clip seen there").clicked() {
+                        self.split_at_playhead();
+                    }
+                });
+
+                let at_playhead = self.frame_start(self.position);
+                ui.horizontal(|ui| {
+                    // The export starts at the zero by definition, so In and Out would be 0 and the length.
+                    let export = self.sequence.export;
+                    ui.label(RichText::new("Export").strong());
+                    if ui.button("Set In (I)").on_hover_text("Start the export at the playhead").clicked() {
+                        self.set_export_start(at_playhead);
+                    }
+                    if ui.button("Set Out (O)").on_hover_text("End the export at the playhead").clicked() {
+                        self.set_export_end(at_playhead);
+                    }
+                    ui.label("Length");
+                    let mut length = export.len();
+                    if ui.add(time_value(&mut length, fps)).changed() {
+                        self.sequence.export.resize_end(export.start + length, frame);
+                    }
+                    let fit = ui
+                        .add_enabled(!self.sequence.export_fits(), egui::Button::new("Fit to clips"))
+                        .on_hover_text("Make the export range exactly what the clips cover")
+                        .on_disabled_hover_text("The export range is exactly what the clips cover. Trimming a clip takes it along");
+                    if fit.clicked() {
+                        self.sequence.fit_export();
+                    }
+                });
+                ui.add_space(6.0);
+            });
+            egui::CentralPanel::default().frame(egui::Frame::none()).show_inside(ui, |ui| {
+                let env = TimelineEnv { fps, missing: &missing, placeable: &placeable, sounds: &sounds };
+                let response = self.timeline.show(ui, &mut self.position, &mut self.sequence, &mut self.selected, &env);
+                if (response.seeked || response.edit_started) && self.playing {
+                    self.pause();
                 }
-                if ui.button("⏪").on_hover_text("Previous frame (Left, Shift+Left for a second)").clicked() {
-                    self.step(-1);
-                }
-                let play = if self.playing { "⏸" } else { "▶" };
-                let play_button = egui::Button::new(RichText::new(play).size(16.0)).min_size(egui::vec2(44.0, 0.0));
-                if ui.add(play_button).on_hover_text("Play / pause (Space)").clicked() {
-                    self.toggle_play();
-                }
-                if ui.button("⏩").on_hover_text("Next frame (Right, Shift+Right for a second)").clicked() {
-                    self.step(1);
-                }
-                if ui.button("⏭").on_hover_text("Go to the export end (Down)").clicked() {
-                    self.seek(self.sequence.export.end);
-                }
-                ui.separator();
-                let mut t = self.position - zero;
-                if ui.add(time_value(&mut t, fps)).on_hover_text("Playhead").changed() {
-                    self.seek(zero + t);
-                }
-                ui.separator();
-                let looped = ui
-                    .toggle_value(&mut self.loop_export, "🔁 Loop export")
-                    .on_hover_text("Space plays the export range in a loop, with the fades from the export settings");
-                if looped.changed() && self.playing {
-                    self.play();
-                }
-                if ui.button("▶ Play export").on_hover_text("Play the export range with the fades from the export settings").clicked() {
-                    self.play_export();
-                }
-                ui.separator();
-                let select = ui.selectable_value(&mut self.timeline.tool, Tool::Select, "Select (V)");
-                select.on_hover_text("A click picks a clip; a clip is dragged by its body, trimmed by its edges");
-                let blade = ui.selectable_value(&mut self.timeline.tool, Tool::Blade, "Blade (B)");
-                blade.on_hover_text("A click on a clip cuts it there; with Shift every clip there. Esc goes back to Select");
-                if ui.button("Split (Ctrl+B)").on_hover_text("Cut the selected clip at the playhead, or the clip seen there").clicked() {
-                    self.split_at_playhead();
+                self.peek = response.peek;
+                if let Some(section) = response.open {
+                    self.flash = Some((section, ui.input(|i| i.time)));
+                    self.scroll_to = Some(section);
+                    ui.ctx().request_repaint();
                 }
             });
-
-            let at_playhead = self.frame_start(self.position);
-            ui.horizontal(|ui| {
-                // The export starts at the zero by definition, so In and Out would be 0 and the length.
-                let export = self.sequence.export;
-                ui.label(RichText::new("Export").strong());
-                if ui.button("Set In (I)").on_hover_text("Start the export at the playhead").clicked() {
-                    self.set_export_start(at_playhead);
-                }
-                if ui.button("Set Out (O)").on_hover_text("End the export at the playhead").clicked() {
-                    self.set_export_end(at_playhead);
-                }
-                ui.label("Length");
-                let mut length = export.len();
-                if ui.add(time_value(&mut length, fps)).changed() {
-                    self.sequence.export.resize_end(export.start + length, frame);
-                }
-                let fit = ui
-                    .add_enabled(!self.sequence.export_fits(), egui::Button::new("Fit to clips"))
-                    .on_hover_text("Make the export range exactly what the clips cover")
-                    .on_disabled_hover_text("The export range is exactly what the clips cover. Trimming a clip takes it along");
-                if fit.clicked() {
-                    self.sequence.fit_export();
-                }
-            });
-            ui.add_space(6.0);
         });
         // The clip's panel follows it on the next frame.
         let top = panel.response.rect.top();
