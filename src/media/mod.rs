@@ -2,6 +2,7 @@ pub mod audio;
 pub mod cache;
 pub mod frames;
 pub mod geometry;
+pub mod color;
 pub mod library;
 pub mod player;
 pub mod probe;

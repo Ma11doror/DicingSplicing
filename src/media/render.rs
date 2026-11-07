@@ -1,11 +1,11 @@
 //! Rendering the edit to a file with ffmpeg, always from the original source.
 
 use crate::core::edit::{Clip, ClipId, Curve, Edge, Sequence, Span};
-use crate::core::export::{ExportSettings, FrameRate, Rate, VideoCodec};
+use crate::core::export::{ExportSettings, FrameRate, Rate, VideoCodec, EVEN_LOUDNESS};
 use crate::core::preset::Preset;
 use crate::core::tools;
 use crate::media::geometry::{Mask, Outline, Transform};
-use crate::media::{Notify, SourceFile, SourceFiles};
+use crate::media::{color, Notify, SourceFile, SourceFiles};
 use anyhow::{bail, Context, Result};
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -350,8 +350,10 @@ fn clip_frames(frames: &Frames, args: &mut Vec<OsString>, inputs: &mut usize, id
     let format = if transparent { "yuva420p" } else { "yuv420p" };
     let over_black = curved && !alpha;
     let out = if over_black { format!("[{name}o]") } else { label.to_owned() };
+    // The colour comes first: a fade into black ends in black whatever the contrast.
+    let colored = clip.graded().map_or_else(String::new, |grade| color::filters(&grade));
     let mut filters = format!(
-        "[{input}:V:0]trim=end={to:.6}{fade},setpts=PTS{:+.6}/TB,fps={fps}:start_time=0,{frame},\
+        "[{input}:V:0]trim=end={to:.6}{colored}{fade},setpts=PTS{:+.6}/TB,fps={fps}:start_time=0,{frame},\
          tpad=stop=-1:stop_mode=clone,trim=end_frame={count},format={format}{out}",
         -from
     );
@@ -417,7 +419,9 @@ pub fn plan(files: &SourceFiles, sequence: &Sequence, output: &Path) -> Result<R
     let has_sound = settings.audio_codec.encoder().is_some()
         && reaching(sequence).any(|(_, clip)| files.get(&clip.source).is_some_and(|file| file.info.has_audio));
     if has_sound {
-        let fades = fade_filters(settings, total);
+        // Brought to one loudness before the fades of the whole, which then stay as they are set.
+        let loudness = if settings.even_loudness { format!(",loudnorm=I={EVEN_LOUDNESS}:TP=-1.5:LRA=11,aresample=48000") } else { String::new() };
+        let fades = format!("{loudness}{}", fade_filters(settings, total));
         let mut sounds = String::new();
         let heard = heard(sequence, files);
         for (n, (clip, span)) in heard.iter().enumerate() {
@@ -946,8 +950,10 @@ mod tests {
         assert_eq!(pieces(&s, 10.0), [black(0, 40), piece(40, 40, top, None), black(80, 20)]);
         // Only the sound fades: the picture is whole.
         s.tracks[0].hidden = false;
-        for crate::core::edit::Effect::Fade(fade) in &mut s.tracks[1].clips[0].effects {
-            fade.picture = false;
+        for effect in &mut s.tracks[1].clips[0].effects {
+            if let crate::core::edit::Effect::Fade(fade) = effect {
+                fade.picture = false;
+            }
         }
         assert_eq!(pieces(&s, 10.0), [piece(0, 40, below, None), piece(40, 40, top, None), piece(80, 20, below, None)]);
     }
@@ -1411,6 +1417,88 @@ mod tests {
         let rgb = rgb_at(path, t, width, height);
         let channel = |c: usize| rgb.iter().skip(c).step_by(3).map(|v| *v as f64).sum::<f64>() / (rgb.len() / 3) as f64;
         [channel(0), channel(1), channel(2)]
+    }
+
+    /// A quiet source and a loud one: as they are, far apart; with even loudness, alike.
+    #[test]
+    fn even_loudness_brings_quiet_and_loud_together() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let dir = temp_dir("loudness");
+        let level = |volume: f64, even: bool| {
+            let name = format!("tone_{volume}.mp4");
+            let source = dir.join(&name);
+            if !source.exists() {
+                ffmpeg(&[
+                    "-f", "lavfi", "-i", "color=c=gray:s=160x90:r=25:d=6",
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=6",
+                    "-af", &format!("volume={volume}"), "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-shortest",
+                    source.to_str().unwrap(),
+                ]);
+            }
+            let files: SourceFiles = [(0, SourceFile { path: source.clone(), info: probe::probe(&source).unwrap() })].into();
+            let mut s = Sequence::new(Clip { source_out: 5.0, ..Clip::of(0, "tone".into(), 6.0) });
+            s.output = Output { preset: PresetId::Landscape, ..Output::default() };
+            s.settings.size = OutputSize::LongSide(160);
+            s.settings.speed = Speed::Ultrafast;
+            s.settings.fades = (0.0, 0.0);
+            s.settings.even_loudness = even;
+            let path = render_all(&files, &s, &dir.join(format!("out_{volume}_{even}.mp4")));
+            20.0 * sound_level(&path, 1.0, 4.0).log10()
+        };
+        let (quiet, loud) = (level(0.02, false), level(0.5, false));
+        assert!(loud - quiet > 20.0, "as they are: {quiet:.1} and {loud:.1} dB");
+        let (quiet, loud) = (level(0.02, true), level(0.5, true));
+        assert!((loud - quiet).abs() < 2.0, "even: {quiet:.1} and {loud:.1} dB");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A clip's colour in the file is the preview's, and comes before its fade: the fade still ends
+    /// in black, however flat the contrast makes black.
+    #[test]
+    fn a_clips_colour_is_in_the_result_as_the_preview_has_it() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let dir = temp_dir("colour");
+        let brown = make_solid(&dir, "brown.mp4", "0x806040", 25, (320, 180), None);
+        let files: SourceFiles = [(0, SourceFile { path: brown.clone(), info: probe::probe(&brown).unwrap() })].into();
+        let color = crate::core::edit::Color { exposure: 0.4, contrast: -60.0, saturation: 160.0, temperature: 40.0 };
+        let mut s = Sequence::new(Clip { source_out: 4.0, ..Clip::of(0, "brown".into(), 10.0) });
+        let id = ClipId { track: 0, index: 0 };
+        s.clip_mut(id).add_color();
+        for effect in &mut s.clip_mut(id).effects {
+            if let crate::core::edit::Effect::Color(c) = effect {
+                *c = color;
+            }
+        }
+        s.clip_mut(id).add_fade(Edge::Out);
+        s.clip_mut(id).set_fade_length(Edge::Out, 1.0);
+        s.output = Output { preset: PresetId::Landscape, ..Output::default() };
+        s.settings.size = OutputSize::LongSide(320);
+        s.settings.speed = Speed::Ultrafast;
+        s.settings.fades = (0.0, 0.0);
+        s.settings.frame_rate = FrameRate::Fixed(25.0);
+
+        let plan = plan(&files, &s, &dir.join("graph.mp4")).unwrap();
+        let graph = plan.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ");
+        let (lut, fade) = (graph.find("lutrgb").expect("a colour"), graph.find(",fade=t=out").expect("a fade"));
+        assert!(lut < fade, "the colour before the fade: {graph}");
+
+        let path = render_all(&files, &s, &dir.join("graded.mp4"));
+        // The source as the file has it, through the preview's tables.
+        let source = mean_color(&brown, 1.0, 320, 180).map(|c| c.round() as u8);
+        let mut want = [egui::Color32::from_rgb(source[0], source[1], source[2])];
+        crate::media::color::Grade::new(&color).apply(&mut want);
+        let want = want[0].to_array();
+        let got = mean_color(&path, 1.0, 320, 180);
+        for c in 0..3 {
+            assert!((got[c] - want[c] as f64).abs() < 5.0, "channel {c}: the file has {got:?}, the preview {want:?} (source {source:?})");
+        }
+        let end = mean_level(&rgb_at(&path, 3.96, 320, 180));
+        assert!(end < 8.0, "the fade ends in black: {end}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A clip fades out of black on its own track, and over another clip on a track above it.

@@ -3,7 +3,7 @@
 
 use crate::core::edit::Sequence;
 use crate::core::export::{
-    AudioCodec, Container, ExportPreset, FrameRate, H264Profile, OutputSize, Rate, Setting, Speed, VideoCodec, EXPORT_PRESETS, PRESET_GROUPS,
+    AudioCodec, Container, ExportPreset, FrameRate, H264Profile, OutputSize, Rate, Setting, Speed, VideoCodec, EVEN_LOUDNESS, EXPORT_PRESETS, PRESET_GROUPS,
 };
 use crate::core::plugins::{Plugin, PluginKind};
 use crate::core::preset::Preset;
@@ -457,6 +457,13 @@ impl ExportPanel {
                     ui.label("out");
                     ui.add(seconds(&mut settings.fades.1));
                 });
+            });
+            row(ui, width, self.started(Setting::Loudness), Setting::Loudness.label(), |ui| {
+                let even = egui::Checkbox::new(&mut settings.even_loudness, format!("Even, {EVEN_LOUDNESS:.0} LUFS"));
+                ui.add_enabled(with_sound, even).on_hover_text(
+                    "Quiet and loud sources come out alike, as loud as YouTube and most sites play. \
+                     Only in the file: the editor plays the sound as it is",
+                );
             });
         });
 

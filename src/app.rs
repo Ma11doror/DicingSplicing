@@ -1,5 +1,6 @@
 //! The window: settings, the workspace, opening projects and hosting the editor.
 
+use crate::core::crash;
 use crate::core::plugins::{self, Fetched, Plugin};
 use crate::core::project::{self, Project, PROJECT_FILE};
 use crate::core::settings::{self, Settings};
@@ -8,6 +9,7 @@ use crate::core::workspace::Workspace;
 use crate::media::probe;
 use crate::media::Notify;
 use crate::ui::editor::Editor;
+use crate::ui::keys::KeysWindow;
 use crate::ui::plugins::SourceWindow;
 use crate::ui::settings::SettingsWindow;
 use crate::ui::start::{self, RecentProject, StartAction};
@@ -21,7 +23,12 @@ use std::sync::Arc;
 use std::thread;
 
 const ERROR: Color32 = Color32::from_rgb(230, 80, 70);
-const TITLE: &str = "Simple Editor";
+const WARNING: Color32 = Color32::from_rgb(230, 170, 60);
+
+/// The window's title: the editor and its version, which feedback should mention.
+pub fn title() -> String {
+    format!("Simple Editor {}", crash::VERSION)
+}
 
 /// A new project, made in the background: its video has to be read first.
 struct Opened {
@@ -73,6 +80,9 @@ pub struct EditorApp {
     /// What the plugin's window brings in goes into the open project, not a new one.
     fetch_into_editor: bool,
     errors: Vec<String>,
+    /// An error report written since the user last looked: something broke last time.
+    crash_report: Option<PathBuf>,
+    keys_window: KeysWindow,
 }
 
 impl EditorApp {
@@ -122,7 +132,13 @@ impl EditorApp {
             source_window: SourceWindow::default(),
             fetch_into_editor: false,
             errors,
+            crash_report: None,
+            keys_window: KeysWindow::default(),
         };
+        app.crash_report = crash::newest_report(&crash::logs_folder()).filter(|report| {
+            let name = report.file_name().map(|name| name.to_string_lossy().into_owned());
+            name != app.settings.crash_seen
+        });
         app.refresh_recent();
         // `simple_editor <video>`: also what "Open with" and dropping a file on the exe do.
         if let Some(path) = std::env::args_os().nth(1) {
@@ -149,7 +165,7 @@ impl EditorApp {
     }
 
     fn show_project(&mut self, project: Project, dir: PathBuf, cache_root: PathBuf, ctx: &egui::Context) {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{} — {TITLE}", project.name)));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{} — {}", project.name, title())));
         self.settings.remember_project(&dir);
         self.editor = Some(Editor::new(project, dir, cache_root, ctx));
     }
@@ -159,7 +175,7 @@ impl EditorApp {
             editor.flush();
             self.errors.extend(editor.save_error.take());
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(TITLE.to_owned()));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title()));
         self.refresh_recent();
     }
 
@@ -310,6 +326,7 @@ impl EditorApp {
     fn top_panel(&mut self, ctx: &egui::Context) {
         let mut close = false;
         let mut open_settings = false;
+        let mut open_keys = false;
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -322,8 +339,21 @@ impl EditorApp {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     open_settings = ui.button("Settings").clicked();
+                    open_keys = ui.button("Keys").on_hover_text("What the keys and the mouse do (F1)").clicked();
                 });
             });
+            if let Some(report) = self.crash_report.clone() {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.small_button("✖").on_hover_text("Don't remind about this one").clicked() {
+                        self.settings.crash_seen = report.file_name().map(|name| name.to_string_lossy().into_owned());
+                        self.crash_report = None;
+                    }
+                    ui.colored_label(WARNING, "Last time something went wrong in the editor. Its report helps to fix it:");
+                    if ui.small_button("Show the report").on_hover_text(report.display().to_string()).clicked() {
+                        crash::show_in_folder(&report);
+                    }
+                });
+            }
             let mut dismissed = None;
             for (i, error) in self.errors.iter().enumerate() {
                 // Errors name long paths: they wrap, and the button stays in sight.
@@ -345,6 +375,10 @@ impl EditorApp {
         if open_settings {
             self.settings_window.open();
         }
+        if open_keys || ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1)) {
+            self.keys_window.toggle();
+        }
+        self.keys_window.show(ctx);
     }
 
     fn save_settings(&mut self) {

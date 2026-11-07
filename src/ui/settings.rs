@@ -1,5 +1,6 @@
 //! The settings window.
 
+use crate::core::crash;
 use crate::core::plugins::{OptionKind, Plugin};
 use crate::core::settings::Settings;
 use crate::core::tools;
@@ -59,7 +60,7 @@ impl SettingsWindow {
                 let lines = [(tools::FFMPEG, &mut settings.ffmpeg), (tools::FFPROBE, &mut settings.ffprobe)];
                 for ((name, path), answer) in lines.into_iter().zip(answers.iter()) {
                     ui.label(name);
-                    let edit = ui.add_sized([FIELD_WIDTH, 20.0], egui::TextEdit::singleline(path).hint_text("From the PATH"));
+                    let edit = ui.add_sized([FIELD_WIDTH, 20.0], egui::TextEdit::singleline(path).hint_text("Next to the editor, or from the PATH"));
                     ask_again |= edit.lost_focus();
                     match answer {
                         Ok(version) => ui.colored_label(OK, version),
@@ -69,6 +70,18 @@ impl SettingsWindow {
                     ui.end_row();
                 }
             });
+
+            ui.separator();
+            ui.heading("Error reports");
+            let logs = crash::logs_folder();
+            ui.horizontal(|ui| {
+                ui.label(logs.display().to_string());
+                if ui.button("Open").clicked() {
+                    let _ = std::fs::create_dir_all(&logs);
+                    crash::show_in_folder(&logs);
+                }
+            });
+            ui.label(RichText::new("When the editor runs into an error, it writes a report here. Send it along with what you did.").weak().small());
 
             for plugin in plugins.iter().filter(|plugin| !plugin.options.is_empty()) {
                 ui.separator();

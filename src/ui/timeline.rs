@@ -322,13 +322,18 @@ fn effects_of(clip: &Clip) -> Vec<Chip> {
     let (t, plain) = (clip.transform, Transform::default());
     let chip = |text: String, section| Chip { text, section };
     let mut chips = Vec::new();
-    for Effect::Fade(fade) in &clip.effects {
-        let name = if fade.edge == Edge::In { "Fade in" } else { "Fade out" };
-        let mut text = format!("{name} {:.1} s", fade.seconds);
-        if fade.curve != Curve::Linear {
-            text += &format!(" · {}", fade.curve.name());
+    for effect in &clip.effects {
+        match effect {
+            Effect::Fade(fade) => {
+                let name = if fade.edge == Edge::In { "Fade in" } else { "Fade out" };
+                let mut text = format!("{name} {:.1} s", fade.seconds);
+                if fade.curve != Curve::Linear {
+                    text += &format!(" · {}", fade.curve.name());
+                }
+                chips.push(chip(text, Section::Effects));
+            }
+            Effect::Color(_) => chips.push(chip("Color".to_owned(), Section::Effects)),
         }
-        chips.push(chip(text, Section::Effects));
     }
     if (t.cx, t.cy, t.zoom, t.angle_deg) != (plain.cx, plain.cy, plain.zoom, plain.angle_deg) {
         let mut text = "Frame".to_owned();
@@ -687,6 +692,8 @@ impl Timeline {
         }
         if let Some((id, at)) = self.menu.filter(|(id, _)| sequence.has(*id)) {
             let mut changed = false;
+            // An effect added here is set up in the Clip tab: it is shown there.
+            let mut added = false;
             // In this egui it gives something back only as the menu closes: whether it is still
             // open is asked separately.
             response.context_menu(|ui| {
@@ -698,11 +705,21 @@ impl Timeline {
                         if present {
                             clip.remove_fade(edge);
                         } else {
-                            clip.add_fade(edge);
+                            added = clip.add_fade(edge);
                         }
                         changed = true;
                         ui.close_menu();
                     }
+                }
+                let colored = clip.color().is_some();
+                if ui.button(if colored { "Remove color" } else { "Add color" }).on_hover_text("Exposure, contrast, saturation and temperature of this clip").clicked() {
+                    if colored {
+                        clip.remove_color();
+                    } else {
+                        added = clip.add_color();
+                    }
+                    changed = true;
+                    ui.close_menu();
                 }
                 // How each fade the clip has goes.
                 for (edge, name) in [(Edge::In, "Fade in curve"), (Edge::Out, "Fade out curve")] {
@@ -726,8 +743,20 @@ impl Timeline {
                     changed = true;
                     ui.close_menu();
                 }
+                if ui.button("Duplicate").on_hover_text("A copy right after it (Ctrl+D)").clicked() {
+                    *selected = Some(sequence.duplicate(id));
+                    changed = true;
+                    ui.close_menu();
+                }
                 if ui.button("Delete").clicked() {
                     sequence.remove_clip(id);
+                    *selected = None;
+                    changed = true;
+                    ui.close_menu();
+                }
+                let ripple = ui.button("Delete and close the gap").on_hover_text("The clips after it on this track move back by its length (Shift+Delete)");
+                if ripple.clicked() {
+                    sequence.ripple_delete(id);
                     *selected = None;
                     changed = true;
                     ui.close_menu();
@@ -737,6 +766,9 @@ impl Timeline {
                 self.menu = None;
             }
             out.edit_started |= changed;
+            if added {
+                out.open = Some(Section::Effects);
+            }
         }
         // A double click on a clip folds or unfolds its row.
         if response.double_clicked() && self.tool == Tool::Select {
@@ -1871,6 +1903,8 @@ mod tests {
         assert_eq!(effects_of(&clip), [Chip { text: "Fade out 0.5 s".into(), section: Section::Effects }]);
         clip.set_fade_curve(Edge::Out, Curve::EaseInOut);
         assert_eq!(effects_of(&clip)[0].text, "Fade out 0.5 s · Ease in-out");
+        clip.add_color();
+        assert_eq!(effects_of(&clip)[1], Chip { text: "Color".into(), section: Section::Effects });
     }
 
     #[test]

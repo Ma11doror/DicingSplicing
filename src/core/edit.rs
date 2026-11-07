@@ -146,11 +146,78 @@ impl Curve {
     }
 }
 
+/// How much the colour of temperature 100 moves red up and blue down.
+const TEMPERATURE_STRENGTH: f64 = 0.15;
+
+/// A clip's colour: how bright, how contrasty, how colourful and how warm. It is worked out on red,
+/// green and blue: each is multiplied (the exposure and the temperature), spread around the middle
+/// (the contrast), and mixed with the pixel's brightness (the saturation).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Color {
+    /// In stops: +1 is twice as bright, -1 half.
+    pub exposure: f64,
+    /// -100 is flat gray, 0 leaves it, 100 is twice the contrast.
+    pub contrast: f64,
+    /// Percent: 0 is black and white, 100 leaves it, 200 is twice as colourful.
+    pub saturation: f64,
+    /// -100 is colder (bluer), 100 warmer (redder).
+    pub temperature: f64,
+}
+
+impl Default for Color {
+    fn default() -> Self {
+        Self { exposure: 0.0, contrast: 0.0, saturation: 100.0, temperature: 0.0 }
+    }
+}
+
+impl Color {
+    pub const EXPOSURE: std::ops::RangeInclusive<f64> = -2.0..=2.0;
+    pub const CONTRAST: std::ops::RangeInclusive<f64> = -100.0..=100.0;
+    pub const SATURATION: std::ops::RangeInclusive<f64> = 0.0..=200.0;
+    pub const TEMPERATURE: std::ops::RangeInclusive<f64> = -100.0..=100.0;
+
+    /// It changes nothing.
+    pub fn is_neutral(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// What red, green and blue are multiplied by before the contrast.
+    pub fn gains(&self) -> [f64; 3] {
+        let light = 2f64.powf(self.exposure);
+        let warm = self.temperature / 100.0 * TEMPERATURE_STRENGTH;
+        [light * (1.0 + warm), light, light * (1.0 - warm)]
+    }
+
+    /// How far from the middle a value goes for each step it was from it.
+    pub fn contrast_factor(&self) -> f64 {
+        1.0 + self.contrast / 100.0
+    }
+
+    pub fn saturation_factor(&self) -> f64 {
+        self.saturation / 100.0
+    }
+}
+
 /// Something done to a clip. Effects apply in the order of the clip's list.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum Effect {
     Fade(Fade),
+    Color(Color),
+}
+
+impl Effect {
+    fn as_fade(&self) -> Option<&Fade> {
+        match self {
+            Effect::Fade(fade) => Some(fade),
+            _ => None,
+        }
+    }
+
+    fn is_fade_at(&self, edge: Edge) -> bool {
+        self.as_fade().is_some_and(|fade| fade.edge == edge)
+    }
 }
 
 /// A piece of a source on a track.
@@ -248,11 +315,41 @@ impl Clip {
 
     /// The fade at `edge`, if the clip has one.
     pub fn fade(&self, edge: Edge) -> Option<&Fade> {
-        self.effects.iter().map(|Effect::Fade(fade)| fade).find(|fade| fade.edge == edge)
+        self.effects.iter().filter_map(Effect::as_fade).find(|fade| fade.edge == edge)
     }
 
     fn fade_mut(&mut self, edge: Edge) -> Option<&mut Fade> {
-        self.effects.iter_mut().map(|Effect::Fade(fade)| fade).find(|fade| fade.edge == edge)
+        self.effects.iter_mut().find_map(|effect| match effect {
+            Effect::Fade(fade) if fade.edge == edge => Some(fade),
+            _ => None,
+        })
+    }
+
+    /// The clip's colour, if it has its own.
+    pub fn color(&self) -> Option<&Color> {
+        self.effects.iter().find_map(|effect| match effect {
+            Effect::Color(color) => Some(color),
+            _ => None,
+        })
+    }
+
+    /// The colour the clip is seen in, if it is not as filmed.
+    pub fn graded(&self) -> Option<Color> {
+        self.color().copied().filter(|color| !color.is_neutral())
+    }
+
+    /// Adds a colour correction that changes nothing yet, unless there is one. Returns whether it was
+    /// added.
+    pub fn add_color(&mut self) -> bool {
+        if self.color().is_some() {
+            return false;
+        }
+        self.effects.push(Effect::Color(Color::default()));
+        true
+    }
+
+    pub fn remove_color(&mut self) {
+        self.effects.retain(|effect| !matches!(effect, Effect::Color(_)));
     }
 
     /// The lengths of the fade in and the fade out as they play: together no longer than the clip.
@@ -311,7 +408,7 @@ impl Clip {
 
     /// Takes the fade at `edge` off, if there is one.
     pub fn remove_fade(&mut self, edge: Edge) {
-        self.effects.retain(|Effect::Fade(fade)| fade.edge != edge);
+        self.effects.retain(|effect| !effect.is_fade_at(edge));
     }
 
     /// Sets the length of the fade at `edge`, as long as the clip and the other fade leave room for.
@@ -585,6 +682,47 @@ impl Sequence {
         Some(id)
     }
 
+    /// Whether `len` seconds from `start` are free on `track`.
+    fn free_on(&self, track: usize, start: f64, len: f64) -> bool {
+        let gap = self.tracks.get(track).and_then(|t| t.gap_at(start + len / 2.0));
+        gap.is_some_and(|gap| gap.start <= start + SAME_TIME && gap.end >= start + len - SAME_TIME)
+    }
+
+    /// Puts `clip` at `t` exactly: on `track` if it is free there, else on a new track right above
+    /// it, or above all the others with no track given. Returns where it went.
+    pub fn paste(&mut self, mut clip: Clip, t: f64, track: Option<usize>) -> ClipId {
+        clip.start = t;
+        let len = clip.span().len();
+        let target = match track {
+            Some(track) if self.free_on(track, t, len) => track,
+            Some(track) => self.add_track(track + 1),
+            None => self.add_track(self.tracks.len()),
+        };
+        self.place_clip(Some(target), clip).unwrap_or(ClipId { track: target, index: 0 })
+    }
+
+    /// A copy of a clip, with its effects, right after it. Returns the copy.
+    pub fn duplicate(&mut self, id: ClipId) -> ClipId {
+        let clip = self.clip(id).clone();
+        let end = clip.end();
+        self.paste(clip, end, Some(id.track))
+    }
+
+    /// Removes a clip, and moves the clips after it on its track back by its length: no gap is left
+    /// where it was. Other tracks stay as they are.
+    pub fn ripple_delete(&mut self, id: ClipId) {
+        let span = self.clip(id).span();
+        let fitted = self.export_fits();
+        let track = &mut self.tracks[id.track];
+        track.clips.remove(id.index);
+        for clip in track.clips.iter_mut().filter(|clip| clip.start >= span.end - SAME_TIME) {
+            clip.start -= span.len();
+        }
+        if fitted {
+            self.fit_export();
+        }
+    }
+
     /// Removes a clip. Its track stays, even when it is left empty.
     pub fn remove_clip(&mut self, id: ClipId) {
         let fitted = self.export_fits();
@@ -705,12 +843,13 @@ impl Sequence {
         }
         let cut = clip.source_time(t);
         // The fade in stays with the part before the cut, the fade out goes with the part after it.
+        // Both keep the colour.
         let mut after = Clip { start: t, source_in: cut, ..clip.clone() };
-        after.effects.retain(|Effect::Fade(fade)| fade.edge != Edge::In);
+        after.effects.retain(|effect| !effect.is_fade_at(Edge::In));
         after.fit_fades();
         let before = self.clip_mut(id);
         before.source_out = cut;
-        before.effects.retain(|Effect::Fade(fade)| fade.edge != Edge::Out);
+        before.effects.retain(|effect| !effect.is_fade_at(Edge::Out));
         before.fit_fades();
         self.tracks[id.track].clips.insert(id.index + 1, after);
         Some(ClipId { track: id.track, index: id.index + 1 })
@@ -1189,6 +1328,85 @@ mod tests {
     }
 
     #[test]
+    fn a_clip_has_one_colour_that_both_parts_of_a_cut_keep() {
+        let mut clip = placed_clip();
+        assert_eq!((clip.color(), clip.graded()), (None, None));
+        assert!(clip.add_color());
+        assert!(!clip.add_color(), "one colour only");
+        assert_eq!(clip.graded(), None, "a new one changes nothing");
+        clip.add_fade(Edge::In);
+        clip.add_fade(Edge::Out);
+        if let Some(Effect::Color(color)) = clip.effects.iter_mut().find(|effect| matches!(effect, Effect::Color(_))) {
+            color.exposure = 0.5;
+        }
+        assert_eq!(clip.graded().map(|color| color.exposure), Some(0.5));
+        assert!(clip.fade(Edge::In).is_some() && clip.fade(Edge::Out).is_some(), "fades are found among other effects");
+
+        let mut sequence = Sequence::new(clip);
+        let first = ClipId { track: 0, index: 0 };
+        let second = sequence.split(first, 14.0, 0.5).unwrap();
+        for id in [first, second] {
+            assert_eq!(sequence.clip(id).graded().map(|color| color.exposure), Some(0.5));
+        }
+        assert!(sequence.clip(first).fade(Edge::Out).is_none() && sequence.clip(second).fade(Edge::In).is_none());
+        sequence.clip_mut(second).remove_color();
+        assert_eq!(sequence.clip(second).color(), None);
+        assert!(sequence.clip(second).fade(Edge::Out).is_some(), "only the colour went");
+
+        // Saved and read back; a colour saved with fewer values gets the rest as they leave it.
+        let color: Color = serde_json::from_str(r#"{"exposure": 1.0}"#).unwrap();
+        assert_eq!(color, Color { exposure: 1.0, ..Color::default() });
+        let effect: Effect = serde_json::from_str(&serde_json::to_string(&Effect::Color(color)).unwrap()).unwrap();
+        assert_eq!(effect, Effect::Color(color));
+        // Warmer: more red, less blue.
+        let [r, g, b] = Color { temperature: 100.0, ..Color::default() }.gains();
+        assert!(r > 1.0 && g == 1.0 && b < 1.0);
+    }
+
+    #[test]
+    fn a_copy_goes_after_its_clip_or_onto_a_new_track_above() {
+        // Track 0: a at 0..10 and b at 10..14; track 1: c at 30..34.
+        let mut sequence = Sequence::new(Clip::new("a".into(), 10.0));
+        sequence.tracks[0].clips.push(Clip { start: 10.0, ..Clip::of(1, "b".into(), 4.0) });
+        sequence.tracks.push(track_of(vec![Clip { start: 30.0, ..Clip::of(2, "c".into(), 4.0) }]));
+        let (a, b, c) = (ClipId { track: 0, index: 0 }, ClipId { track: 0, index: 1 }, ClipId { track: 1, index: 0 });
+        sequence.clip_mut(c).add_fade(Edge::In);
+
+        // Room after c: the copy is right there, with its effects.
+        let copy = sequence.duplicate(c);
+        assert_eq!(copy, ClipId { track: 1, index: 1 });
+        assert_eq!(sequence.clip(copy).span(), span(34.0, 38.0));
+        assert!(sequence.clip(copy).fade(Edge::In).is_some());
+        // b follows a at once: a's copy goes onto a new track between tracks 0 and 1.
+        let copy = sequence.duplicate(a);
+        assert_eq!((copy, sequence.tracks.len()), (ClipId { track: 1, index: 0 }, 3));
+        assert_eq!(sequence.clip(copy).span(), span(10.0, 20.0));
+        assert_eq!(sequence.clip(ClipId { track: 2, index: 0 }).name, "c", "the track above moved up");
+
+        // Pasted at 50 s on track 0: free there. At 5 s on track 0: a is there, so above it.
+        let pasted = sequence.paste(sequence.clip(b).clone(), 50.0, Some(0));
+        assert_eq!((pasted, sequence.clip(pasted).span()), (ClipId { track: 0, index: 2 }, span(50.0, 54.0)));
+        let pasted = sequence.paste(sequence.clip(b).clone(), 5.0, Some(0));
+        assert_eq!(pasted.track, 1);
+        assert_eq!(sequence.clip(pasted).span(), span(5.0, 9.0), "exactly where it was asked to go");
+    }
+
+    #[test]
+    fn a_ripple_delete_closes_the_gap_on_its_track_only() {
+        // Track 0: a 0..10, b 10..14, c 20..24; track 1: d 12..16.
+        let mut sequence = Sequence::new(Clip::new("a".into(), 10.0));
+        sequence.tracks[0].clips.push(Clip { start: 10.0, ..Clip::of(1, "b".into(), 4.0) });
+        sequence.tracks[0].clips.push(Clip { start: 20.0, ..Clip::of(2, "c".into(), 4.0) });
+        sequence.tracks.push(track_of(vec![Clip { start: 12.0, ..Clip::of(3, "d".into(), 4.0) }]));
+        sequence.fit_export();
+        sequence.ripple_delete(ClipId { track: 0, index: 1 });
+        let starts: Vec<f64> = sequence.tracks[0].clips.iter().map(|clip| clip.start).collect();
+        assert_eq!(starts, [0.0, 16.0], "c moved back by b's 4 s");
+        assert_eq!(sequence.tracks[1].clips[0].start, 12.0);
+        assert_eq!(sequence.export, span(0.0, 20.0), "a fitted export range follows");
+    }
+
+    #[test]
     fn a_fade_saved_before_curves_is_linear() {
         let fade: Fade = serde_json::from_str(r#"{"edge": "Out", "seconds": 2.0, "picture": true, "sound": false}"#).unwrap();
         assert_eq!(fade.curve, Curve::Linear);
@@ -1205,7 +1423,7 @@ mod tests {
         let mut sequence = Sequence::new(clip);
         let first = ClipId { track: 0, index: 0 };
         let second = sequence.split(first, 14.0, 0.5).unwrap();
-        let edges = |id| sequence.clip(id).effects.iter().map(|Effect::Fade(fade)| fade.edge).collect::<Vec<_>>();
+        let edges = |id| sequence.clip(id).effects.iter().filter_map(Effect::as_fade).map(|fade| fade.edge).collect::<Vec<_>>();
         assert_eq!((edges(first), edges(second)), (vec![Edge::In], vec![Edge::Out]));
         assert_eq!(sequence.clip(second).opacity(20.0), 0.0);
         assert_eq!(sequence.clip(first).opacity(14.0 - 1e-9), 1.0);

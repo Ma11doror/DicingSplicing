@@ -1,6 +1,7 @@
 pub mod editor;
 pub mod export;
 pub mod flash;
+pub mod keys;
 pub mod framing;
 pub mod picture;
 pub mod plugins;

@@ -2,11 +2,12 @@
 //! prepared for the editor. Each source gets a decoder of its own when it is first needed, so that
 //! going back and forth between clips of two sources does not start anything anew.
 
-use crate::core::edit::SourceId;
+use crate::core::edit::{Color, SourceId};
 use crate::media::cache::MediaCache;
+use crate::media::color::Grade;
 use crate::media::frames::FrameDecoder;
 use crate::media::{timecode, Notify};
-use egui::{TextureHandle, TextureOptions};
+use egui::{ColorImage, TextureHandle, TextureOptions};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -20,11 +21,21 @@ pub struct Picture {
     shown: Option<SourceId>,
     /// The frame asked for last.
     wanted: Option<(SourceId, usize)>,
+    /// The last frame as it was decoded, for its colour to change without decoding it again.
+    raw: Option<ColorImage>,
+    /// The colour frames are shown in, and the one the texture has.
+    color: Option<Color>,
+    shown_color: Option<Color>,
 }
 
 impl Picture {
     pub fn new(name: &'static str, notify: Notify) -> Self {
-        Self { name, notify, decoders: BTreeMap::new(), texture: None, shown: None, wanted: None }
+        Self { name, notify, decoders: BTreeMap::new(), texture: None, shown: None, wanted: None, raw: None, color: None, shown_color: None }
+    }
+
+    /// The colour of the clip the frames are of; None shows them as they are.
+    pub fn set_color(&mut self, color: Option<Color>) {
+        self.color = color;
     }
 
     /// Asks for the frame of `source` at source time `t`. Returns the frame's number.
@@ -45,20 +56,33 @@ impl Picture {
         frame
     }
 
-    /// Takes in what the decoders have decoded. Frames of a source no longer wanted are dropped.
+    /// Takes in what the decoders have decoded, in the colour asked for. Frames of a source no longer
+    /// wanted are dropped. A new colour redraws the frame there is.
     pub fn poll(&mut self, ctx: &egui::Context) {
         let wanted = self.wanted.map(|(source, _)| source);
+        let mut fresh = false;
         for (&source, (_, decoder)) in &self.decoders {
             let Some(image) = decoder.poll() else { continue };
             if wanted != Some(source) {
                 continue;
             }
-            match &mut self.texture {
-                Some(texture) => texture.set(image, TextureOptions::LINEAR),
-                None => self.texture = Some(ctx.load_texture(self.name, image, TextureOptions::LINEAR)),
-            }
+            self.raw = Some(image);
             self.shown = Some(source);
+            fresh = true;
         }
+        if !fresh && self.color == self.shown_color {
+            return;
+        }
+        let Some(raw) = &self.raw else { return };
+        let mut image = raw.clone();
+        if let Some(color) = &self.color {
+            Grade::new(color).apply(&mut image.pixels);
+        }
+        match &mut self.texture {
+            Some(texture) => texture.set(image, TextureOptions::LINEAR),
+            None => self.texture = Some(ctx.load_texture(self.name, image, TextureOptions::LINEAR)),
+        }
+        self.shown_color = self.color;
     }
 
     /// The texture, if it holds a frame of `source`.
@@ -71,6 +95,7 @@ impl Picture {
         self.decoders.remove(&source);
         if self.shown == Some(source) {
             self.shown = None;
+            self.raw = None;
         }
         if self.wanted.is_some_and(|(wanted, _)| wanted == source) {
             self.wanted = None;

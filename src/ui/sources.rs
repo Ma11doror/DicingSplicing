@@ -7,11 +7,14 @@ use crate::core::project::Source;
 use crate::media::library::SourceState;
 use crate::media::probe::MediaInfo;
 use crate::media::timecode;
+use crate::ui::grip_dots;
 use egui::{Color32, RichText};
 
 const LIST_WIDTH: f32 = 460.0;
 const LIST_HEIGHT: f32 = 380.0;
 const ERROR: Color32 = Color32::from_rgb(230, 80, 70);
+/// The six dots in front of a source that can be dragged onto the timeline, as on the rows.
+const GRIP_SIZE: [f32; 2] = [14.0, 16.0];
 
 /// What the user asked for in the list.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -75,15 +78,43 @@ fn source_row(ui: &mut egui::Ui, row: &SourceRow) -> Option<SourceAction> {
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
             ui.set_max_width(LIST_WIDTH - 150.0);
-            // A source that has been read can be dragged onto the timeline by its name.
-            let name = RichText::new(row.source.label()).strong();
             let path = row.source.path.display().to_string();
+            // A source that has been read is dragged onto the timeline by any part of it: the dots,
+            // its name, the lines under it.
             if row.info.is_some() {
-                let dragged = ui.dnd_drag_source(egui::Id::new(("source", id)), id, |ui| ui.label(name)).response;
-                dragged.on_hover_text(format!("{path}\nDrag it onto the timeline"));
+                let dragged = ui.dnd_drag_source(egui::Id::new(("source", id)), id, |ui| source_text(ui, row, true)).response;
+                dragged.on_hover_cursor(egui::CursorIcon::Grab).on_hover_text(format!("{path}\nDrag it onto the timeline"));
             } else {
-                ui.label(name).on_hover_text(path);
+                ui.scope(|ui| source_text(ui, row, false)).response.on_hover_text(path);
             }
+        });
+        ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
+            let add = ui.add_enabled(row.info.is_some(), egui::Button::new("Add to timeline"));
+            let add = add.on_hover_text("On a new track under the others, right after the last clip").on_disabled_hover_text("Its file has to be read first");
+            if add.clicked() {
+                action = Some(SourceAction::AddToTimeline(id));
+            }
+            if matches!(row.state, SourceState::Missing | SourceState::Failed(_)) && ui.button("Locate file…").clicked() {
+                action = Some(SourceAction::Locate(id));
+            }
+            let remove = ui.add_enabled(row.uses == 0, egui::Button::new("Remove"));
+            if remove.on_hover_text("From the project. The file stays where it is").on_disabled_hover_text("It is on the timeline").clicked() {
+                action = Some(SourceAction::Remove(id));
+            }
+        });
+    });
+    action
+}
+
+/// A source's name and what is known about it; with `draggable`, the dots it is dragged by in front.
+fn source_text(ui: &mut egui::Ui, row: &SourceRow, draggable: bool) {
+    ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+        if draggable {
+            let (grip, _) = ui.allocate_exact_size(egui::vec2(GRIP_SIZE[0], GRIP_SIZE[1]), egui::Sense::hover());
+            grip_dots(ui.painter(), grip.center(), 3, 2, ui.visuals().weak_text_color());
+        }
+        ui.vertical(|ui| {
+            ui.label(RichText::new(row.source.label()).strong());
             if let Some(info) = row.info {
                 let sound = if info.has_audio { "sound" } else { "no sound" };
                 let placed = match row.uses {
@@ -103,7 +134,7 @@ fn source_row(ui: &mut egui::Ui, row: &SourceRow) -> Option<SourceAction> {
                 }
                 SourceState::Preparing(progress) => {
                     let text = format!("Preparing frames {:.0}%", progress * 100.0);
-                    ui.add(egui::ProgressBar::new(*progress).desired_width(LIST_WIDTH - 170.0).text(text));
+                    ui.add(egui::ProgressBar::new(*progress).desired_width(LIST_WIDTH - 190.0).text(text));
                 }
                 SourceState::Ready => {}
                 SourceState::Missing => {
@@ -114,20 +145,5 @@ fn source_row(ui: &mut egui::Ui, row: &SourceRow) -> Option<SourceAction> {
                 }
             }
         });
-        ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
-            let add = ui.add_enabled(row.info.is_some(), egui::Button::new("Add to timeline"));
-            let add = add.on_hover_text("On a new track under the others, right after the last clip").on_disabled_hover_text("Its file has to be read first");
-            if add.clicked() {
-                action = Some(SourceAction::AddToTimeline(id));
-            }
-            if matches!(row.state, SourceState::Missing | SourceState::Failed(_)) && ui.button("Locate file…").clicked() {
-                action = Some(SourceAction::Locate(id));
-            }
-            let remove = ui.add_enabled(row.uses == 0, egui::Button::new("Remove"));
-            if remove.on_hover_text("From the project. The file stays where it is").on_disabled_hover_text("It is on the timeline").clicked() {
-                action = Some(SourceAction::Remove(id));
-            }
-        });
     });
-    action
 }

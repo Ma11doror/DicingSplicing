@@ -222,7 +222,14 @@ pub struct ExportSettings {
     pub audio_kbps: u32,
     /// Fade-in and fade-out of the sound at the edges of the export range, in seconds.
     pub fades: (f64, f64),
+    /// The sound is brought to one loudness, as the sites that play videos do: quiet sources and
+    /// loud ones come out alike.
+    #[serde(default)]
+    pub even_loudness: bool,
 }
+
+/// The loudness of `ExportSettings::even_loudness`: what YouTube and most sites play at, in LUFS.
+pub const EVEN_LOUDNESS: f64 = -14.0;
 
 /// The starting point is the format the editor was made for: the settings of tgCircleGen.
 impl Default for ExportSettings {
@@ -238,6 +245,7 @@ impl Default for ExportSettings {
             audio_codec: AudioCodec::Aac,
             audio_kbps: 128,
             fades: (1.0, 1.0),
+            even_loudness: false,
         }
     }
 }
@@ -275,6 +283,7 @@ impl ExportSettings {
             (Setting::AudioCodec, self.audio_codec != other.audio_codec),
             (Setting::AudioBitrate, self.audio_kbps != other.audio_kbps),
             (Setting::Fades, self.fades != other.fades),
+            (Setting::Loudness, self.even_loudness != other.even_loudness),
         ];
         checks.into_iter().filter(|(_, differs)| *differs).map(|(setting, _)| setting).collect()
     }
@@ -294,6 +303,7 @@ pub enum Setting {
     AudioCodec,
     AudioBitrate,
     Fades,
+    Loudness,
 }
 
 impl Setting {
@@ -310,6 +320,7 @@ impl Setting {
             Self::AudioCodec => "Audio codec",
             Self::AudioBitrate => "Audio bitrate",
             Self::Fades => "Sound fades",
+            Self::Loudness => "Loudness",
         }
     }
 }
@@ -448,6 +459,8 @@ impl ExportPreset {
             audio_codec: self.audio_codec.unwrap_or(settings.audio_codec),
             audio_kbps: self.audio_kbps.unwrap_or(settings.audio_kbps),
             fades: self.fades.unwrap_or(settings.fades),
+            // Presets don't say: it is the user's own choice.
+            even_loudness: settings.even_loudness,
         };
         *settings = raw.normalized();
         let mut lines = self.settings();

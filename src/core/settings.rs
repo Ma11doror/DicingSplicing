@@ -22,6 +22,8 @@ pub struct Settings {
     pub ffprobe: String,
     /// The options of each plugin, by its id. The editor keeps them and doesn't look into them.
     pub plugin_options: BTreeMap<String, BTreeMap<String, String>>,
+    /// The name of the newest error report the user has been told about.
+    pub crash_seen: Option<String>,
 }
 
 /// `%APPDATA%\simple_editor\settings.json`.

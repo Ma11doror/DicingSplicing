@@ -32,19 +32,22 @@ pub struct YtDlp {
 
 /// The program to run when the settings don't say which.
 pub fn find_program() -> PathBuf {
-    locate(&|name| std::env::var_os(name))
+    let own_folder = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_owned));
+    locate(&|name| std::env::var_os(name), own_folder.as_deref())
 }
 
 /// On the PATH it goes by its name, as that is the user's own choice. Otherwise it is looked for
 /// where it usually gets installed: the editor may have been started before the install changed
-/// the PATH, or from somewhere that never saw it. Found nowhere, the name stays, and running it
-/// says that it is missing.
-fn locate(env: &dyn Fn(&str) -> Option<OsString>) -> PathBuf {
+/// the PATH, or from somewhere that never saw it. Then in `own_folder`, where a packaged editor
+/// brings one: last, as an installed one is easier to keep up to date, and sites change often.
+/// Found nowhere, the name stays, and running it says that it is missing.
+fn locate(env: &dyn Fn(&str) -> Option<OsString>, own_folder: Option<&Path>) -> PathBuf {
     let on_path = env("PATH").is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(PROGRAM_FILE).is_file()));
     if on_path {
         return PathBuf::from(PROGRAM_NAME);
     }
-    usual_places(env).into_iter().find(|place| place.is_file()).unwrap_or_else(|| PathBuf::from(PROGRAM_NAME))
+    let brought = own_folder.map(|folder| folder.join(PROGRAM_FILE));
+    usual_places(env).into_iter().chain(brought).find(|place| place.is_file()).unwrap_or_else(|| PathBuf::from(PROGRAM_NAME))
 }
 
 /// Where the ways of installing it leave the program.
@@ -331,7 +334,21 @@ mod tests {
 
     /// `locate` in a world that has only these variables.
     fn locate_with(vars: &[(&str, &Path)]) -> PathBuf {
-        locate(&|name| vars.iter().find(|(var, _)| *var == name).map(|(_, value)| value.as_os_str().to_owned()))
+        locate(&|name| vars.iter().find(|(var, _)| *var == name).map(|(_, value)| value.as_os_str().to_owned()), None)
+    }
+
+    #[test]
+    fn the_one_brought_along_is_the_last_resort() {
+        let root = temp_root("brought");
+        let own = root.join("editor");
+        let brought = install(&own, PROGRAM_FILE);
+        assert_eq!(locate(&|_| None, Some(&own)), brought);
+        // Installed, that one comes first.
+        let installed = install(&root, &format!(".local/bin/{PROGRAM_FILE}"));
+        let home = root.as_os_str().to_owned();
+        let found = locate(&|name| matches!(name, "USERPROFILE" | "HOME").then(|| home.clone()), Some(&own));
+        assert_eq!(found, installed);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[cfg(windows)]

@@ -1,9 +1,9 @@
 //! Running external tools (ffmpeg, ffprobe).
 
 use anyhow::{bail, Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::RwLock;
+use std::sync::{OnceLock, RwLock};
 
 pub const FFMPEG: &str = "ffmpeg";
 pub const FFPROBE: &str = "ffprobe";
@@ -21,10 +21,24 @@ pub fn set_program(name: &str, path: &str) {
     }
 }
 
+/// Where a program is: as the settings say; else the one in the editor's own folder, which is where
+/// a packaged editor brings its ffmpeg; else its name, for the PATH.
 pub fn program_path(name: &str) -> String {
     let programs = PROGRAMS.read();
     let known = programs.as_ref().ok().and_then(|programs| programs.iter().find(|(known, _)| known == name).map(|(_, path)| path.clone()));
-    known.unwrap_or_else(|| name.to_owned())
+    known.or_else(|| editor_folder().and_then(|folder| beside(folder, name))).unwrap_or_else(|| name.to_owned())
+}
+
+/// The folder the editor runs from.
+fn editor_folder() -> Option<&'static Path> {
+    static FOLDER: OnceLock<Option<PathBuf>> = OnceLock::new();
+    FOLDER.get_or_init(|| std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_owned))).as_deref()
+}
+
+/// The program `name` in `folder`, if it is there.
+fn beside(folder: &Path, name: &str) -> Option<String> {
+    let file = folder.join(if cfg!(windows) { format!("{name}.exe") } else { name.to_owned() });
+    file.is_file().then(|| file.to_string_lossy().into_owned())
 }
 
 /// A command for an external tool. On Windows it never opens a console window,
@@ -131,6 +145,17 @@ mod tests {
         assert_eq!(program_path("some_tool"), "C:/bin/some_tool.exe");
         set_program("some_tool", "");
         assert_eq!(program_path("some_tool"), "some_tool");
+    }
+
+    #[test]
+    fn a_program_in_the_folder_is_found_by_its_file() {
+        let folder = std::env::temp_dir().join(format!("simple_editor_tools_{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        assert_eq!(beside(&folder, "some_tool"), None);
+        let file = folder.join(if cfg!(windows) { "some_tool.exe" } else { "some_tool" });
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(beside(&folder, "some_tool"), Some(file.to_string_lossy().into_owned()));
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[cfg(windows)]

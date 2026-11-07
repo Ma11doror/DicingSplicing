@@ -4,7 +4,7 @@
 //! selected at a time: the middle shows its source with its frame, the side panel its transform and
 //! sound. The output preview shows what goes into the file: the clip seen at the playhead.
 
-use crate::core::edit::{Clip, ClipId, Curve, Edge, Effect, Sequence, SourceId, Span};
+use crate::core::edit::{Clip, ClipId, Color, Curve, Edge, Effect, Sequence, SourceId, Span};
 use crate::core::history::History;
 use crate::core::plugins::Plugin;
 use crate::core::project::{self, Project, Source, ViewState, RENDERS_FOLDER};
@@ -127,6 +127,9 @@ pub struct Editor {
     flash: Option<(Section, f64)>,
     /// That part is still to be scrolled into sight.
     scroll_to: Option<Section>,
+    /// The clip Ctrl+C copied, and what it put into the system's clipboard to say so: Ctrl+V pastes
+    /// the clip only while that text is still there.
+    clipboard: Option<(Clip, String)>,
 }
 
 impl Editor {
@@ -181,6 +184,7 @@ impl Editor {
             show_sources: false,
             flash: None,
             scroll_to: None,
+            clipboard: None,
         }
     }
 
@@ -316,12 +320,16 @@ impl Editor {
         }
         self.output_shares_center = false;
         if let Some((clip, cache)) = self.under_at(t).and_then(|id| Some((self.sequence.clip(id), self.library.cache(self.sequence.clip(id).source)?))) {
+            self.under.set_color(clip.graded());
             self.under.want(clip.source, clip.source_time(t), cache);
         }
         if let Some(clip) = self.sequence.shown_at(t).map(|id| self.sequence.clip(id)) {
+            let graded = clip.graded();
+            self.output.set_color(graded);
             if let Some(cache) = self.library.cache(clip.source) {
                 let time = clip.source_time(t);
-                self.output_shares_center = center_frame == Some((clip.source, frame_at(cache, time)));
+                // In its own colour it is a picture of its own: the middle shows the source as it is.
+                self.output_shares_center = graded.is_none() && center_frame == Some((clip.source, frame_at(cache, time)));
                 if !self.output_shares_center {
                     self.output.want(clip.source, time, cache);
                 }
@@ -484,6 +492,40 @@ impl Editor {
             self.pause();
             self.sequence.remove_clip(id);
         }
+    }
+
+    /// Deletes the selected clip and closes the gap it leaves on its track.
+    fn ripple_delete_selected(&mut self) {
+        if let Some(id) = self.selected.take() {
+            self.pause();
+            self.sequence.ripple_delete(id);
+        }
+    }
+
+    fn duplicate_selected(&mut self) {
+        if let Some(id) = self.selected {
+            self.pause();
+            self.selected = Some(self.sequence.duplicate(id));
+        }
+    }
+
+    /// Keeps the selected clip for pasting, and says so in the system's clipboard.
+    fn copy_selected(&mut self, ctx: &egui::Context) {
+        if let Some(id) = self.selected {
+            let clip = self.sequence.clip(id).clone();
+            let note = format!("Simple Editor clip: {} ({})", clip.name, timecode::format(clip.span().len()));
+            ctx.copy_text(note.clone());
+            self.clipboard = Some((clip, note));
+        }
+    }
+
+    /// Pastes the copied clip at the playhead, if the clipboard still has what copying put there.
+    fn paste(&mut self, text: &str) {
+        let Some((clip, _)) = self.clipboard.as_ref().filter(|(_, note)| note == text) else { return };
+        let (clip, at) = (clip.clone(), self.frame_start(self.position));
+        self.pause();
+        let track = self.selected.map(|id| id.track);
+        self.selected = Some(self.sequence.paste(clip, at, track));
     }
 
     fn undo(&mut self) {
@@ -660,8 +702,24 @@ impl Editor {
         if pressed(none, Key::End) {
             self.seek(self.content().end);
         }
-        if pressed(none, Key::Delete) || pressed(none, Key::Backspace) {
+        // With Shift first: without it, Delete would take Shift+Delete too.
+        if pressed(shift, Key::Delete) {
+            self.ripple_delete_selected();
+        } else if pressed(none, Key::Delete) || pressed(none, Key::Backspace) {
             self.delete_selected();
+        }
+        if pressed(Modifiers::COMMAND, Key::D) {
+            self.duplicate_selected();
+        }
+        // Copying and pasting come as events of their own, not as keys; pasting only when the
+        // system's clipboard has text.
+        let copied = ctx.input(|i| i.events.iter().any(|event| matches!(event, egui::Event::Copy)));
+        let pasted = ctx.input(|i| i.events.iter().find_map(|event| if let egui::Event::Paste(text) = event { Some(text.clone()) } else { None }));
+        if copied {
+            self.copy_selected(ctx);
+        }
+        if let Some(text) = pasted {
+            self.paste(&text);
         }
         if pressed(Modifiers::COMMAND, Key::B) {
             self.split_at_playhead();
@@ -1204,6 +1262,33 @@ fn effects_editor(ui: &mut egui::Ui, clip: &mut Clip) {
                     .response
                     .on_hover_text("How it goes: an ease in starts slowly, an ease out ends slowly");
                 }
+                Effect::Color(color) => {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Color").strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Remove").clicked() {
+                                remove = Some(i);
+                            }
+                            if ui.add_enabled(!color.is_neutral(), egui::Button::new("Reset").small()).clicked() {
+                                *color = Color::default();
+                            }
+                        });
+                    });
+                    egui::Grid::new(("color", i)).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                        ui.label("Exposure").on_hover_text("In stops: +1 is twice as bright");
+                        ui.add(egui::Slider::new(&mut color.exposure, Color::EXPOSURE).step_by(0.05).fixed_decimals(2).suffix(" EV"));
+                        ui.end_row();
+                        ui.label("Contrast");
+                        ui.add(egui::Slider::new(&mut color.contrast, Color::CONTRAST).step_by(1.0).fixed_decimals(0));
+                        ui.end_row();
+                        ui.label("Saturation").on_hover_text("0 % is black and white");
+                        ui.add(egui::Slider::new(&mut color.saturation, Color::SATURATION).step_by(1.0).fixed_decimals(0).suffix(" %"));
+                        ui.end_row();
+                        ui.label("Temperature").on_hover_text("Colder, bluer to the left; warmer, redder to the right");
+                        ui.add(egui::Slider::new(&mut color.temperature, Color::TEMPERATURE).step_by(1.0).fixed_decimals(0));
+                        ui.end_row();
+                    });
+                }
             }
         });
     }
@@ -1221,6 +1306,11 @@ fn effects_editor(ui: &mut egui::Ui, clip: &mut Clip) {
                 clip.add_fade(edge);
                 ui.close_menu();
             }
+        }
+        let add = ui.add_enabled(clip.color().is_none(), egui::Button::new("Color"));
+        if add.on_disabled_hover_text("The clip has one").clicked() {
+            clip.add_color();
+            ui.close_menu();
         }
     });
 }
