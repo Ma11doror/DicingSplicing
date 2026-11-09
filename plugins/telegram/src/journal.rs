@@ -98,7 +98,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("simple_editor_telegram_journal_{}_{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dicing_splicing_telegram_journal_{}_{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
     }

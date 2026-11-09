@@ -1,10 +1,10 @@
-//! A plugin for Simple Editor: downloads the video behind a link. song.link links are first resolved
+//! A plugin for DicingSplicing: downloads the video behind a link. song.link links are first resolved
 //! to a video, anything else goes straight to yt-dlp.
 //!
 //! It is a program on its own and knows nothing of the editor except the plugin protocol, described
 //! in the editor's `src/core/plugins.rs`. To try it by hand:
 //!
-//!     simple_editor-link fetch --input <link> --out <folder> [--option key=value]...
+//!     dicing_splicing-link fetch --input <link> --out <folder> [--option key=value]...
 //!
 //! It answers with one JSON object per line. Closing its standard input cancels the download.
 
@@ -139,7 +139,7 @@ fn fetch(args: &FetchArgs, cancel: &Cancel) -> Result<Marker> {
         program: option("yt_dlp").map_or_else(ytdlp::find_program, PathBuf::from),
         cookies: option("cookies").map(PathBuf::from),
         max_height,
-        ffmpeg: std::env::var("SIMPLE_EDITOR_FFMPEG").ok().filter(|path| !path.is_empty() && path != "ffmpeg"),
+        ffmpeg: std::env::var("DICING_SPLICING_FFMPEG").ok().filter(|path| !path.is_empty() && path != "ffmpeg"),
     };
 
     let song = if songlink::is_song_link(link) {
@@ -218,8 +218,8 @@ fn main() -> ExitCode {
             }
         }
         _ => {
-            eprintln!("Usage: simple_editor-link --describe");
-            eprintln!("       simple_editor-link fetch --input <link> --out <folder> [--option key=value]...");
+            eprintln!("Usage: dicing_splicing-link --describe");
+            eprintln!("       dicing_splicing-link fetch --input <link> --out <folder> [--option key=value]...");
             ExitCode::from(2)
         }
     }
@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn a_download_counts_only_when_its_marker_and_file_are_there() {
-        let dir = std::env::temp_dir().join(format!("simple_editor_link_marker_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dicing_splicing_link_marker_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let file = dir.join("video.mp4");

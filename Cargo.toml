@@ -1,8 +1,8 @@
 [package]
-name = "simple_editor"
+name = "dicing_splicing"
 version = "0.1.0"
 edition = "2021"
-default-run = "simple_editor"
+default-run = "dicing_splicing"
 
 [dependencies]
 eframe = "0.29.1"

@@ -167,7 +167,7 @@ mod tests {
     use crate::media::geometry::Transform;
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("simple_editor_project_{}_{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dicing_splicing_project_{}_{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir

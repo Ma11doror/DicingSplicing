@@ -872,6 +872,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
+name = "dicing_splicing"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cpal",
+ "eframe",
+ "egui",
+ "image",
+ "rfd",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "dicing_splicing-link"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "regex",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
+name = "dicing_splicing-telegram"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3016,41 +3051,6 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
-
-[[package]]
-name = "simple_editor"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cpal",
- "eframe",
- "egui",
- "image",
- "rfd",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "simple_editor-link"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "regex",
- "serde",
- "serde_json",
- "ureq",
-]
-
-[[package]]
-name = "simple_editor-telegram"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "ureq",
-]
 
 [[package]]
 name = "slab"

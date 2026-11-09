@@ -9,7 +9,7 @@ use serde::Deserialize;
 use std::time::Duration;
 
 const OEMBED_URL: &str = "https://song.link/oembed";
-const USER_AGENT: &str = concat!("simple_editor-link/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str = concat!("dicing_splicing-link/", env!("CARGO_PKG_VERSION"));
 const TIMEOUT: Duration = Duration::from_secs(20);
 const HOSTS: [&str; 7] = ["song.link", "album.link", "artist.link", "playlist.link", "pods.link", "odesli.co", "mylink.page"];
 

@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn a_program_in_the_folder_is_found_by_its_file() {
-        let folder = std::env::temp_dir().join(format!("simple_editor_tools_{}", std::process::id()));
+        let folder = std::env::temp_dir().join(format!("dicing_splicing_tools_{}", std::process::id()));
         std::fs::create_dir_all(&folder).unwrap();
         assert_eq!(beside(&folder, "some_tool"), None);
         let file = folder.join(if cfg!(windows) { "some_tool.exe" } else { "some_tool" });

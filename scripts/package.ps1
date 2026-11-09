@@ -1,11 +1,11 @@
 <#
-Builds Simple Editor for Windows and gathers everything it needs to run into one folder: the
+Builds DicingSplicing for Windows and gathers everything it needs to run into one folder: the
 editor, its plugins, ffmpeg and ffprobe, and yt-dlp for the link plugin. Then zips the folder.
 
     scripts\package.cmd
     powershell -ExecutionPolicy Bypass -File scripts\package.ps1 [-FFmpegDir <folder>] [-YtDlp <file>] [-NoZip]
 
-The result is dist\SimpleEditor-<version>\ and dist\SimpleEditor-<version>.zip. Unpacked anywhere,
+The result is dist\DicingSplicing-<version>\ and dist\DicingSplicing-<version>.zip. Unpacked anywhere,
 the folder runs as it is: nothing has to be installed. The Telegram plugin's credentials.json is
 never copied: it holds a bot's token, and each user brings their own.
 #>
@@ -92,7 +92,7 @@ function Find-YtDlp {
 }
 
 $version = (Select-String -LiteralPath (Join-Path $root "Cargo.toml") -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-$name = "SimpleEditor-$version"
+$name = "DicingSplicing-$version"
 $dist = Join-Path $root "dist"
 $out = Join-Path $dist $name
 
@@ -122,11 +122,11 @@ if (Test-Path -LiteralPath $out) {
     Remove-Item -LiteralPath $out -Recurse -Force
 }
 New-Item -ItemType Directory -Path $out | Out-Null
-foreach ($program in "simple_editor.exe", "simple_editor-link.exe", "simple_editor-telegram.exe") {
+foreach ($program in "dicing_splicing.exe", "dicing_splicing-link.exe", "dicing_splicing-telegram.exe") {
     Copy-Item -LiteralPath (Join-Path $bin $program) -Destination $out
 }
 # Names and lines for the editor's error reports.
-$symbols = Join-Path $bin "simple_editor.pdb"
+$symbols = Join-Path $bin "dicing_splicing.pdb"
 if (Test-Path -LiteralPath $symbols) {
     Copy-Item -LiteralPath $symbols -Destination $out
 }
@@ -155,7 +155,7 @@ if ($secrets.Count -gt 0) {
 
 # Each program starts: the plugins say what they are, ffmpeg says its version.
 Say "Checking"
-foreach ($plugin in "simple_editor-link.exe", "simple_editor-telegram.exe") {
+foreach ($plugin in "dicing_splicing-link.exe", "dicing_splicing-telegram.exe") {
     $description = & (Join-Path $out $plugin) --describe | Out-String
     if ($LASTEXITCODE -ne 0 -or -not ($description | ConvertFrom-Json).protocol) {
         throw "$plugin does not describe itself"

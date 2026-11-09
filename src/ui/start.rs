@@ -56,7 +56,7 @@ pub fn start_screen(
 ) -> Option<StartAction> {
     let mut action = None;
     column(ctx, |ui| {
-        ui.label(RichText::new("Simple Editor").size(26.0).strong());
+        ui.label(RichText::new("DicingSplicing").size(26.0).strong());
         ui.add_space(16.0);
         let Some(workspace) = workspace else {
             ui.label("Choose a folder for your projects. They are kept there, together with the prepared frames of their videos.");

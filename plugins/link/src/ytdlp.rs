@@ -318,7 +318,7 @@ mod tests {
 
     /// An empty folder of its own for one test.
     fn temp_root(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("simple_editor_link_find_{}_{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dicing_splicing_link_find_{}_{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -478,7 +478,7 @@ mod tests {
 
     #[test]
     fn the_second_try_uses_the_cookies_if_they_exist() {
-        let dir = std::env::temp_dir().join(format!("simple_editor_link_cookies_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dicing_splicing_link_cookies_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let cookies = dir.join("cookies.txt");
         fs::write(&cookies, "x").unwrap();
@@ -553,7 +553,7 @@ mod tests {
 
     #[test]
     fn only_the_finished_video_counts() {
-        let dir = std::env::temp_dir().join(format!("simple_editor_link_files_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dicing_splicing_link_files_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         for piece in ["video.f137.mp4", "video.f137.mp4.part", "video.f140.m4a", "video.temp", "info.json"] {

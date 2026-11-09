@@ -27,7 +27,7 @@ const WARNING: Color32 = Color32::from_rgb(230, 170, 60);
 
 /// The window's title: the editor and its version, which feedback should mention.
 pub fn title() -> String {
-    format!("Simple Editor {}", crash::VERSION)
+    format!("DicingSplicing {}", crash::VERSION)
 }
 
 /// A new project, made in the background: its video has to be read first.
@@ -87,6 +87,7 @@ pub struct EditorApp {
 
 impl EditorApp {
     pub fn new(cc: &eframe::CreationContext) -> Self {
+        settings::carry_over_old_settings();
         let settings_path = settings::default_path();
         let (settings, problem) = Settings::load(&settings_path);
         settings.apply_programs();
@@ -140,7 +141,7 @@ impl EditorApp {
             name != app.settings.crash_seen
         });
         app.refresh_recent();
-        // `simple_editor <video>`: also what "Open with" and dropping a file on the exe do.
+        // `dicing_splicing <video>`: also what "Open with" and dropping a file on the exe do.
         if let Some(path) = std::env::args_os().nth(1) {
             app.open_path(PathBuf::from(path), &cc.egui_ctx);
         }

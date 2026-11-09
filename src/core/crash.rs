@@ -10,9 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const PREFIX: &str = "crash-";
 
-/// `%APPDATA%\simple_editor\logs`.
+/// `%APPDATA%\DicingSplicing\logs`.
 pub fn logs_folder() -> PathBuf {
-    std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("simple_editor").join("logs")
+    crate::core::settings::app_folder().join("logs")
 }
 
 /// From now on a panic in any thread also writes a report into `folder`, and then goes on as before.
@@ -40,7 +40,7 @@ fn now() -> u64 {
 /// The text of a report.
 fn report(message: &str, place: &str, thread: &str, stack: &str, at: u64) -> String {
     format!(
-        "Simple Editor {VERSION} on {} ({})\nWhen: {} UTC\nThread: {thread}\nWhat: {message}\nWhere: {place}\n\nStack:\n{stack}\n",
+        "DicingSplicing {VERSION} on {} ({})\nWhen: {} UTC\nThread: {thread}\nWhat: {message}\nWhere: {place}\n\nStack:\n{stack}\n",
         std::env::consts::OS,
         std::env::consts::ARCH,
         utc(at),
@@ -111,7 +111,7 @@ mod tests {
 
     #[test]
     fn a_report_says_what_where_and_which_version_and_the_newest_is_found() {
-        let folder = std::env::temp_dir().join(format!("simple_editor_crash_{}", std::process::id()));
+        let folder = std::env::temp_dir().join(format!("dicing_splicing_crash_{}", std::process::id()));
         let _ = fs::remove_dir_all(&folder);
         assert_eq!(newest_report(&folder), None);
         let text = report("index out of bounds", "src/ui/timeline.rs:10", "main", "0: main", 0);

@@ -1,11 +1,11 @@
-//! A plugin for Simple Editor: sends a finished video to a Telegram channel, as a circle.
+//! A plugin for DicingSplicing: sends a finished video to a Telegram channel, as a circle.
 //!
 //! It is a program on its own and knows nothing of the editor except the plugin protocol, described
 //! in the editor's `src/core/plugins.rs`. The editor knows nothing of the bot, the token or the
 //! channels: those are in `credentials.json`, which only this program reads. To try it by hand:
 //!
-//!     simple_editor-telegram prepare --file <video> --data <folder> [--name <project>] [--meta key=value]...
-//!     simple_editor-telegram send --file <video> --data <folder> --field channel=test [--field text=...] [--field link=...]
+//!     dicing_splicing-telegram prepare --file <video> --data <folder> [--name <project>] [--meta key=value]...
+//!     dicing_splicing-telegram send --file <video> --data <folder> --field channel=test [--field text=...] [--field link=...]
 //!
 //! It answers with one JSON object per line. Closing its standard input cancels the sending.
 
@@ -140,7 +140,7 @@ impl Args {
 }
 
 fn ffprobe() -> String {
-    std::env::var("SIMPLE_EDITOR_FFPROBE").ok().filter(|path| !path.is_empty()).unwrap_or_else(|| "ffprobe".to_owned())
+    std::env::var("DICING_SPLICING_FFPROBE").ok().filter(|path| !path.is_empty()).unwrap_or_else(|| "ffprobe".to_owned())
 }
 
 fn channel_field(credentials: &Credentials, journal: &Journal, key: Option<&str>, now: u64) -> Field {
@@ -314,9 +314,9 @@ fn main() -> ExitCode {
             run_send(parsed, &cancel)
         }),
         _ => {
-            eprintln!("Usage: simple_editor-telegram --describe");
-            eprintln!("       simple_editor-telegram prepare --file <video> --data <folder> [--name <project>] [--meta key=value]... [--option key=value]...");
-            eprintln!("       simple_editor-telegram send --file <video> --data <folder> [--field key=value]... [--option key=value]...");
+            eprintln!("Usage: dicing_splicing-telegram --describe");
+            eprintln!("       dicing_splicing-telegram prepare --file <video> --data <folder> [--name <project>] [--meta key=value]... [--option key=value]...");
+            eprintln!("       dicing_splicing-telegram send --file <video> --data <folder> [--field key=value]... [--option key=value]...");
             ExitCode::from(2)
         }
     }
@@ -331,7 +331,7 @@ mod tests {
     const TOKEN: &str = "123456:fake-Token_value";
 
     fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("simple_editor_telegram_main_{}_{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dicing_splicing_telegram_main_{}_{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

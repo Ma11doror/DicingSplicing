@@ -18,7 +18,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "Simple Editor",
+        "DicingSplicing",
         native_options,
         Box::new(|cc| Ok(Box::new(app::EditorApp::new(cc)))),
     )

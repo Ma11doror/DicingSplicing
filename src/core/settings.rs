@@ -26,9 +26,39 @@ pub struct Settings {
     pub crash_seen: Option<String>,
 }
 
-/// `%APPDATA%\simple_editor\settings.json`.
+/// The editor's folder among the user's own files: `%APPDATA%\DicingSplicing`.
+pub fn app_folder() -> PathBuf {
+    user_files().join(APP_FOLDER)
+}
+
+/// The folder of the user's settings of programs, or a temporary one where there is none.
+fn user_files() -> PathBuf {
+    std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
+}
+
+const APP_FOLDER: &str = "DicingSplicing";
+/// What the editor was called before, and where its settings were.
+const OLD_APP_FOLDER: &str = "simple_editor";
+const SETTINGS_FILE: &str = "settings.json";
+
+/// `%APPDATA%\DicingSplicing\settings.json`.
 pub fn default_path() -> PathBuf {
-    std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("simple_editor").join("settings.json")
+    app_folder().join(SETTINGS_FILE)
+}
+
+/// The settings the editor had under its old name, copied to where they are now, once: the projects
+/// folder, the recent projects and the plugins' options stay. Only when there are none yet under the
+/// new name; the old ones stay where they are, for the old editor.
+pub fn carry_over_old_settings() {
+    carry_over(&user_files().join(OLD_APP_FOLDER).join(SETTINGS_FILE), &default_path());
+}
+
+/// Copies `old` to `new` if `old` is there and `new` is not. Returns whether it did.
+fn carry_over(old: &Path, new: &Path) -> bool {
+    if new.exists() || !old.is_file() {
+        return false;
+    }
+    new.parent().is_some_and(|folder| fs::create_dir_all(folder).is_ok()) && fs::copy(old, new).is_ok()
 }
 
 impl Settings {
@@ -81,8 +111,25 @@ impl Settings {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_settings_of_the_old_name_come_along_once() {
+        let dir = std::env::temp_dir().join(format!("dicing_splicing_carry_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (old, new) = (dir.join("simple_editor").join("settings.json"), dir.join("DicingSplicing").join("settings.json"));
+        assert!(!carry_over(&old, &new), "nothing to bring");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::write(&old, "{\"recent\": []}").unwrap();
+        assert!(carry_over(&old, &new));
+        assert_eq!(fs::read_to_string(&new).unwrap(), "{\"recent\": []}");
+        assert!(old.exists(), "the old ones stay for the old editor");
+        fs::write(&new, "{}").unwrap();
+        assert!(!carry_over(&old, &new), "the new ones are not overwritten");
+        assert_eq!(fs::read_to_string(&new).unwrap(), "{}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     fn temp_file(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("simple_editor_settings_{}_{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dicing_splicing_settings_{}_{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir.join("settings.json")
     }

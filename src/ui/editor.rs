@@ -522,7 +522,7 @@ impl Editor {
     fn copy_selected(&mut self, ctx: &egui::Context) {
         if let Some(id) = self.selected {
             let clip = self.sequence.clip(id).clone();
-            let note = format!("Simple Editor clip: {} ({})", clip.name, timecode::format(clip.span().len()));
+            let note = format!("DicingSplicing clip: {} ({})", clip.name, timecode::format(clip.span().len()));
             ctx.copy_text(note.clone());
             self.clipboard = Some((clip, note));
         }

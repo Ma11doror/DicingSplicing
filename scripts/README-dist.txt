@@ -1,7 +1,7 @@
-Simple Editor
-=============
+DicingSplicing
+==============
 
-Запуск: simple_editor.exe. Ничего устанавливать не нужно, всё нужное лежит в этой папке.
+Запуск: dicing_splicing.exe. Ничего устанавливать не нужно, всё нужное лежит в этой папке.
 
 Первый запуск
 -------------
@@ -13,11 +13,11 @@ Windows может показать «Система Windows защитила в
 
 Что в папке
 -----------
-simple_editor.exe            сам редактор
-simple_editor-link.exe       плагин: видео по ссылке (YouTube, song.link и другие)
-simple_editor-telegram.exe   плагин: отправка готового видео в Telegram
-ffmpeg.exe, ffprobe.exe      ffmpeg: чтение и запись видео (лицензия в ffmpeg-LICENSE.txt)
-yt-dlp.exe                   скачивание по ссылкам, если он есть в папке
+dicing_splicing.exe            сам редактор
+dicing_splicing-link.exe       плагин: видео по ссылке (YouTube, song.link и другие)
+dicing_splicing-telegram.exe   плагин: отправка готового видео в Telegram
+ffmpeg.exe, ffprobe.exe        ffmpeg: чтение и запись видео (лицензия в ffmpeg-LICENSE.txt)
+yt-dlp.exe                     скачивание по ссылкам, если он есть в папке
 
 Если видео по ссылке перестали скачиваться, обновите yt-dlp: в этой папке выполните
 yt-dlp.exe -U. Установленный отдельно yt-dlp (winget install yt-dlp.yt-dlp) редактор

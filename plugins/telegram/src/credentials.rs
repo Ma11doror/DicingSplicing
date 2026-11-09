@@ -139,7 +139,7 @@ mod tests {
     const TOKEN: &str = "123456:fake-Token_value";
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("simple_editor_telegram_credentials_{}_{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dicing_splicing_telegram_credentials_{}_{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir

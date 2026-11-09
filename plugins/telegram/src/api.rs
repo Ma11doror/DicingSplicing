@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ureq::http::Response;
 use ureq::{Body, SendBody};
 
-const USER_AGENT: &str = concat!("simple_editor-telegram/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str = concat!("dicing_splicing-telegram/", env!("CARGO_PKG_VERSION"));
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 /// A video has to be looked at on the other side before there is an answer.
@@ -143,7 +143,7 @@ fn delivered(result: &Value, uploaded: bool) -> Delivered {
 /// Something that won't be met inside a video.
 fn boundary() -> String {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_nanos());
-    format!("SimpleEditor{nanos:x}{:x}", std::process::id())
+    format!("DicingSplicing{nanos:x}{:x}", std::process::id())
 }
 
 /// What goes before and after the file in the request.
@@ -340,7 +340,7 @@ mod tests {
     const VIDEO: &[u8] = b"video\r\n--\0\xFF\xFE bytes";
 
     fn video_file(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("simple_editor_telegram_api_{}_{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dicing_splicing_telegram_api_{}_{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let file = dir.join("a.mp4");

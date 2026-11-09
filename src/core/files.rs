@@ -28,7 +28,7 @@ mod tests {
 
     #[test]
     fn replaces_the_file_and_leaves_nothing_else() {
-        let dir = std::env::temp_dir().join(format!("simple_editor_files_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dicing_splicing_files_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("data.json");

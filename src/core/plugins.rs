@@ -1,10 +1,10 @@
 //! Plugins: separate programs that do what the editor itself has no business knowing about. The
 //! editor knows only this protocol, and works the same without any plugin.
 //!
-//! A plugin is a program named `simple_editor-<id>` next to the editor, or in
-//! `%APPDATA%\simple_editor\plugins`. It can be written in anything.
+//! A plugin is a program named `dicing_splicing-<id>` next to the editor, or in
+//! `%APPDATA%\DicingSplicing\plugins`. It can be written in anything.
 //!
-//! `simple_editor-<id> --describe` prints what it is, as one JSON object:
+//! `dicing_splicing-<id> --describe` prints what it is, as one JSON object:
 //!
 //! ```json
 //! { "protocol": 1, "kind": "source", "name": "Button text", "prompt": "What to ask for",
@@ -22,11 +22,11 @@
 //! ```
 //!
 //! When the standard input closes, the plugin should stop what it does and exit. The environment
-//! variables `SIMPLE_EDITOR_FFMPEG` and `SIMPLE_EDITOR_FFPROBE` say which programs the editor uses.
+//! variables `DICING_SPLICING_FFMPEG` and `DICING_SPLICING_FFPROBE` say which programs the editor uses.
 //!
 //! # The `source` kind brings in a video
 //!
-//! `simple_editor-<id> fetch --input <what the user typed> --out <folder>` does the work in `--out`,
+//! `dicing_splicing-<id> fetch --input <what the user typed> --out <folder>` does the work in `--out`,
 //! which is the plugin's own folder in the workspace, and ends with:
 //!
 //! ```json
@@ -40,7 +40,7 @@
 //! Its description adds `"extensions": ["mp4"]`, the files it takes; without it, any file. Both steps
 //! are given `--file <path>` and `--data <folder>`, the plugin's own folder for its notes.
 //!
-//! `simple_editor-<id> prepare --name <project> [--meta key=value]...` says what to ask. `meta` is what
+//! `dicing_splicing-<id> prepare --name <project> [--meta key=value]...` says what to ask. `meta` is what
 //! a source plugin said about the video. Nothing goes out yet:
 //!
 //! ```json
@@ -54,7 +54,7 @@
 //!   "action": "What the button says, unless a chosen value says otherwise" }
 //! ```
 //!
-//! `simple_editor-<id> send [--field key=value]...` does it, with the values the user left in the form.
+//! `dicing_splicing-<id> send [--field key=value]...` does it, with the values the user left in the form.
 //! The plugin checks everything again: the form is only what things were like when it was made. It
 //! ends with this, even after being asked to stop, because what has gone out has gone out:
 //!
@@ -80,7 +80,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const PROTOCOL: u32 = 1;
-const NAME_PREFIX: &str = "simple_editor-";
+const NAME_PREFIX: &str = "dicing_splicing-";
 const SOURCE_KIND: &str = "source";
 const PUBLISH_KIND: &str = "publish";
 const DEFAULT_ACTION: &str = "Send";
@@ -253,8 +253,8 @@ pub struct PublishTarget {
 /// Next to the editor, and among the user's own files.
 pub fn default_folders() -> Vec<PathBuf> {
     let next_to_editor = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_owned));
-    let in_user_files = std::env::var_os("APPDATA").map(|folder| PathBuf::from(folder).join("simple_editor").join("plugins"));
-    next_to_editor.into_iter().chain(in_user_files).collect()
+    let in_user_files = crate::core::settings::app_folder().join("plugins");
+    next_to_editor.into_iter().chain([in_user_files]).collect()
 }
 
 /// The id of a plugin, if this file is one.
@@ -487,8 +487,8 @@ impl PluginRun {
             stdin: Mutex::new(None),
             child: Mutex::new(None),
         });
-        command.env("SIMPLE_EDITOR_FFMPEG", tools::program_path(tools::FFMPEG));
-        command.env("SIMPLE_EDITOR_FFPROBE", tools::program_path(tools::FFPROBE));
+        command.env("DICING_SPLICING_FFMPEG", tools::program_path(tools::FFMPEG));
+        command.env("DICING_SPLICING_FFPROBE", tools::program_path(tools::FFPROBE));
         command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let name = plugin.name.clone();
@@ -589,7 +589,7 @@ mod tests {
     use super::*;
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("simple_editor_plugins_{}_{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dicing_splicing_plugins_{}_{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -597,12 +597,12 @@ mod tests {
 
     #[test]
     fn plugins_are_known_by_their_names() {
-        assert_eq!(plugin_id(Path::new("d/simple_editor-link.exe")).as_deref(), Some("link"));
-        assert_eq!(plugin_id(Path::new("simple_editor-a-b.cmd")).as_deref(), Some("a-b"));
-        assert_eq!(plugin_id(Path::new("simple_editor.exe")), None);
-        assert_eq!(plugin_id(Path::new("simple_editor-.exe")), None);
-        assert_eq!(plugin_id(Path::new("simple_editor-link.pdb")), None);
-        assert_eq!(plugin_id(Path::new("simple_editor-link.d")), None);
+        assert_eq!(plugin_id(Path::new("d/dicing_splicing-link.exe")).as_deref(), Some("link"));
+        assert_eq!(plugin_id(Path::new("dicing_splicing-a-b.cmd")).as_deref(), Some("a-b"));
+        assert_eq!(plugin_id(Path::new("dicing_splicing.exe")), None);
+        assert_eq!(plugin_id(Path::new("dicing_splicing-.exe")), None);
+        assert_eq!(plugin_id(Path::new("dicing_splicing-link.pdb")), None);
+        assert_eq!(plugin_id(Path::new("dicing_splicing-link.d")), None);
         assert_eq!(plugin_id(Path::new("other.exe")), None);
     }
 
@@ -701,7 +701,7 @@ mod tests {
     fn fake_plugin(dir: &Path) -> PathBuf {
         let video = dir.join("video.mp4");
         fs::write(&video, "video").unwrap();
-        let path = dir.join("simple_editor-fake.cmd");
+        let path = dir.join("dicing_splicing-fake.cmd");
         let video = video.display().to_string().replace('\\', "\\\\");
         let script = format!(
             "@echo off\r\n\
@@ -755,7 +755,7 @@ mod tests {
     fn finds_and_runs_a_plugin() {
         let dir = temp_dir("run");
         fake_plugin(&dir);
-        fs::write(dir.join("simple_editor-broken.cmd"), "@echo not json\r\n").unwrap();
+        fs::write(dir.join("dicing_splicing-broken.cmd"), "@echo not json\r\n").unwrap();
         fs::write(dir.join("unrelated.cmd"), "@exit /b 1\r\n").unwrap();
 
         let (plugins, problems) = discover(&[dir.clone(), dir.join("no_such_folder")]);
@@ -763,7 +763,7 @@ mod tests {
         assert_eq!(plugins[0].id, "fake");
         assert_eq!(plugins[0].name, "Fake");
         assert_eq!(problems.len(), 1, "{problems:?}");
-        assert!(problems[0].contains("simple_editor-broken"), "{problems:?}");
+        assert!(problems[0].contains("dicing_splicing-broken"), "{problems:?}");
         let plugin = &plugins[0];
 
         let notify: Notify = Arc::new(|| {});
@@ -808,7 +808,7 @@ mod tests {
     /// A publishing plugin as a batch file: what it sends depends on the name of the file.
     #[cfg(windows)]
     fn fake_publisher(dir: &Path) -> Plugin {
-        let path = dir.join("simple_editor-pub.cmd");
+        let path = dir.join("dicing_splicing-pub.cmd");
         let script = format!(
             "@echo off\r\n\
              if \"%1\"==\"--describe\" goto describe\r\n\

@@ -579,7 +579,7 @@ mod tests {
             eprintln!("ffmpeg/ffprobe not found, skipping");
             return;
         }
-        let dir = std::env::temp_dir().join(format!("simple_editor_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dicing_splicing_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let source = dir.join("source.mp4");
