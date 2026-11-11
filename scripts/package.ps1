@@ -91,6 +91,75 @@ function Find-YtDlp {
     return $null
 }
 
+# The licenses of what is built into the programs, in one file: every library as cargo names it,
+# with its license and where its source is, and the license texts it brings in its own folder (the
+# fonts of the interface are among them).
+function Write-ThirdPartyLicenses($file) {
+    $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+    $registries = @(Get-ChildItem -LiteralPath (Join-Path $cargoHome "registry\src") -Directory -ErrorAction SilentlyContinue)
+    $lines = & cargo tree --workspace --prefix none -e normal --target x86_64-pc-windows-msvc --format "{p}|{l}|{r}"
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo tree failed"
+    }
+    $text = New-Object System.Text.StringBuilder
+    [void]$text.AppendLine("Third-party software in DicingSplicing")
+    [void]$text.AppendLine("======================================")
+    [void]$text.AppendLine("")
+    [void]$text.AppendLine("DicingSplicing itself is under the Apache License 2.0: see LICENSE and NOTICE.")
+    [void]$text.AppendLine("")
+    [void]$text.AppendLine("Programs that come with it in this folder, each under its own license:")
+    [void]$text.AppendLine("")
+    [void]$text.AppendLine("  ffmpeg.exe, ffprobe.exe")
+    [void]$text.AppendLine("      FFmpeg, https://ffmpeg.org. Its license is in ffmpeg-LICENSE.txt; ffmpeg-README.txt")
+    [void]$text.AppendLine("      names the build and the source it was made from.")
+    [void]$text.AppendLine("  yt-dlp.exe")
+    [void]$text.AppendLine("      yt-dlp, https://github.com/yt-dlp/yt-dlp. Its own code is under The Unlicense; the")
+    [void]$text.AppendLine("      program as released also holds code of other projects, and as a whole is under the")
+    [void]$text.AppendLine("      GNU GPL version 3 or later. Its source and the licenses of its parts are at that address.")
+    [void]$text.AppendLine("")
+    [void]$text.AppendLine("Libraries built into dicing_splicing.exe and its plugins follow, with the license each one")
+    [void]$text.AppendLine("names and where its source is. Where a library brings the text of its license, it is given.")
+    [void]$text.AppendLine("")
+    $count = 0
+    # A library met again in the tree is marked with a star: the same library, once.
+    $lines = $lines | ForEach-Object { $_ -replace ' \(\*\)$', '' } | Sort-Object -Unique
+    foreach ($line in $lines) {
+        # Not the editor's own parts (they have a folder after the version), and not what only
+        # helps to build it.
+        if (-not $line -or $line -match '\((proc-macro|[A-Za-z]:\\|/)') {
+            continue
+        }
+        $parts = $line.Split('|')
+        if ($parts[0] -notmatch '^(\S+) v(\S+)') {
+            continue
+        }
+        $library = $Matches[1]
+        $libraryVersion = $Matches[2]
+        $count += 1
+        [void]$text.AppendLine(("-" * 78))
+        [void]$text.AppendLine("$library $libraryVersion")
+        [void]$text.AppendLine("License: $($parts[1])")
+        if ($parts[2]) {
+            [void]$text.AppendLine("Source:  $($parts[2])")
+        }
+        $folder = $registries | ForEach-Object { Join-Path $_.FullName "$library-$libraryVersion" } | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+        if (-not $folder) {
+            continue
+        }
+        $texts = @(Get-ChildItem -LiteralPath $folder -File | Where-Object { $_.Name -match '^(LICEN[SC]E|COPYING|NOTICE|UNLICENSE|COPYRIGHT)' })
+        $texts += @(Get-ChildItem -LiteralPath $folder -Directory | ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -File } |
+            Where-Object { $_.Name -match '(licen[sc]e|^OFL|^UFL)' -or ($_.Directory.Name -eq 'fonts' -and $_.Extension -eq '.txt') })
+        foreach ($license in ($texts | Where-Object { $_.Length -lt 200KB } | Sort-Object FullName)) {
+            [void]$text.AppendLine("")
+            [void]$text.AppendLine("--- $($license.FullName.Substring($folder.Length + 1)) ---")
+            [void]$text.AppendLine([IO.File]::ReadAllText($license.FullName).TrimEnd())
+        }
+        [void]$text.AppendLine("")
+    }
+    [IO.File]::WriteAllText($file, $text.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+    return $count
+}
+
 $version = (Select-String -LiteralPath (Join-Path $root "Cargo.toml") -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
 $name = "DicingSplicing-$version"
 $dist = Join-Path $root "dist"
@@ -145,6 +214,12 @@ if ($ytdlp) {
     [IO.File]::Copy($ytdlp, (Join-Path $out "yt-dlp.exe"))
 }
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "README-dist.txt") -Destination (Join-Path $out "README.txt")
+# The editor's own license, and those of everything built into it.
+foreach ($file in "LICENSE", "NOTICE") {
+    Copy-Item -LiteralPath (Join-Path $root $file) -Destination (Join-Path $out "$file.txt")
+}
+$libraries = Write-ThirdPartyLicenses (Join-Path $out "THIRD-PARTY-LICENSES.txt")
+Say "Licenses of $libraries libraries written"
 
 # Nothing secret goes out.
 $secrets = @(Get-ChildItem -LiteralPath $out -Recurse -File | Where-Object { $_.Name -in @("credentials.json", "config.json") })

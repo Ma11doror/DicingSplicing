@@ -2,6 +2,10 @@
 name = "dicing_splicing-telegram"
 version = "0.1.0"
 edition = "2021"
+description = "A DicingSplicing plugin: sends a finished video to a Telegram channel."
+license = "Apache-2.0"
+repository = "https://github.com/Ma11doror/DicingSplicing"
+authors = ["Peter Sinditskii"]
 
 # What this needs stays here: the editor itself has no HTTP client and no idea what a bot is.
 [dependencies]

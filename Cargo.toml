@@ -2,6 +2,10 @@
 name = "dicing_splicing"
 version = "0.1.0"
 edition = "2021"
+description = "A simple video editor for short videos: Telegram circles, Reels, Shorts and the like."
+license = "Apache-2.0"
+repository = "https://github.com/Ma11doror/DicingSplicing"
+authors = ["Peter Sinditskii"]
 default-run = "dicing_splicing"
 
 [dependencies]

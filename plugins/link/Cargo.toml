@@ -2,6 +2,10 @@
 name = "dicing_splicing-link"
 version = "0.1.0"
 edition = "2021"
+description = "A DicingSplicing plugin: brings in the video behind a link."
+license = "Apache-2.0"
+repository = "https://github.com/Ma11doror/DicingSplicing"
+authors = ["Peter Sinditskii"]
 
 # What this needs stays here: the editor itself has no HTTP client and no idea what yt-dlp is.
 [dependencies]
