@@ -4,7 +4,7 @@
 //! selected at a time: the middle shows its source with its frame, the side panel its transform and
 //! sound. The output preview shows what goes into the file: the clip seen at the playhead.
 
-use crate::core::edit::{Clip, ClipId, Color, Curve, Edge, Effect, Sequence, SourceId, Span};
+use crate::core::edit::{Clip, ClipId, Color, Curve, Edge, Effect, Sequence, SourceId, Span, TrackKind};
 use crate::core::history::History;
 use crate::core::plugins::Plugin;
 use crate::core::project::{self, Project, Source, ViewState, RENDERS_FOLDER};
@@ -20,7 +20,8 @@ use crate::ui::export::{ExportEnv, ExportPanel};
 use crate::ui::flash;
 use crate::ui::framing::Framing;
 use crate::ui::picture::{frame_at, Picture};
-use crate::ui::{curve_choice, grip_dots, paint_curve, pick_video};
+use crate::ui::timeline::track_name;
+use crate::ui::{curve_choice, grip_dots, paint_curve, pick_media};
 use crate::ui::plugins::PublishEnv;
 use crate::ui::sources::{self, SourceAction, SourceRow};
 use crate::ui::timeline::{Section, SourceSound, Timeline, TimelineEnv, Tool};
@@ -136,7 +137,7 @@ pub struct Editor {
     scroll_to: Option<Section>,
     /// The clip Ctrl+C copied, and what it put into the system's clipboard to say so: Ctrl+V pastes
     /// the clip only while that text is still there.
-    clipboard: Option<(Clip, String)>,
+    clipboard: Option<(Clip, TrackKind, String)>,
 }
 
 impl Editor {
@@ -320,7 +321,8 @@ impl Editor {
     /// the playhead for the output, unless it is the same frame.
     fn request_frames(&mut self) {
         let t = self.shown_time();
-        let center = self.selected.map(|id| self.sequence.clip(id)).map(|clip| (clip.source, clip.source_time(t)));
+        let framed = self.selected.filter(|id| self.sequence.tracks[id.track].kind == TrackKind::Video);
+        let center = framed.map(|id| self.sequence.clip(id)).map(|clip| (clip.source, clip.source_time(t)));
         let mut center_frame = None;
         if let Some((source, time)) = center {
             if let Some(cache) = self.library.cache(source) {
@@ -384,7 +386,7 @@ impl Editor {
         let sounds: Vec<Sound> = self
             .sequence
             .clips()
-            .filter(|(id, clip)| !self.sequence.tracks[id.track].muted && clip.gain() > 0.0)
+            .filter(|(id, _)| self.sequence.sounds(*id))
             .filter_map(|(_, clip)| {
                 let (fade_in, fade_out) = clip.fade_lengths();
                 let sounds = |edge| clip.fade(edge).is_some_and(|fade| fade.sound);
@@ -524,17 +526,18 @@ impl Editor {
             let clip = self.sequence.clip(id).clone();
             let note = format!("DicingSplicing clip: {} ({})", clip.name, timecode::format(clip.span().len()));
             ctx.copy_text(note.clone());
-            self.clipboard = Some((clip, note));
+            self.clipboard = Some((clip, self.sequence.tracks[id.track].kind, note));
         }
     }
 
     /// Pastes the copied clip at the playhead, if the clipboard still has what copying put there.
     fn paste(&mut self, text: &str) {
-        let Some((clip, _)) = self.clipboard.as_ref().filter(|(_, note)| note == text) else { return };
-        let (clip, at) = (clip.clone(), self.frame_start(self.position));
+        let Some((clip, kind, _)) = self.clipboard.as_ref().filter(|(_, _, note)| note == text) else { return };
+        let (clip, kind, at) = (clip.clone(), *kind, self.frame_start(self.position));
         self.pause();
+        // Onto the selected clip's track, if it is of the kind the copy came from.
         let track = self.selected.map(|id| id.track);
-        self.selected = Some(self.sequence.paste(clip, at, track));
+        self.selected = Some(self.sequence.paste(clip, at, track, kind));
     }
 
     fn undo(&mut self) {
@@ -582,14 +585,16 @@ impl Editor {
     fn add_to_timeline(&mut self, id: SourceId) {
         let (Some(source), Some(info)) = (self.sources.iter().find(|source| source.id == id), self.library.info(id)) else { return };
         let clip = Clip::of(id, source.label(), info.duration);
-        let added = self.sequence.add_below(clip);
+        // A file of sound only goes onto an audio track.
+        let kind = if info.has_video() { TrackKind::Video } else { TrackKind::Audio };
+        let added = self.sequence.add_below(clip, kind);
         self.selected = Some(added);
         self.seek(self.sequence.clip(added).start);
     }
 
     /// The source's file is somewhere else now.
     fn locate(&mut self, id: SourceId) {
-        let Some(path) = pick_video() else { return };
+        let Some(path) = pick_media() else { return };
         let Some(source) = self.sources.iter_mut().find(|source| source.id == id) else { return };
         source.path = path;
         self.center.forget(id);
@@ -645,7 +650,7 @@ impl Editor {
             SourceAction::Locate(id) => self.locate(id),
             SourceAction::Remove(id) => self.remove_source(id),
             SourceAction::AddVideo => {
-                if let Some(path) = pick_video() {
+                if let Some(path) = pick_media() {
                     self.add_source(path, None, BTreeMap::new());
                 }
             }
@@ -737,6 +742,7 @@ impl Editor {
         }
         if pressed(none, Key::V) || pressed(none, Key::Escape) {
             self.timeline.tool = Tool::Select;
+            self.timeline.cancel_chaining();
         }
     }
 
@@ -744,10 +750,13 @@ impl Editor {
         let fps = self.fps;
         let frame = self.frame();
         let missing = self.missing();
-        let placeable: BTreeMap<SourceId, (String, f64)> = self
+        let placeable: BTreeMap<SourceId, (String, f64, bool)> = self
             .sources
             .iter()
-            .filter_map(|source| Some((source.id, (source.label(), self.library.info(source.id)?.duration))))
+            .filter_map(|source| {
+                let info = self.library.info(source.id)?;
+                Some((source.id, (source.label(), info.duration, info.has_video())))
+            })
             .collect();
         // The graph of each source's sound: none for a video without sound.
         let sounds: BTreeMap<SourceId, SourceSound> = self
@@ -1006,7 +1015,9 @@ impl Editor {
         let (fps, at_playhead) = (self.fps, self.frame_start(self.position));
         let clip = self.sequence.clip(id);
         let (span, source_in, source_out, name) = (clip.span(), clip.source_in, clip.source_out, clip.name.clone());
-        let track = format!("Track {}", self.sequence.tracks.len() - id.track);
+        let track = track_name(&self.sequence, id.track);
+        let kind = self.sequence.tracks[id.track].kind;
+        let detached = self.sequence.clip(id).sound_detached;
         ui.label(RichText::new(name).strong());
         ui.label(RichText::new(format!("{track} · {} to {}", timecode::format(span.start - zero), timecode::format(span.end - zero))).weak());
         ui.separator();
@@ -1046,6 +1057,8 @@ impl Editor {
         let info = self.library.info(source).cloned();
         let flash_of = |section: Section| self.flash.filter(|(flashed, _)| *flashed == section).map(|(_, started)| started);
         let (frame_flash, sound_flash, effects_flash) = (flash_of(Section::Frame), flash_of(Section::Sound), flash_of(Section::Effects));
+        // A sound clip is not seen: nothing to frame.
+        if kind == TrackKind::Video {
         let t = &mut self.sequence.clip_mut(id).transform;
         let frame_section = flash::frame(ui, frame_flash, false).show(ui, |ui| {
             ui.heading("Transform");
@@ -1106,8 +1119,19 @@ impl Editor {
             self.scroll_to = None;
         }
         ui.separator();
+        }
 
-        if info.as_ref().is_some_and(|info| info.has_audio) {
+        // A picture whose sound is a clip of its own has no sound here: the other clip has it.
+        if detached {
+            let partner = self.sequence.group_of(id).into_iter().find(|&other| self.sequence.tracks[other.track].kind == TrackKind::Audio);
+            ui.heading("Sound");
+            let text = match partner {
+                Some(other) => format!("Detached: it is a clip of its own on {}.", track_name(&self.sequence, other.track)),
+                None => "Detached: its sound is a clip of its own.".to_owned(),
+            };
+            ui.label(RichText::new(text).weak());
+            ui.separator();
+        } else if info.as_ref().is_some_and(|info| info.has_audio) {
             let clip = self.sequence.clip_mut(id);
             let sound_section = flash::frame(ui, sound_flash, false).show(ui, |ui| {
                 ui.heading("Sound");
@@ -1130,7 +1154,8 @@ impl Editor {
         }
 
         let clip = self.sequence.clip_mut(id);
-        let effects_section = flash::frame(ui, effects_flash, false).show(ui, |ui| effects_editor(ui, clip));
+        let (picture, sound) = (kind == TrackKind::Video, kind == TrackKind::Audio || !detached);
+        let effects_section = flash::frame(ui, effects_flash, false).show(ui, |ui| effects_editor(ui, clip, picture, sound));
         if self.scroll_to == Some(Section::Effects) {
             effects_section.response.scroll_to_me(Some(egui::Align::Center));
             self.scroll_to = None;
@@ -1145,15 +1170,21 @@ impl Editor {
             return;
         };
         egui::Grid::new("source").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
-            ui.label("Size");
-            ui.label(format!("{}×{}", info.width, info.height));
-            ui.end_row();
-            ui.label("Frame rate");
-            match self.library.cache(source).map(|cache| cache.format.fps).filter(|preview| *preview != info.fps) {
-                Some(preview) => ui.label(format!("{:.2} fps (preview {:.2})", info.fps.as_f64(), preview.as_f64())),
-                None => ui.label(format!("{:.2} fps", info.fps.as_f64())),
-            };
-            ui.end_row();
+            if info.has_video() {
+                ui.label("Size");
+                ui.label(format!("{}×{}", info.width, info.height));
+                ui.end_row();
+                ui.label("Frame rate");
+                match self.library.cache(source).map(|cache| cache.format.fps).filter(|preview| *preview != info.fps) {
+                    Some(preview) => ui.label(format!("{:.2} fps (preview {:.2})", info.fps.as_f64(), preview.as_f64())),
+                    None => ui.label(format!("{:.2} fps", info.fps.as_f64())),
+                };
+                ui.end_row();
+            } else {
+                ui.label("Picture");
+                ui.label("none: sound only");
+                ui.end_row();
+            }
             ui.label("Duration");
             ui.label(timecode::format(info.duration));
             ui.end_row();
@@ -1164,8 +1195,9 @@ impl Editor {
     }
 
     fn source_panel(&mut self, ctx: &egui::Context) {
-        let selected = self.selected.map(|id| (id, self.sequence.clip(id).source));
-        let size = selected.and_then(|(_, source)| self.size_of(source));
+        let sound_clip = self.selected.filter(|id| self.sequence.tracks[id.track].kind == TrackKind::Audio);
+        let selected = self.selected.filter(|_| sound_clip.is_none()).map(|id| (id, self.sequence.clip(id).source));
+        let size = selected.and_then(|(_, source)| self.size_of(source).filter(|[w, h]| *w > 0.0 && *h > 0.0));
         let aspect = size.map_or(NO_SIZE[0] / NO_SIZE[1], |[w, h]| w / h);
         let note = selected.filter(|(id, _)| !self.sequence.clip(*id).span().contains(self.shown_time())).map(|_| "Outside the clip");
         let frame = egui::Frame::none().fill(Color32::from_gray(16));
@@ -1194,6 +1226,7 @@ impl Editor {
                 }
                 _ => {
                     let text = match selected {
+                        _ if sound_clip.is_some() => "A sound clip: there is nothing to frame. Its volume and fades are in the Clip panel".to_owned(),
                         Some((_, source)) => match self.library.state(source) {
                             SourceState::Missing => "The file of this clip is not there. Sources: Locate file".to_owned(),
                             SourceState::Failed(error) => format!("The file of this clip can't be read: {error}"),
@@ -1236,7 +1269,7 @@ fn panel_border(ui: &mut egui::Ui) -> Option<f32> {
 }
 
 /// The effects of a clip, in order, each with its settings, and a way to add more.
-fn effects_editor(ui: &mut egui::Ui, clip: &mut Clip) {
+fn effects_editor(ui: &mut egui::Ui, clip: &mut Clip, picture: bool, sound: bool) {
     ui.heading("Effects");
     let len = clip.span().len();
     let (fade_in, fade_out) = clip.fade_lengths();
@@ -1262,8 +1295,10 @@ fn effects_editor(ui: &mut egui::Ui, clip: &mut Clip) {
                         ui.label("Length");
                         let length = egui::DragValue::new(&mut fade.seconds).speed(0.01).range(0.0..=room.max(0.0)).fixed_decimals(2).suffix(" s");
                         ui.add(length).on_hover_text("No longer than the clip leaves after the other fade");
-                        ui.checkbox(&mut fade.picture, "Picture").on_hover_text("The picture comes out of, or goes into, what is under the clip: black if there is nothing");
-                        ui.checkbox(&mut fade.sound, "Sound").on_hover_text("The sound rises from, or falls into, silence");
+                        if picture && sound {
+                            ui.checkbox(&mut fade.picture, "Picture").on_hover_text("The picture comes out of, or goes into, what is under the clip: black if there is nothing");
+                            ui.checkbox(&mut fade.sound, "Sound").on_hover_text("The sound rises from, or falls into, silence");
+                        }
                     });
                     ui.horizontal(|ui| {
                         ui.label("Curve");
@@ -1326,10 +1361,12 @@ fn effects_editor(ui: &mut egui::Ui, clip: &mut Clip) {
                 ui.close_menu();
             }
         }
-        let add = ui.add_enabled(clip.color().is_none(), egui::Button::new("Color"));
-        if add.on_disabled_hover_text("The clip has one").clicked() {
-            clip.add_color();
-            ui.close_menu();
+        if picture {
+            let add = ui.add_enabled(clip.color().is_none(), egui::Button::new("Color"));
+            if add.on_disabled_hover_text("The clip has one").clicked() {
+                clip.add_color();
+                ui.close_menu();
+            }
         }
     });
 }

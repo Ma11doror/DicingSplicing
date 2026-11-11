@@ -23,6 +23,7 @@ impl Rational {
     }
 }
 
+/// What a file is. A file of sound only has no size and no frame rate: 0 by 0 at 0 frames a second.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MediaInfo {
     pub duration: f64,
@@ -89,16 +90,31 @@ struct ProbeFormat {
     duration: Option<String>,
 }
 
+impl MediaInfo {
+    /// It has a picture, and is not sound only.
+    pub fn has_video(&self) -> bool {
+        self.width > 0 && self.height > 0
+    }
+}
+
 fn parse(json: &[u8]) -> Result<MediaInfo> {
     let probe: ProbeOutput = serde_json::from_slice(json).context("unexpected ffprobe output")?;
     let is = |s: &ProbeStream, kind: &str| s.codec_type.as_deref() == Some(kind);
-    // Cover art in some containers is a "video" stream too.
-    let video = probe
-        .streams
-        .iter()
-        .find(|s| is(s, "video") && s.disposition.attached_pic == 0)
-        .context("the file has no video stream")?;
     let has_audio = probe.streams.iter().any(|s| is(s, "audio"));
+    // Cover art in some containers is a "video" stream too.
+    let Some(video) = probe.streams.iter().find(|s| is(s, "video") && s.disposition.attached_pic == 0) else {
+        // Sound only, a song with its cover too.
+        let audio = probe.streams.iter().find(|s| is(s, "audio")).context("the file has neither a picture nor sound")?;
+        let duration = probe
+            .format
+            .as_ref()
+            .and_then(|f| f.duration.as_deref())
+            .or(audio.duration.as_deref())
+            .and_then(|d| d.parse::<f64>().ok())
+            .filter(|d| *d > 0.0)
+            .context("can't determine the duration")?;
+        return Ok(MediaInfo { duration, width: 0, height: 0, fps: Rational { num: 0, den: 1 }, has_audio });
+    };
 
     let (w, h) = (
         video.width.context("video stream has no width")?,
@@ -132,6 +148,22 @@ fn parse(json: &[u8]) -> Result<MediaInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_of_sound_only_has_no_picture() {
+        // A song with its cover: the cover is no picture to play.
+        let json = br#"{
+            "streams": [
+                {"codec_type": "audio", "duration": "182.5"},
+                {"codec_type": "video", "width": 600, "height": 600, "disposition": {"attached_pic": 1}}
+            ],
+            "format": {"duration": "182.6"}
+        }"#;
+        let info = parse(json).unwrap();
+        assert_eq!((info.width, info.height, info.has_audio, info.has_video()), (0, 0, true, false));
+        assert_eq!(info.duration, 182.6);
+        assert!(parse(br#"{"streams": [], "format": {"duration": "3"}}"#).is_err(), "nothing to play");
+    }
 
     #[test]
     fn applies_rotation_metadata() {

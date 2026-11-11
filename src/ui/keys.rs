@@ -40,10 +40,10 @@ const GROUPS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Click on the ruler", "Take the playhead there"),
             ("Click on a clip", "Select it"),
-            ("Drag a clip", "Move it, also onto another track"),
+            ("Drag a clip", "Move it, also onto another track of its kind; the clips chained to it go along"),
             ("Drag an edge of the selected clip", "Trim it"),
             ("Drag the dots on its top edge", "Change the length of its fade"),
-            ("Right click on a clip", "Its menu: fades and their curves, color, a cut there, delete"),
+            ("Right click on a clip", "Its menu: detach its sound, chain it to another clip, fades, color, a cut there, delete"),
             ("Double click on a clip", "Unfold or fold its track: effects and sound"),
             ("Drag the ruler or an empty place", "Move along the time, and over the tracks up and down too"),
             ("Drag with the right or middle button", "The same, wherever it starts"),

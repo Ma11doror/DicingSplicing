@@ -177,10 +177,13 @@ impl MediaCache {
         if meta.version != VERSION || !meta.frames_complete || !meta.audio_complete || &meta.info != info {
             return None;
         }
-        let entries = read_index(&dir.join(INDEX_FILE)).ok()?;
-        let end = entries.last().map(|&(offset, len)| offset + len as u64)?;
-        if fs::metadata(dir.join(FRAMES_FILE)).ok()?.len() != end {
-            return None;
+        // Sound only: there are no frames to look for.
+        let entries = if info.has_video() { read_index(&dir.join(INDEX_FILE)).ok()? } else { Vec::new() };
+        if info.has_video() {
+            let end = entries.last().map(|&(offset, len)| offset + len as u64)?;
+            if fs::metadata(dir.join(FRAMES_FILE)).ok()?.len() != end {
+                return None;
+            }
         }
         let samples = if info.has_audio { pcm_from_bytes(&fs::read(dir.join(AUDIO_FILE)).ok()?) } else { Vec::new() };
         Some(Self {
@@ -204,7 +207,8 @@ impl MediaCache {
             source: source.to_path_buf(),
             info: info.clone(),
             format,
-            frames_complete: false,
+            // Sound only: no frames to make.
+            frames_complete: !info.has_video(),
             audio_complete: !info.has_audio,
         };
         write_meta(&dir, &meta)?;
@@ -226,23 +230,25 @@ impl MediaCache {
             build: Some(Build { shared: shared.clone(), children: Vec::new() }),
         };
 
-        let filter = format!(
-            "fps={}/{}:start_time=0,scale={}:{}:flags=bicubic",
-            format.fps.num, format.fps.den, format.width, format.height
-        );
-        #[rustfmt::skip]
-        let (child, stdout, stderr) = cache.spawn_ffmpeg(&[
-            "-map", "0:V:0", "-an", "-sn", "-dn",
-            "-vf", &filter,
-            "-c:v", "mjpeg", "-q:v", JPEG_QUALITY, "-pix_fmt", "yuvj420p",
-            "-f", "image2pipe", "pipe:1",
-        ])?;
-        let (job, frames) = (shared.clone(), cache.frames.clone());
-        thread::spawn(move || {
-            run_job(child, stdout, stderr, &job, |out| write_frames(out, &job, &frames), |meta| {
-                meta.frames_complete = true
-            })
-        });
+        if cache.info.has_video() {
+            let filter = format!(
+                "fps={}/{}:start_time=0,scale={}:{}:flags=bicubic",
+                format.fps.num, format.fps.den, format.width, format.height
+            );
+            #[rustfmt::skip]
+            let (child, stdout, stderr) = cache.spawn_ffmpeg(&[
+                "-map", "0:V:0", "-an", "-sn", "-dn",
+                "-vf", &filter,
+                "-c:v", "mjpeg", "-q:v", JPEG_QUALITY, "-pix_fmt", "yuvj420p",
+                "-f", "image2pipe", "pipe:1",
+            ])?;
+            let (job, frames) = (shared.clone(), cache.frames.clone());
+            thread::spawn(move || {
+                run_job(child, stdout, stderr, &job, |out| write_frames(out, &job, &frames), |meta| {
+                    meta.frames_complete = true
+                })
+            });
+        }
 
         if cache.info.has_audio {
             // first_pts=0 pads with silence if the audio starts later than the video.
@@ -624,6 +630,40 @@ mod tests {
         let cache = MediaCache::open_in(&root, &source, notify).unwrap();
         assert!(cache.build.is_none(), "the second open must reuse the cache");
         assert_eq!(cache.frame_count(), 50);
+        drop(cache);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_of_sound_only_gets_its_sound_and_no_frames() {
+        if tools::check(tools::FFMPEG).is_err() || tools::check(tools::FFPROBE).is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("dicing_splicing_sound_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("tone.m4a");
+        let status = tools::command(tools::FFMPEG)
+            .args(["-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-c:a", "aac"])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let (root, notify): (_, Notify) = (dir.join("cache"), Arc::new(|| {}));
+        let cache = MediaCache::open_in(&root, &source, notify.clone()).unwrap();
+        assert!(!cache.info.has_video());
+        let started = Instant::now();
+        while !matches!(cache.status(), CacheStatus::Ready) {
+            assert!(!matches!(cache.status(), CacheStatus::Failed(_)), "the build failed");
+            assert!(started.elapsed() < Duration::from_secs(60), "the build timed out");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let samples = cache.audio.get().unwrap().len() as i64;
+        assert!((samples - 2 * 2 * AUDIO_RATE as i64).abs() < 2 * AUDIO_RATE as i64 / 10, "{samples} samples");
+        assert_eq!(cache.frames.len(), 0);
+        drop(cache);
+        let cache = MediaCache::open_in(&root, &source, notify).unwrap();
+        assert!(cache.build.is_none(), "the second open reuses it, with no frames to look for");
         drop(cache);
         let _ = fs::remove_dir_all(&dir);
     }

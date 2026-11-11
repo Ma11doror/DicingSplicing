@@ -19,7 +19,7 @@
 //! unfolded, also the effects of each clip and its sound as a graph. A clip covers all the lanes of
 //! its row, and is grabbed, cut and trimmed by any of them.
 
-use crate::core::edit::{Clip, ClipId, Curve, Edge, Effect, SourceId, Sequence, Span, Track, TrackId};
+use crate::core::edit::{Clip, ClipId, Curve, Edge, Effect, SourceId, Sequence, Span, Track, TrackId, TrackKind};
 use crate::media::geometry::Transform;
 use crate::media::timecode;
 use crate::media::waveform::Peaks;
@@ -35,6 +35,8 @@ const STRIP_HEIGHT: f32 = 12.0;
 const PICTURE_LANE_HEIGHT: f32 = 44.0;
 const EFFECTS_LANE_HEIGHT: f32 = 24.0;
 const SOUND_LANE_HEIGHT: f32 = 52.0;
+/// An audio track's row: lower than a video track's, as its clips are only sound.
+const AUDIO_LANE_HEIGHT: f32 = 34.0;
 /// Left of the rows: their scroll bar, and the name of each track and what can be done with it.
 const HEADER_WIDTH: f32 = 218.0;
 /// The scroll bar and the gap after it, at the left of the headers.
@@ -76,6 +78,11 @@ const GAP_LABEL_WIDTH: f32 = 64.0;
 const PLAYHEAD_COLOR: Color32 = Color32::from_rgb(255, 86, 64);
 const EXPORT_COLOR: Color32 = Color32::from_rgb(64, 150, 240);
 const CLIP_COLOR: Color32 = Color32::from_rgb(72, 88, 128);
+/// Clips of sound only, and the headers of their tracks: another shade.
+const AUDIO_CLIP_COLOR: Color32 = Color32::from_rgb(44, 102, 92);
+const AUDIO_HEADER_TINT: Color32 = Color32::from_rgba_premultiplied(20, 60, 52, 60);
+/// The mark of a clip chained to others, and the outline of those chained to the selected one.
+const LINK_COLOR: Color32 = Color32::from_rgb(255, 214, 120);
 const HANDLE_COLOR: Color32 = Color32::from_rgb(255, 200, 40);
 const MISSING_COLOR: Color32 = Color32::from_rgb(230, 80, 70);
 const CUT_COLOR: Color32 = Color32::from_rgb(255, 120, 60);
@@ -168,6 +175,8 @@ pub struct Timeline {
     pan: Option<(f32, f32)>,
     /// When the rows were last pushed: they spring back a little after.
     pushed_at: f64,
+    /// A clip waiting to be chained: the next click on a clip chains it there.
+    chaining: Option<ClipId>,
 }
 
 /// The rows' scroll after a push by `delta`: past an end they give way less, and no further than
@@ -235,10 +244,11 @@ impl RowsBar {
 enum Place {
     /// Into this track, where there is room for it.
     Into(usize),
-    /// On a new track right above this one, which has no room for it there.
-    Above(usize),
-    /// On a new track under all the others.
-    Bottom,
+    /// On a new track of this kind right above this one, which has no room for it there, or is of
+    /// another kind.
+    Above(usize, TrackKind),
+    /// On a new track of this kind under all the others.
+    Bottom(TrackKind),
 }
 
 /// Something dragged over the rows, drawn where it would go.
@@ -288,8 +298,9 @@ pub struct TimelineEnv<'a> {
     pub fps: f64,
     /// Sources whose file is not there: their clips are marked.
     pub missing: &'a BTreeSet<SourceId>,
-    /// Sources that can be dropped on the timeline, with what their clip is called and how long it is.
-    pub placeable: &'a BTreeMap<SourceId, (String, f64)>,
+    /// Sources that can be dropped on the timeline: what their clip is called, how long it is, and
+    /// whether it has a picture.
+    pub placeable: &'a BTreeMap<SourceId, (String, f64, bool)>,
     /// The graph of each source's sound, for unfolded rows.
     pub sounds: &'a BTreeMap<SourceId, SourceSound>,
 }
@@ -299,8 +310,8 @@ pub struct TimelineEnv<'a> {
 enum TrackAction {
     Move { track: usize, up: bool },
     Delete(usize),
-    /// An empty track at this place among the tracks.
-    Add(usize),
+    /// An empty track of this kind at this place among the tracks.
+    Add(usize, TrackKind),
 }
 
 /// Time to screen mapping: `pos` is under `center_x`.
@@ -327,6 +338,8 @@ enum Lane {
     Picture,
     Effects,
     Sound,
+    /// The one lane of an audio track: its clips' sound, with their names.
+    Audio,
 }
 
 impl Lane {
@@ -335,17 +348,31 @@ impl Lane {
             Lane::Picture => PICTURE_LANE_HEIGHT,
             Lane::Effects => EFFECTS_LANE_HEIGHT,
             Lane::Sound => SOUND_LANE_HEIGHT,
+            Lane::Audio => AUDIO_LANE_HEIGHT,
         }
     }
 }
 
-/// The lanes of a track's row, top to bottom: the picture, and when it is unfolded the effects and
-/// the sound.
+/// The lanes of a track's row, top to bottom. A video track: the picture, and when it is unfolded
+/// the effects and the sound. An audio track: the sound, and the effects when unfolded.
 fn lanes_of(track: &Track, expanded: &BTreeSet<TrackId>) -> Vec<Lane> {
-    if expanded.contains(&track.id) {
-        vec![Lane::Picture, Lane::Effects, Lane::Sound]
-    } else {
-        vec![Lane::Picture]
+    let unfolded = expanded.contains(&track.id);
+    match (track.kind, unfolded) {
+        (TrackKind::Video, true) => vec![Lane::Picture, Lane::Effects, Lane::Sound],
+        (TrackKind::Video, false) => vec![Lane::Picture],
+        (TrackKind::Audio, true) => vec![Lane::Audio, Lane::Effects],
+        (TrackKind::Audio, false) => vec![Lane::Audio],
+    }
+}
+
+/// What a track is called: "Video 1", "Audio 2". Each kind is counted on its own, from the top, as
+/// the rows are seen.
+pub fn track_name(sequence: &Sequence, track: usize) -> String {
+    let kind = sequence.tracks[track].kind;
+    let number = sequence.tracks[track..].iter().filter(|other| other.kind == kind).count();
+    match kind {
+        TrackKind::Video => format!("Video {number}"),
+        TrackKind::Audio => format!("Audio {number}"),
     }
 }
 
@@ -531,7 +558,13 @@ impl Timeline {
             scroll_bar: None,
             pan: None,
             pushed_at: 0.0,
+            chaining: None,
         }
+    }
+
+    /// Stops waiting for a clip to chain to.
+    pub fn cancel_chaining(&mut self) {
+        self.chaining = None;
     }
 
     pub fn scale(&self) -> Option<f32> {
@@ -638,7 +671,22 @@ impl Timeline {
         let view = |pos: f64| View { center_x, pps, pos };
         let snap_range = if ui.input(|i| i.modifiers.alt) { 0.0 } else { (SNAP_DISTANCE / pps) as f64 };
 
-        if response.drag_started() {
+        // Waiting for a clip to chain to: a click on a clip chains, anything else gives up.
+        if self.chaining.is_some_and(|id| !sequence.has(id)) || response.drag_started() {
+            self.chaining = None;
+        }
+        // That click is not also a pick or a cut.
+        let mut click_used = false;
+        if let (Some(waiting), true) = (self.chaining, response.clicked()) {
+            click_used = true;
+            let clicked = response.interact_pointer_pos().and_then(|p| hit(p, &layout, view(pos), sequence, *selected)).and_then(Drag::clip);
+            if let Some(to) = clicked.filter(|&to| to != waiting) {
+                sequence.chain(waiting, to);
+                *selected = Some(waiting);
+                out.edit_started = true;
+            }
+            self.chaining = None;
+        } else if response.drag_started() {
             let press = ui.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos());
             // The right and the middle button always take the tape, whatever is under them.
             let tape = response.drag_started_by(PointerButton::Secondary) || response.drag_started_by(PointerButton::Middle);
@@ -691,7 +739,9 @@ impl Timeline {
                         ui.ctx().request_repaint();
                     }
                     let target = layout.row_at(p.y.clamp(layout.rows_area.top() + 1.0, layout.rows_area.bottom() - 1.0)).map(|row| row.track);
-                    if let Some(track) = target.filter(|&track| track != id.track) {
+                    // Only onto a track of its kind: a picture can't go where only sound is.
+                    let kind = sequence.tracks[id.track].kind;
+                    if let Some(track) = target.filter(|&track| track != id.track && sequence.tracks[track].kind == kind) {
                         match sequence.move_clip_to_track(id, track, wanted) {
                             Some(moved) => {
                                 drag = Drag::ClipMove(moved);
@@ -709,7 +759,7 @@ impl Timeline {
         if response.drag_stopped() {
             // A clip let go where there was no room: on a new row right above that one.
             if let (Some(Drag::ClipMove(id)), Some((above, start))) = (self.drag, self.new_row.take()) {
-                let track = sequence.add_track(above + 1);
+                let track = sequence.add_track(above + 1, sequence.tracks[id.track].kind);
                 let id = ClipId { track: after_insert(id.track, track), ..id };
                 *selected = sequence.move_clip_to_track(id, track, start).or(Some(id));
             }
@@ -726,7 +776,7 @@ impl Timeline {
         } else if held && !(0.0..=max_scroll).contains(&self.scroll) {
             ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(SPRING_DELAY));
         }
-        if response.clicked() {
+        if response.clicked() && !click_used {
             if let Some(p) = response.interact_pointer_pos().filter(|p| p.x >= layout.body.left()) {
                 if layout.ruler.contains(p) {
                     // The ruler is where the playhead goes: straight to the time clicked.
@@ -770,7 +820,32 @@ impl Timeline {
             let mut added = false;
             // In this egui it gives something back only as the menu closes: whether it is still
             // open is asked separately.
+            let kind = sequence.tracks[id.track].kind;
+            let has_sound = matches!(env.sounds.get(&sequence.clip(id).source), Some(SourceSound::Graph(_)));
+            let chained = sequence.is_chained(id);
             response.context_menu(|ui| {
+                // Its sound, and what it is chained to.
+                if kind == TrackKind::Video && has_sound && !sequence.clip(id).sound_detached {
+                    let detach = ui.button("Detach sound").on_hover_text("Its sound becomes a clip of its own on an audio track under it, chained to it");
+                    if detach.clicked() {
+                        if let Some((_, sound)) = sequence.detach_sound(id) {
+                            *selected = Some(sound);
+                        }
+                        changed = true;
+                        ui.close_menu();
+                        return;
+                    }
+                }
+                if ui.button("Chain to…").on_hover_text("Then click the clip to chain this one to: moved in time, they go together").clicked() {
+                    self.chaining = Some(id);
+                    ui.close_menu();
+                }
+                if chained && ui.button("Unchain").on_hover_text("It moves on its own; the others it was chained to stay together").clicked() {
+                    sequence.unchain(id);
+                    changed = true;
+                    ui.close_menu();
+                }
+                ui.separator();
                 let clip = sequence.clip_mut(id);
                 for (edge, name) in [(Edge::In, "fade in"), (Edge::Out, "fade out")] {
                     let present = clip.fade(edge).is_some();
@@ -786,7 +861,8 @@ impl Timeline {
                     }
                 }
                 let colored = clip.color().is_some();
-                if ui.button(if colored { "Remove color" } else { "Add color" }).on_hover_text("Exposure, contrast, saturation and temperature of this clip").clicked() {
+                let color = kind == TrackKind::Video && ui.button(if colored { "Remove color" } else { "Add color" }).on_hover_text("Exposure, contrast, saturation and temperature of this clip").clicked();
+                if color {
                     if colored {
                         clip.remove_color();
                     } else {
@@ -881,14 +957,14 @@ impl Timeline {
 
         // A source dragged from the list: where it would go, and there it goes when let go.
         let dragged_source = |source: &SourceId| Some((*source, env.placeable.get(source)?));
-        self.ghost = response.dnd_hover_payload::<SourceId>().and_then(|source| dragged_source(&source)).and_then(|(_, (name, len))| {
+        self.ghost = response.dnd_hover_payload::<SourceId>().and_then(|source| dragged_source(&source)).and_then(|(_, (name, len, picture))| {
             // While a source is dragged, the timeline is not the hovered widget: the pointer says where it is.
-            let (place, start) = drop_place(&layout, view, sequence, pointer.filter(|p| rect.contains(*p))?, *len, frame);
+            let (place, start) = drop_place(&layout, view, sequence, pointer.filter(|p| rect.contains(*p))?, *len, frame, *picture);
             Some(Ghost { place, span: Span { start, end: start + len }, name: name.clone() })
         });
-        if let Some((source, (name, len))) = response.dnd_release_payload::<SourceId>().and_then(|source| dragged_source(&source)) {
+        if let Some((source, (name, len, picture))) = response.dnd_release_payload::<SourceId>().and_then(|source| dragged_source(&source)) {
             if let Some(p) = pointer {
-                let (place, start) = drop_place(&layout, view, sequence, p, *len, frame);
+                let (place, start) = drop_place(&layout, view, sequence, p, *len, frame, *picture);
                 let clip = Clip { start, ..Clip::of(source, name.clone(), *len) };
                 if let Some(id) = put(sequence, place, clip) {
                     *selected = Some(id);
@@ -899,7 +975,12 @@ impl Timeline {
         }
         if let (Some(Drag::ClipMove(id)), Some((above, start))) = (self.drag, self.new_row) {
             let clip = sequence.clip(id);
-            self.ghost = Some(Ghost { place: Place::Above(above), span: Span { start, end: start + clip.span().len() }, name: clip.name.clone() });
+            let place = Place::Above(above, sequence.tracks[id.track].kind);
+            self.ghost = Some(Ghost { place, span: Span { start, end: start + clip.span().len() }, name: clip.name.clone() });
+        }
+        // Waiting for a clip to chain to: the pointer says so over the clips.
+        if self.chaining.is_some() && hovered.and_then(Drag::clip).is_some() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
 
         out.peek = match self.drag {
@@ -936,21 +1017,32 @@ impl Timeline {
         let mut changed = false;
         let mut action = None;
 
-        // Over the headers: a new empty track under all the others, above or under the selected clip's.
+        // Over the headers: a new empty video track under all the others, one of the selected clip's
+        // kind above or under its track, and a new audio track under all the others.
         let area = Rect::from_x_y_ranges(layout.rect.left() + 8.0..=layout.body.left() - 8.0, layout.ruler.y_range());
         let mut buttons = ui.new_child(egui::UiBuilder::new().max_rect(area).layout(egui::Layout::left_to_right(egui::Align::Center)));
         buttons.spacing_mut().item_spacing.x = 4.0;
-        if add_track_button(&mut buttons, None, true).on_hover_text("Add an empty track under all the others").clicked() {
-            action = Some(TrackAction::Add(0));
+        if add_track_button(&mut buttons, None, true).on_hover_text("Add an empty video track under all the others").clicked() {
+            action = Some(TrackAction::Add(0, TrackKind::Video));
         }
-        let near = selected.map(|id| id.track);
+        let near = selected.filter(|id| id.track < count).map(|id| (id.track, sequence.tracks[id.track].kind));
         let above = add_track_button(&mut buttons, Some(true), near.is_some());
-        if above.on_hover_text("Add an empty track above the selected clip's track").on_disabled_hover_text("Select a clip first").clicked() {
-            action = near.map(|track| TrackAction::Add(track + 1));
+        let tip = "Add an empty track of the selected clip's kind above its track";
+        if above.on_hover_text(tip).on_disabled_hover_text("Select a clip first").clicked() {
+            action = near.map(|(track, kind)| TrackAction::Add(track + 1, kind));
         }
         let below = add_track_button(&mut buttons, Some(false), near.is_some());
-        if below.on_hover_text("Add an empty track under the selected clip's track").on_disabled_hover_text("Select a clip first").clicked() {
-            action = near.map(TrackAction::Add);
+        let tip = "Add an empty track of the selected clip's kind under its track";
+        if below.on_hover_text(tip).on_disabled_hover_text("Select a clip first").clicked() {
+            action = near.map(|(track, kind)| TrackAction::Add(track, kind));
+        }
+        let audio = buttons.add(egui::Button::new(RichText::new("+ Audio").small()).min_size(vec2(0.0, 20.0)));
+        if audio.on_hover_text("Add an empty audio track under all the others: for music, or sound taken off a video").clicked() {
+            action = Some(TrackAction::Add(0, TrackKind::Audio));
+        }
+        if self.chaining.is_some() {
+            let hint = "Click the clip to chain this one to. Esc gives up";
+            ui.painter().text(pos2(layout.body.left() + 8.0, layout.rect.top() + 4.0), Align2::LEFT_TOP, hint, FontId::proportional(12.0), LINK_COLOR);
         }
 
         let mut fold = None;
@@ -959,8 +1051,8 @@ impl Timeline {
             if visible.height() <= 0.0 {
                 continue;
             }
-            // The controls stand by the picture lane; the other lanes have their names under them.
-            let picture = row.lane(Lane::Picture).unwrap_or(row.body);
+            // The controls stand by the first lane; the other lanes have their names under them.
+            let picture = row.lanes.first().map_or(row.body, |(_, lane)| *lane);
             let area = Rect::from_x_y_ranges(row.header.x_range(), picture.y_range()).shrink2(vec2(8.0, 0.0));
             let id = sequence.tracks[row.track].id;
             let expanded = self.expanded.contains(&id);
@@ -980,14 +1072,21 @@ impl Timeline {
                 vec![pos2(c.x - 2.5, c.y - 4.5), pos2(c.x + 3.5, c.y), pos2(c.x - 2.5, c.y + 4.5)]
             };
             header.painter().add(Shape::convex_polygon(points, color, Stroke::NONE));
-            let hint = if expanded { "Fold: only the picture" } else { "Unfold: the effects and the sound of the clips" };
+            let kind = track.kind;
+            let hint = match (kind, expanded) {
+                (TrackKind::Video, true) => "Fold: only the picture",
+                (TrackKind::Video, false) => "Unfold: the effects and the sound of the clips",
+                (TrackKind::Audio, true) => "Fold: only the sound",
+                (TrackKind::Audio, false) => "Unfold: the effects of the clips",
+            };
             if folding.on_hover_text(hint).clicked() {
                 fold = Some(id);
             }
             // Numbered from the top, as they are seen. Dragged up or down by its dots or its name, the
             // row moves.
             let (grip_rect, grip) = header.allocate_exact_size(ROW_GRIP_SIZE.into(), Sense::drag());
-            let name = header.add(egui::Label::new(RichText::new(format!("Track {}", count - row.track)).small()).sense(Sense::drag()));
+            let name = header.add(egui::Label::new(RichText::new(track_name(sequence, row.track)).small()).sense(Sense::drag()));
+            let track = &mut sequence.tracks[row.track];
             let handle = grip.union(name);
             if handle.drag_started() {
                 self.row_drag = Some(id);
@@ -999,10 +1098,13 @@ impl Timeline {
             let dots = if handle.hovered() || held { header.visuals().strong_text_color() } else { header.visuals().weak_text_color() };
             grip_dots(header.painter(), grip_rect.center(), 3, 2, dots);
             handle.on_hover_text("Drag up or down to put the track elsewhere");
-            let hide = header.add(egui::Button::new(RichText::new("Hide").small()).selected(track.hidden));
-            if hide.on_hover_text("Leave this track's picture out: what is under it shows").clicked() {
-                track.hidden = !track.hidden;
-                changed = true;
+            // Sound has no picture to hide.
+            if kind == TrackKind::Video {
+                let hide = header.add(egui::Button::new(RichText::new("Hide").small()).selected(track.hidden));
+                if hide.on_hover_text("Leave this track's picture out: what is under it shows").clicked() {
+                    track.hidden = !track.hidden;
+                    changed = true;
+                }
             }
             let mute = header.add(egui::Button::new(RichText::new("Mute").small()).selected(track.muted));
             if mute.on_hover_text("Leave this track's sound out").clicked() {
@@ -1029,7 +1131,7 @@ impl Timeline {
             let painter = ui.painter_at(visible);
             for (lane, rect) in &row.lanes {
                 let name = match lane {
-                    Lane::Picture => continue,
+                    Lane::Picture | Lane::Audio => continue,
                     Lane::Effects => "effects",
                     Lane::Sound => "sound",
                 };
@@ -1061,8 +1163,8 @@ impl Timeline {
         }
 
         match action {
-            Some(TrackAction::Add(index)) => {
-                let index = sequence.add_track(index);
+            Some(TrackAction::Add(index, kind)) => {
+                let index = sequence.add_track(index, kind);
                 if let Some(id) = selected.as_mut() {
                     id.track = after_insert(id.track, index);
                 }
@@ -1106,6 +1208,10 @@ impl Timeline {
         painter.hline(body.x_range(), layout.ruler.bottom(), separator);
         for row in &layout.rows {
             headers_painter.rect_filled(row.header, 0.0, visuals.faint_bg_color);
+            if sequence.tracks[row.track].kind == TrackKind::Audio {
+                headers_painter.rect_filled(row.header, 0.0, AUDIO_HEADER_TINT);
+                rows_painter.rect_filled(row.body, 0.0, AUDIO_HEADER_TINT.gamma_multiply(0.5));
+            }
             headers_painter.hline(layout.rect.x_range(), row.body.bottom(), separator);
         }
         if layout.rows.is_empty() {
@@ -1131,7 +1237,9 @@ impl Timeline {
             painter.text(pos2(x + 3.0, body.top() + 2.0), Align2::LEFT_TOP, label, FontId::monospace(10.0), tick_color);
         }
 
-        // Clips. The selected one shows where its source would go untrimmed, a frame and handles.
+        // Clips. The selected one shows where its source would go untrimmed, a frame and handles; the
+        // ones chained to it are outlined.
+        let partners: Vec<ClipId> = selected.filter(|&id| sequence.has(id)).map(|id| sequence.group_of(id)).unwrap_or_default();
         for (id, clip) in sequence.clips() {
             let Some(row) = layout.row(id.track) else { continue };
             let block = row.block(clip.span(), view);
@@ -1143,7 +1251,8 @@ impl Timeline {
                 rows_painter.rect_filled(ghost, 4.0, CLIP_COLOR.gamma_multiply(0.25));
                 rows_painter.rect_stroke(ghost, 4.0, Stroke::new(1.0, CLIP_COLOR.gamma_multiply(0.7)));
             }
-            let fill = if track.hidden { CLIP_COLOR.gamma_multiply(0.45) } else { CLIP_COLOR };
+            let color = if track.kind == TrackKind::Audio { AUDIO_CLIP_COLOR } else { CLIP_COLOR };
+            let fill = if track.hidden { color.gamma_multiply(0.45) } else { color };
             rows_painter.rect_filled(block, 4.0, fill);
             let inside = rows_painter.with_clip_rect(block.shrink(2.0).intersect(layout.rows_area).intersect(body));
             let text_x = block.left().max(body.left()) + if is_selected { HANDLE_WIDTH + 6.0 } else { 6.0 };
@@ -1153,6 +1262,9 @@ impl Timeline {
                 match lane {
                     Lane::Picture => {
                         let mut text = format!("{}  ·  {}", clip.name, timecode::format(clip.span().len()));
+                        if clip.sound_detached {
+                            text += "  ·  sound detached";
+                        }
                         if missing {
                             text += "  ·  file missing";
                         }
@@ -1170,6 +1282,25 @@ impl Timeline {
                             inside.rect_filled(rect, 4.0, CHIP_COLOR);
                             inside.text(rect.center(), Align2::CENTER_CENTER, chip.text, FontId::proportional(11.0), Color32::WHITE);
                         }
+                    }
+                    // A sound clip: its sound, with its name over it.
+                    Lane::Audio => {
+                        let muted = clip.muted || track.muted;
+                        if let Some(SourceSound::Graph(graph)) = env.sounds.get(&clip.source) {
+                            if let Some(peaks) = graph.get() {
+                                paint_sound(&inside, area.intersect(body), clip, view, peaks, muted);
+                            }
+                        }
+                        let mut text = format!("{}  ·  {}", clip.name, timecode::format(clip.span().len()));
+                        if missing {
+                            text += "  ·  file missing";
+                        }
+                        let color = if missing { MISSING_COLOR } else { Color32::from_white_alpha(230) };
+                        inside.text(pos2(text_x, area.top() + 3.0), Align2::LEFT_TOP, text, FontId::proportional(11.0), color);
+                    }
+                    Lane::Sound if clip.sound_detached => {
+                        inside.rect_filled(area, 0.0, LANE_SHADE);
+                        inside.text(pos2(text_x, area.center().y), Align2::LEFT_CENTER, "sound detached: a clip of its own", FontId::proportional(11.0), weak);
                     }
                     Lane::Sound => {
                         inside.rect_filled(area, 0.0, LANE_SHADE);
@@ -1219,6 +1350,20 @@ impl Timeline {
             if missing {
                 rows_painter.rect_stroke(block.shrink(1.0), 4.0, Stroke::new(2.0, MISSING_COLOR));
             }
+            // Chained to others: a link at its top right; outlined when it goes with the selected one.
+            if sequence.is_chained(id) {
+                let right = block.right() - if is_selected { HANDLE_WIDTH + 6.0 } else { 6.0 };
+                let at = pos2(right - 8.0, block.top() + 8.0);
+                if block.width() > 40.0 {
+                    paint_link(&inside, at, LINK_COLOR);
+                }
+                if !is_selected && partners.contains(&id) {
+                    rows_painter.rect_stroke(block, 4.0, Stroke::new(1.5, LINK_COLOR.gamma_multiply(0.8)));
+                }
+            }
+            if self.chaining == Some(id) {
+                rows_painter.rect_stroke(block.expand(1.0), 4.0, Stroke::new(2.0, LINK_COLOR));
+            }
             if is_selected {
                 rows_painter.rect_stroke(block, 4.0, Stroke::new(2.0, HANDLE_COLOR));
                 let left = Rect::from_x_y_ranges(block.left()..=block.left() + HANDLE_WIDTH, block.y_range());
@@ -1250,8 +1395,9 @@ impl Timeline {
             }
         }
 
-        // Where the export range shows no clip, the file will be black: the bottom row says so.
-        if let Some(bottom) = layout.row(0) {
+        // Where the export range shows no clip, the file will be black: the bottom video row says so.
+        let bottom_video = sequence.tracks.iter().position(|track| track.kind == TrackKind::Video);
+        if let Some(bottom) = bottom_video.and_then(|track| layout.row(track)) {
             for gap in sequence.gaps() {
                 let (from, to) = (view.x(gap.start).max(body.left()), view.x(gap.end).min(body.right()));
                 if to - from >= GAP_LABEL_WIDTH {
@@ -1313,19 +1459,22 @@ impl Timeline {
         // Where a dragged source would go: into a row, or a new row under the others.
         if let Some(ghost) = &self.ghost {
             let x = view.x(ghost.span.start)..=view.x(ghost.span.end);
-            let new_track = Some(format!("{}  ·  new track", ghost.name));
+            let new_track = |kind| {
+                let what = if kind == TrackKind::Audio { "new audio track" } else { "new track" };
+                Some(format!("{}  ·  {what}", ghost.name))
+            };
             let (block, label) = match ghost.place {
                 // The dragged name is at the pointer already.
                 Place::Into(track) => (layout.row(track).map_or(Rect::NOTHING, |row| row.block(ghost.span, view)), None),
                 // Across the border between that row and the one above it.
-                Place::Above(track) => {
+                Place::Above(track, kind) => {
                     let top = layout.row(track).map_or(layout.rows_area.top(), |row| row.body.top());
                     let band = (top - PICTURE_LANE_HEIGHT / 4.0).max(layout.rows_area.top())..=top + PICTURE_LANE_HEIGHT / 4.0;
-                    (Rect::from_x_y_ranges(x, band), new_track)
+                    (Rect::from_x_y_ranges(x, band), new_track(kind))
                 }
-                Place::Bottom => {
+                Place::Bottom(kind) => {
                     let bottom = layout.rows_area.bottom();
-                    (Rect::from_x_y_ranges(x, bottom - PICTURE_LANE_HEIGHT / 2.0..=bottom - 2.0), new_track)
+                    (Rect::from_x_y_ranges(x, bottom - PICTURE_LANE_HEIGHT / 2.0..=bottom - 2.0), new_track(kind))
                 }
             };
             rows_painter.rect_filled(block, 4.0, HANDLE_COLOR.gamma_multiply(0.35));
@@ -1439,13 +1588,21 @@ fn paint_sound(painter: &egui::Painter, area: Rect, clip: &Clip, view: View, pea
 
 /// Where a source `len` seconds long dropped at `p` goes: its start at the pointer, on the frame
 /// grid. In the row under the pointer if there is room for it around its middle, pulled in to fit;
-/// on a new row right above that one if not; under all the rows when it is not over one.
-fn drop_place(layout: &Layout, view: View, sequence: &Sequence, p: Pos2, len: f64, frame: f64) -> (Place, f64) {
+/// on a new row right above that one if not; under all the rows when it is not over one. A source
+/// with a `picture` goes onto an audio row too, as its sound; one of sound only never onto a video
+/// row, but onto a new audio row above it.
+#[allow(clippy::too_many_arguments)]
+fn drop_place(layout: &Layout, view: View, sequence: &Sequence, p: Pos2, len: f64, frame: f64, picture: bool) -> (Place, f64) {
     let start = (view.t(p.x) / frame).round() * frame;
-    let Some(row) = layout.row_at(p.y) else { return (Place::Bottom, start) };
+    let own = if picture { TrackKind::Video } else { TrackKind::Audio };
+    let Some(row) = layout.row_at(p.y) else { return (Place::Bottom(own), start) };
+    let kind = sequence.tracks[row.track].kind;
+    if kind == TrackKind::Video && !picture {
+        return (Place::Above(row.track, TrackKind::Audio), start);
+    }
     match sequence.tracks[row.track].gap_at(start + len / 2.0).filter(|gap| gap.len() + 1e-6 >= len) {
         Some(gap) => (Place::Into(row.track), start.max(gap.start).min(gap.end - len)),
-        None => (Place::Above(row.track), start),
+        None => (Place::Above(row.track, kind), start),
     }
 }
 
@@ -1453,11 +1610,23 @@ fn drop_place(layout: &Layout, view: View, sequence: &Sequence, p: Pos2, len: f6
 fn put(sequence: &mut Sequence, place: Place, clip: Clip) -> Option<ClipId> {
     match place {
         Place::Into(track) => sequence.place_clip(Some(track), clip),
-        Place::Above(track) => {
-            let track = sequence.add_track(track + 1);
+        Place::Above(track, kind) => {
+            let track = sequence.add_track(track + 1, kind);
             sequence.place_clip(Some(track), clip)
         }
-        Place::Bottom => sequence.place_clip(None, clip),
+        Place::Bottom(kind) => {
+            let track = sequence.add_track(0, kind);
+            sequence.place_clip(Some(track), clip)
+        }
+    }
+}
+
+/// The mark of a clip chained to others: two links of a chain, drawn around `center`.
+fn paint_link(painter: &egui::Painter, center: Pos2, color: Color32) {
+    let stroke = Stroke::new(1.5, color);
+    for dx in [-2.5, 2.5] {
+        let link = Rect::from_center_size(pos2(center.x + dx, center.y), vec2(8.0, 5.0));
+        painter.rect_stroke(link, 2.5, stroke);
     }
 }
 
@@ -1625,11 +1794,15 @@ fn edit(sequence: &mut Sequence, drag: Drag, t: f64, playhead: f64, snap_range: 
 /// being dragged and what moves along with it.
 fn snap_targets(sequence: &Sequence, drag: Drag, playhead: f64) -> Vec<f64> {
     let mut targets = vec![playhead];
-    for (id, clip) in sequence.clips() {
-        if drag != Drag::ClipStart(id) && drag != Drag::ClipMove(id) {
+    let moving: Vec<ClipId> = match drag {
+        Drag::ClipMove(id) => sequence.group_of(id),
+        _ => Vec::new(),
+    };
+    for (id, clip) in sequence.clips().filter(|(id, _)| !moving.contains(id)) {
+        if drag != Drag::ClipStart(id) {
             targets.push(clip.start);
         }
-        if drag != Drag::ClipEnd(id) && drag != Drag::ClipMove(id) {
+        if drag != Drag::ClipEnd(id) {
             targets.push(clip.end());
         }
     }
@@ -1810,7 +1983,7 @@ mod tests {
     fn rows_go_from_the_top_track_down_and_scroll() {
         let mut sequence = Sequence::new(Clip::new("a".into(), 10.0));
         for _ in 0..5 {
-            sequence.add_below(Clip::new("b".into(), 1.0));
+            sequence.add_below(Clip::new("b".into(), 1.0), TrackKind::Video);
         }
         let folded = BTreeSet::new();
         assert_eq!(Layout::rows_height(&sequence, &folded), 6.0 * PICTURE_LANE_HEIGHT);
@@ -1852,7 +2025,7 @@ mod tests {
         let mut sequence = Sequence::new(Clip { start: 30.0, source_out: 5.0, ..Clip::new("a".into(), 60.0) });
         sequence.tracks[0].clips.push(Clip { start: 50.0, source_out: 10.0, ..Clip::new("b".into(), 60.0) });
         let layout = layout(&sequence, 102.0);
-        let at = |x: f32, len: f64| drop_place(&layout, view(), &sequence, pos2(x, 80.0), len, 0.04);
+        let at = |x: f32, len: f64| drop_place(&layout, view(), &sequence, pos2(x, 80.0), len, 0.04, true);
         // Into the gap of 15 s between them, pulled in to fit.
         let (place, start) = at(510.0, 8.0);
         assert_eq!(place, Place::Into(0));
@@ -1861,17 +2034,20 @@ mod tests {
         assert_eq!(place, Place::Into(0));
         assert!((start - 42.0).abs() < 1e-9, "{start}");
         // Too long for the gap, or over a clip: a new row right above, where it was dropped.
-        assert_eq!(at(510.0, 20.0).0, Place::Above(0));
+        assert_eq!(at(510.0, 20.0).0, Place::Above(0, TrackKind::Video));
         let (place, start) = at(420.0, 2.0);
-        assert_eq!(place, Place::Above(0));
+        assert_eq!(place, Place::Above(0, TrackKind::Video));
         assert!((start - 32.0).abs() < 1e-9, "{start}");
         // Not over a row, on the ruler: a new row under the others.
-        assert_eq!(drop_place(&layout, view(), &sequence, pos2(510.0, 40.0), 2.0, 0.04).0, Place::Bottom);
+        assert_eq!(drop_place(&layout, view(), &sequence, pos2(510.0, 40.0), 2.0, 0.04, true).0, Place::Bottom(TrackKind::Video));
+        // Sound only, over a video row: onto a new audio row above it, even where there is room.
+        assert_eq!(drop_place(&layout, view(), &sequence, pos2(550.0, 80.0), 8.0, 0.04, false).0, Place::Above(0, TrackKind::Audio));
+        assert_eq!(drop_place(&layout, view(), &sequence, pos2(510.0, 40.0), 2.0, 0.04, false).0, Place::Bottom(TrackKind::Audio));
 
         // Put there: above means between that row and the one over it.
         let mut sequence = sequence.clone();
-        sequence.add_below(Clip::new("c".into(), 1.0));
-        let id = put(&mut sequence, Place::Above(0), Clip { start: 32.0, ..Clip::of(1, "d".into(), 2.0) }).unwrap();
+        sequence.add_below(Clip::new("c".into(), 1.0), TrackKind::Video);
+        let id = put(&mut sequence, Place::Above(0, TrackKind::Video), Clip { start: 32.0, ..Clip::of(1, "d".into(), 2.0) }).unwrap();
         assert_eq!(id, ClipId { track: 1, index: 0 });
         assert_eq!(sequence.tracks.iter().map(|track| track.clips.len()).collect::<Vec<_>>(), [1, 1, 2]);
     }

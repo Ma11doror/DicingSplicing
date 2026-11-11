@@ -135,7 +135,7 @@ fn heard<'a>(sequence: &'a Sequence, files: &SourceFiles) -> Vec<(&'a Clip, Span
     let export = sequence.export;
     sequence
         .clips()
-        .filter(|(id, clip)| !sequence.tracks[id.track].muted && clip.gain() > 0.0)
+        .filter(|(id, _)| sequence.sounds(*id))
         .filter(|(_, clip)| files.get(&clip.source).is_none_or(|file| file.info.has_audio))
         .filter_map(|(_, clip)| {
             let span = clip.span();
@@ -1451,6 +1451,53 @@ mod tests {
         assert!(loud - quiet > 20.0, "as they are: {quiet:.1} and {loud:.1} dB");
         let (quiet, loud) = (level(0.02, true), level(0.5, true));
         assert!((loud - quiet).abs() < 2.0, "even: {quiet:.1} and {loud:.1} dB");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Sound taken off its picture and moved is heard where it was moved to; the picture is still
+    /// seen, and no longer heard. A file of sound only on an audio track is heard, and never seen.
+    #[test]
+    fn detached_sound_and_sound_files_are_heard_where_they_are() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let dir = temp_dir("detached");
+        let gray = make_solid(&dir, "gray.mp4", "0x808080", 25, (320, 180), Some(440));
+        let tone = dir.join("tone.m4a");
+        ffmpeg(&["-f", "lavfi", "-i", "sine=frequency=880:duration=10", "-c:a", "aac", tone.to_str().unwrap()]);
+        let files: SourceFiles = [(0, &gray), (1, &tone)]
+            .into_iter()
+            .map(|(id, path)| (id, SourceFile { path: path.clone(), info: probe::probe(path).unwrap() }))
+            .collect();
+        assert!(!files[&1].info.has_video());
+
+        // Gray 0..4 s; its sound detached and moved to 2..6 s. The export range is 0..6 s.
+        let mut s = Sequence::new(Clip { source_out: 4.0, ..Clip::of(0, "gray".into(), 10.0) });
+        let (picture, sound) = s.detach_sound(ClipId { track: 0, index: 0 }).unwrap();
+        s.unchain(sound);
+        s.move_clip(sound, 2.0);
+        s.export = Span { start: 0.0, end: 6.0 };
+        s.output = Output { preset: PresetId::Landscape, ..Output::default() };
+        s.settings.size = OutputSize::LongSide(320);
+        s.settings.speed = Speed::Ultrafast;
+        s.settings.fades = (0.0, 0.0);
+        s.settings.frame_rate = FrameRate::Fixed(25.0);
+        assert_eq!(s.clip(picture).span(), Span { start: 0.0, end: 4.0 });
+        let path = render_all(&files, &s, &dir.join("moved.mp4"));
+        let rms = |from: f64, to: f64| sound_level(&path, from, to);
+        assert!(rms(0.3, 1.7) < 5.0, "the picture's own place is silent: {}", rms(0.3, 1.7));
+        assert!(rms(2.3, 3.7) > 100.0 && rms(4.3, 5.7) > 100.0, "{} {}", rms(2.3, 3.7), rms(4.3, 5.7));
+        assert!((mean_level(&rgb_at(&path, 1.0, 320, 180)) - 128.0).abs() < 20.0, "the picture is seen");
+
+        // The sound file on an audio track at 1..2 s, the moved sound gone: heard there, and the
+        // picture stays as it was.
+        s.remove_clip(sound);
+        let track = s.add_track(0, crate::core::edit::TrackKind::Audio);
+        s.place_clip(Some(track), Clip { start: 1.0, source_out: 1.0, ..Clip::of(1, "tone".into(), 10.0) });
+        let path = render_all(&files, &s, &dir.join("file.mp4"));
+        let rms = |from: f64, to: f64| sound_level(&path, from, to);
+        assert!(rms(1.2, 1.8) > 100.0 && rms(2.5, 3.5) < 5.0, "{} {}", rms(1.2, 1.8), rms(2.5, 3.5));
+        assert!((mean_level(&rgb_at(&path, 1.5, 320, 180)) - 128.0).abs() < 20.0, "sound only is never seen");
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -16,6 +16,7 @@ use egui::{pos2, vec2, Color32, Painter, Pos2, Rect, Response, Sense, Shape, Str
 use std::path::PathBuf;
 
 pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "mov", "webm", "avi", "m4v"];
+pub const SOUND_EXTENSIONS: &[&str] = &["mp3", "wav", "m4a", "aac", "flac", "ogg", "opus"];
 
 /// How dots of a grip are apart, and how big they are.
 const GRIP_STEP: f32 = 4.0;
@@ -76,6 +77,18 @@ pub fn pick_video() -> Option<PathBuf> {
     rfd::FileDialog::new()
         .set_title("Choose a video")
         .add_filter("Video", VIDEO_EXTENSIONS)
+        .add_filter("All files", &["*"])
+        .pick_file()
+}
+
+/// Asks for a file a source can be: a video, or sound only.
+pub fn pick_media() -> Option<PathBuf> {
+    let both: Vec<&str> = VIDEO_EXTENSIONS.iter().chain(SOUND_EXTENSIONS).copied().collect();
+    rfd::FileDialog::new()
+        .set_title("Choose a video or a sound file")
+        .add_filter("Video and sound", &both)
+        .add_filter("Video", VIDEO_EXTENSIONS)
+        .add_filter("Sound", SOUND_EXTENSIONS)
         .add_filter("All files", &["*"])
         .pick_file()
 }

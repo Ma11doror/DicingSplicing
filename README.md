@@ -31,6 +31,16 @@ yt-dlp come along in the same folder.
   everything.
 - Unfold a track to see each clip's effects and the graph of its sound.
 
+**Sound**
+
+- Audio tracks between the video tracks, in any order: lower than video tracks and of another
+  shade, so that sound stays next to its picture.
+- Detach the sound of a clip: it becomes a clip of its own on an audio track under it, to move,
+  cut, trim and fade on its own. The two stay chained: moved in time, they go together.
+- Chain any clips to each other, or unchain them, from the clip's menu: cut a piece out of the
+  sound or the picture, delete it, and chain what is left to other clips.
+- Music and other sound files (MP3, WAV, M4A, FLAC, OGG, Opus) as sources, on audio tracks.
+
 **Framing for the platform**
 
 ![The Telegram circle frame: the circle on the source, and the circle that will be sent](docs/screenshots/circle.png)
@@ -65,9 +75,11 @@ yt-dlp come along in the same folder.
 1. On the start screen, **New project from a video…**, or drop a video on the window.
 2. Open **Frames** at the top left and pick the main frame, such as *Telegram circle*. Move and
    resize the frame on the picture.
-3. More videos: **Sources**, then **Add video…** or **Download from a link…**. Drag a source onto the timeline.
+3. More videos or music: **Sources**, then **Add video or sound…** or **Download from a link…**. Drag a
+   source onto the timeline; onto an audio track it goes as its sound only.
 4. Pick a clip to change it in the **Clip** panel on the right: timing, framing, volume, effects.
-   Right click a clip for its menu: fades, color, cut, duplicate, delete.
+   Right click a clip for its menu: detach its sound, chain it to another clip, fades, color, cut,
+   duplicate, delete.
 5. Set the part to export with **I** and **O**, or **Fit to clips**.
 6. **Export** tab: choose a preset, then **Export**.
 
@@ -101,7 +113,7 @@ Press **F1** in the editor for the list of keys.
 | Where | What it does |
 |---|---|
 | Click on the ruler | Takes the playhead there |
-| Drag a clip | Moves it, also onto another track |
+| Drag a clip | Moves it, also onto another track of its kind; chained clips go along |
 | Drag an edge of the selected clip | Trims it |
 | Drag the dots on the top edge of the selected clip | Changes the length of its fade |
 | Right click on a clip | Its menu |

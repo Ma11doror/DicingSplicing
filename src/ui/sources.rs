@@ -59,7 +59,8 @@ pub fn sources_button(ui: &mut egui::Ui, rows: &[SourceRow], plugins: &[Plugin],
             }
         });
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Add video…").on_hover_text("A file from the disk. It is not copied: the project links to it").clicked() {
+            let add = ui.button("Add video or sound…").on_hover_text("A file from the disk: a video, or sound only, such as music. It is not copied: the project links to it");
+            if add.clicked() {
                 action = Some(SourceAction::AddVideo);
             }
             for (i, plugin) in plugins.iter().enumerate().filter(|(_, plugin)| plugin.kind == PluginKind::Source) {
@@ -122,7 +123,11 @@ fn source_text(ui: &mut egui::Ui, row: &SourceRow, draggable: bool) {
                     1 => "on the timeline".to_owned(),
                     n => format!("on the timeline {n} times"),
                 };
-                let details = format!("{} · {}×{} · {sound} · {placed}", timecode::format(info.duration), info.width, info.height);
+                let details = if info.has_video() {
+                    format!("{} · {}×{} · {sound} · {placed}", timecode::format(info.duration), info.width, info.height)
+                } else {
+                    format!("{} · sound only · {placed}", timecode::format(info.duration))
+                };
                 ui.label(RichText::new(details).weak().small());
             }
             match &row.state {
@@ -133,7 +138,8 @@ fn source_text(ui: &mut egui::Ui, row: &SourceRow, draggable: bool) {
                     ui.label(RichText::new("Its frames wait for another video's").weak().small());
                 }
                 SourceState::Preparing(progress) => {
-                    let text = format!("Preparing frames {:.0}%", progress * 100.0);
+                    let sound_only = row.info.is_some_and(|info| !info.has_video());
+                    let text = if sound_only { "Reading the sound".to_owned() } else { format!("Preparing frames {:.0}%", progress * 100.0) };
                     ui.add(egui::ProgressBar::new(*progress).desired_width(LIST_WIDTH - 190.0).text(text));
                 }
                 SourceState::Ready => {}

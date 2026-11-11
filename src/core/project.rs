@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 pub const PROJECT_FILE: &str = "project.json";
 pub const RENDERS_FOLDER: &str = "renders";
 /// 2: several tracks, each with an id of its own. 3: effects on clips. 4: curves of fades. 5: colour.
-/// An editor that knows less can't open such a file, and so can't lose what it does not know by
-/// saving it.
-pub const VERSION: u32 = 5;
+/// 6: audio tracks, detached sound and chained clips. An editor that knows less can't open such a
+/// file, and so can't lose what it does not know by saving it.
+pub const VERSION: u32 = 6;
 
 /// A video the project uses. It is not copied: the project remembers where it is.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -13,6 +13,9 @@ The first release.
 - Move clips along and between tracks, trim them, cut them with the Blade or at the playhead,
   duplicate, copy and paste, delete with or without closing the gap. Undo and redo.
 - Unfolded tracks show each clip's effects and the graph of its sound.
+- Audio tracks, in any order among the video tracks. The sound of a clip can be detached into a
+  clip of its own; clips can be chained to each other and move together.
+- Music and other sound files as sources.
 - The timeline and the side panels can be resized; tracks scroll a little past their ends and
   spring back.
 
@@ -46,4 +49,4 @@ The first release.
 - Tested on Windows 11 only.
 - The program is not signed: Windows asks to confirm the first start.
 - Sending to Telegram needs your own bot and a `credentials.json` written by hand.
-- Sound can't yet be separated from its video, and sound files can't yet be added: that is next.
+- The editor plays the sound as it is: even loudness is heard only in the exported file.

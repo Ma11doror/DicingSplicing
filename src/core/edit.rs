@@ -8,7 +8,7 @@ use crate::core::export::ExportSettings;
 use crate::core::preset::Output;
 use crate::media::geometry::Transform;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Closer than this, two times are the same one: a saved file may not bring back the last digit.
 const SAME_TIME: f64 = 1e-6;
@@ -241,7 +241,17 @@ pub struct Clip {
     /// What is done to it, in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effects: Vec<Effect>,
+    /// Its sound was made a clip of its own, on an audio track: this one is only seen.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sound_detached: bool,
+    /// Clips with the same link are chained to each other: moved in time, they go together. A clip
+    /// and the sound detached from it are, until one of them is unchained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<LinkId>,
 }
+
+/// What chained clips have in common.
+pub type LinkId = u32;
 
 fn full_volume() -> f64 {
     1.0
@@ -266,6 +276,8 @@ impl Clip {
             volume: full_volume(),
             muted: false,
             effects: Vec::new(),
+            sound_detached: false,
+            link: None,
         }
     }
 
@@ -450,11 +462,29 @@ impl Clip {
 /// Which track something is about. Unlike its place among the tracks, this does not change.
 pub type TrackId = u32;
 
-/// A layer of the picture. Its clips are sorted by start and do not overlap.
+/// What a track carries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrackKind {
+    /// The picture of its clips, and their sound unless it was detached.
+    #[default]
+    Video,
+    /// Only the sound of its clips.
+    Audio,
+}
+
+impl TrackKind {
+    fn is_video(&self) -> bool {
+        *self == TrackKind::Video
+    }
+}
+
+/// A layer of the picture, or of sound only. Its clips are sorted by start and do not overlap.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Track {
     #[serde(default)]
     pub id: TrackId,
+    #[serde(default, skip_serializing_if = "TrackKind::is_video")]
+    pub kind: TrackKind,
     /// Its picture is left out: what is under it shows.
     #[serde(default, skip_serializing_if = "is_false")]
     pub hidden: bool,
@@ -485,7 +515,9 @@ impl Track {
         self.clips[index].trim_end(t, hi, min_len);
     }
 
-    /// Puts a clip's start at `t`, between its neighbours. What it plays does not change.
+    /// Puts a clip's start at `t`, between its neighbours. What it plays does not change. The
+    /// sequence moves clips with what is chained to them: see `Sequence::move_clip`.
+    #[cfg(test)]
     pub fn move_clip(&mut self, index: usize, t: f64) {
         let len = self.clips[index].span().len();
         self.clips[index].start = clamp(t, self.free_before(index), self.free_after(index) - len);
@@ -564,25 +596,38 @@ impl Sequence {
         self.tracks.get(id.track).is_some_and(|track| id.index < track.clips.len())
     }
 
-    /// The clip whose picture is seen at `t`: the topmost one on a track that is not hidden. It covers
-    /// the whole frame, bars included, so nothing under it shows.
+    /// The clip whose picture is seen at `t`: the topmost one on a video track that is not hidden. It
+    /// covers the whole frame, bars included, so nothing under it shows.
     pub fn shown_at(&self, t: f64) -> Option<ClipId> {
-        let mut visible = self.tracks.iter().enumerate().rev().filter(|(_, track)| !track.hidden);
+        let mut visible = self.tracks.iter().enumerate().rev().filter(|(_, track)| track.kind == TrackKind::Video && !track.hidden);
         visible.find_map(|(track, clips)| Some(ClipId { track, index: clips.clip_at(t)? }))
     }
 
     /// The clip seen at `t` under the tracks from `track` up: what a clip on `track` shows through
     /// while it fades.
     pub fn shown_under(&self, t: f64, track: usize) -> Option<ClipId> {
-        let mut visible = self.tracks[..track.min(self.tracks.len())].iter().enumerate().rev().filter(|(_, track)| !track.hidden);
+        let below = self.tracks[..track.min(self.tracks.len())].iter().enumerate().rev();
+        let mut visible = below.filter(|(_, track)| track.kind == TrackKind::Video && !track.hidden);
         visible.find_map(|(track, clips)| Some(ClipId { track, index: clips.clip_at(t)? }))
+    }
+
+    /// Whether the sound of a clip is heard: on a track that is not muted, not muted itself, and on
+    /// an audio track, or on a video track if its sound was not detached.
+    pub fn sounds(&self, id: ClipId) -> bool {
+        let (track, clip) = (&self.tracks[id.track], self.clip(id));
+        !track.muted && clip.gain() > 0.0 && (track.kind == TrackKind::Audio || !clip.sound_detached)
+    }
+
+    /// The video tracks' clips: what can be seen.
+    fn seen_clips(&self) -> impl Iterator<Item = (ClipId, &Clip)> {
+        self.clips().filter(|(id, _)| self.tracks[id.track].kind == TrackKind::Video && !self.tracks[id.track].hidden)
     }
 
     /// What the picture is made of in `range`: pieces of it, each with the clip that is seen there.
     /// Pieces that follow each other with the same clip are one.
     pub fn picture(&self, range: Span) -> Vec<(Span, Option<ClipId>)> {
         let mut cuts = vec![range.start, range.end];
-        for (_, clip) in self.clips().filter(|(id, _)| !self.tracks[id.track].hidden) {
+        for (_, clip) in self.seen_clips() {
             cuts.extend([clip.start, clip.end()].into_iter().filter(|&t| t > range.start && t < range.end));
         }
         cuts.sort_by(f64::total_cmp);
@@ -648,11 +693,12 @@ impl Sequence {
         self.tracks.iter().map(|track| track.id + 1).max().unwrap_or(0)
     }
 
-    /// Puts a clip on a new track under all the others, right after the last clip: there nothing
-    /// covers it. An export range that fitted the clips, or had none to fit, takes it in.
-    pub fn add_below(&mut self, mut clip: Clip) -> ClipId {
+    /// Puts a clip on a new track of `kind` under all the others, right after the last clip: there
+    /// nothing covers it. An export range that fitted the clips, or had none to fit, takes it in.
+    pub fn add_below(&mut self, mut clip: Clip, kind: TrackKind) -> ClipId {
         clip.start = self.content().map_or(self.export.start, |content| content.end);
-        self.place_clip(None, clip).unwrap_or(ClipId { track: 0, index: 0 })
+        let track = self.add_track(0, kind);
+        self.place_clip(Some(track), clip).unwrap_or(ClipId { track, index: 0 })
     }
 
     /// Puts a clip on `track`, as near its start as the free time around its middle allows, or with
@@ -688,15 +734,17 @@ impl Sequence {
         gap.is_some_and(|gap| gap.start <= start + SAME_TIME && gap.end >= start + len - SAME_TIME)
     }
 
-    /// Puts `clip` at `t` exactly: on `track` if it is free there, else on a new track right above
-    /// it, or above all the others with no track given. Returns where it went.
-    pub fn paste(&mut self, mut clip: Clip, t: f64, track: Option<usize>) -> ClipId {
+    /// Puts `clip` at `t` exactly: on `track` if it is of `kind` and free there, else on a new track
+    /// of `kind` right above it, or above all the others with no track given. A copy is chained to
+    /// nothing. Returns where it went.
+    pub fn paste(&mut self, mut clip: Clip, t: f64, track: Option<usize>, kind: TrackKind) -> ClipId {
         clip.start = t;
+        clip.link = None;
         let len = clip.span().len();
         let target = match track {
-            Some(track) if self.free_on(track, t, len) => track,
-            Some(track) => self.add_track(track + 1),
-            None => self.add_track(self.tracks.len()),
+            Some(track) if self.tracks.get(track).is_some_and(|it| it.kind == kind) && self.free_on(track, t, len) => track,
+            Some(track) => self.add_track(track + 1, kind),
+            None => self.add_track(self.tracks.len(), kind),
         };
         self.place_clip(Some(target), clip).unwrap_or(ClipId { track: target, index: 0 })
     }
@@ -705,19 +753,31 @@ impl Sequence {
     pub fn duplicate(&mut self, id: ClipId) -> ClipId {
         let clip = self.clip(id).clone();
         let end = clip.end();
-        self.paste(clip, end, Some(id.track))
+        let kind = self.tracks[id.track].kind;
+        self.paste(clip, end, Some(id.track), kind)
     }
 
     /// Removes a clip, and moves the clips after it on its track back by its length: no gap is left
-    /// where it was. Other tracks stay as they are.
+    /// where it was. Each of them takes the clips chained to it along, while all of them have room;
+    /// the first that has none stays, and so do the ones after it. Other tracks stay as they are.
     pub fn ripple_delete(&mut self, id: ClipId) {
-        let span = self.clip(id).span();
+        let len = self.clip(id).span().len();
         let fitted = self.export_fits();
-        let track = &mut self.tracks[id.track];
-        track.clips.remove(id.index);
-        for clip in track.clips.iter_mut().filter(|clip| clip.start >= span.end - SAME_TIME) {
-            clip.start -= span.len();
+        self.tracks[id.track].clips.remove(id.index);
+        let mut moved: Vec<ClipId> = Vec::new();
+        for index in id.index..self.tracks[id.track].clips.len() {
+            let next = ClipId { track: id.track, index };
+            if moved.contains(&next) {
+                continue;
+            }
+            let group: Vec<ClipId> = self.group_of(next).into_iter().filter(|member| !moved.contains(member)).collect();
+            if self.room_for(&group, -len) > -len + SAME_TIME {
+                break;
+            }
+            self.shift(&group, -len);
+            moved.extend(group);
         }
+        self.tidy_links();
         if fitted {
             self.fit_export();
         }
@@ -727,6 +787,7 @@ impl Sequence {
     pub fn remove_clip(&mut self, id: ClipId) {
         let fitted = self.export_fits();
         self.tracks[id.track].clips.remove(id.index);
+        self.tidy_links();
         if fitted {
             self.fit_export();
         }
@@ -736,17 +797,143 @@ impl Sequence {
     pub fn remove_track(&mut self, track: usize) {
         let fitted = self.export_fits();
         self.tracks.remove(track);
+        self.tidy_links();
         if fitted {
             self.fit_export();
         }
     }
 
-    /// Puts an empty track at `index` among the tracks, 0 being the bottom one. Returns where it is.
-    pub fn add_track(&mut self, index: usize) -> usize {
+    /// Puts an empty track of `kind` at `index` among the tracks, 0 being the bottom one. Returns
+    /// where it is.
+    pub fn add_track(&mut self, index: usize, kind: TrackKind) -> usize {
         let index = index.min(self.tracks.len());
         let id = self.next_track_id();
-        self.tracks.insert(index, Track { id, ..Track::default() });
+        self.tracks.insert(index, Track { id, kind, ..Track::default() });
         index
+    }
+
+    /// The clips chained to `id`, itself among them.
+    pub fn group_of(&self, id: ClipId) -> Vec<ClipId> {
+        match self.clip(id).link {
+            Some(link) => self.clips().filter(|(_, clip)| clip.link == Some(link)).map(|(member, _)| member).collect(),
+            None => vec![id],
+        }
+    }
+
+    /// Whether a clip is chained to another one.
+    pub fn is_chained(&self, id: ClipId) -> bool {
+        self.group_of(id).len() > 1
+    }
+
+    /// How far, of `wanted` seconds, every clip of `group` can move in time: the clips that are not
+    /// in it stay where they are, and none may be passed.
+    fn room_for(&self, group: &[ClipId], wanted: f64) -> f64 {
+        let (mut lo, mut hi) = (f64::NEG_INFINITY, f64::INFINITY);
+        for &id in group {
+            let span = self.clip(id).span();
+            for (index, other) in self.tracks[id.track].clips.iter().enumerate() {
+                if group.contains(&ClipId { track: id.track, index }) {
+                    continue;
+                }
+                if other.end() <= span.start + SAME_TIME {
+                    lo = lo.max(other.end() - span.start);
+                } else if other.start >= span.end - SAME_TIME {
+                    hi = hi.min(other.start - span.end);
+                }
+            }
+        }
+        if lo > hi {
+            0.0
+        } else {
+            clamp(wanted, lo, hi)
+        }
+    }
+
+    /// Moves every clip of `group` by `delta` seconds. They keep their places among the others.
+    fn shift(&mut self, group: &[ClipId], delta: f64) {
+        for &id in group {
+            self.clip_mut(id).start += delta;
+        }
+    }
+
+    fn next_link(&self) -> LinkId {
+        self.clips().filter_map(|(_, clip)| clip.link).max().map_or(0, |link| link + 1)
+    }
+
+    /// A clip left alone in its group is chained to nothing.
+    fn tidy_links(&mut self) {
+        let mut counts: BTreeMap<LinkId, usize> = BTreeMap::new();
+        for link in self.clips().filter_map(|(_, clip)| clip.link) {
+            *counts.entry(link).or_default() += 1;
+        }
+        for clip in self.tracks.iter_mut().flat_map(|track| &mut track.clips) {
+            if clip.link.is_some_and(|link| counts[&link] < 2) {
+                clip.link = None;
+            }
+        }
+    }
+
+    /// Chains `id`, with whatever it is chained to, to `to` and whatever that is chained to.
+    pub fn chain(&mut self, id: ClipId, to: ClipId) {
+        if id == to {
+            return;
+        }
+        let link = match self.clip(to).link {
+            Some(link) => link,
+            None => {
+                let link = self.next_link();
+                self.clip_mut(to).link = Some(link);
+                link
+            }
+        };
+        for member in self.group_of(id) {
+            self.clip_mut(member).link = Some(link);
+        }
+    }
+
+    /// The clip is chained to nothing any more; the others of its group stay together.
+    pub fn unchain(&mut self, id: ClipId) {
+        self.clip_mut(id).link = None;
+        self.tidy_links();
+    }
+
+    /// Makes the sound of a clip on a video track a clip of its own, on an audio track right under
+    /// it: the one there if it is free at that time, else a new one. The two are chained. The sound's
+    /// part of the fades goes with the sound; the colour stays with the picture. Returns where the
+    /// picture and the sound are now, or None if the clip has no sound of its own to detach.
+    pub fn detach_sound(&mut self, id: ClipId) -> Option<(ClipId, ClipId)> {
+        if self.tracks[id.track].kind != TrackKind::Video || self.clip(id).sound_detached {
+            return None;
+        }
+        let link = self.clip(id).link.unwrap_or_else(|| self.next_link());
+        let picture = self.clip_mut(id);
+        picture.link = Some(link);
+        picture.sound_detached = true;
+        let mut sound = picture.clone();
+        sound.sound_detached = false;
+        sound.transform = Transform::default();
+        sound.effects = picture
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Fade(fade) if fade.sound => Some(Effect::Fade(Fade { picture: false, ..*fade })),
+                _ => None,
+            })
+            .collect();
+        picture.effects.retain(|effect| !matches!(effect, Effect::Fade(fade) if !fade.picture));
+        for effect in &mut picture.effects {
+            if let Effect::Fade(fade) = effect {
+                fade.sound = false;
+            }
+        }
+        let span = sound.span();
+        let below = id.track.checked_sub(1).filter(|&track| self.tracks[track].kind == TrackKind::Audio && self.free_on(track, span.start, span.len()));
+        let (track, picture) = match below {
+            Some(track) => (track, id),
+            None => (self.add_track(id.track, TrackKind::Audio), ClipId { track: id.track + 1, ..id }),
+        };
+        let index = self.tracks[track].insert(sound);
+        Some((picture, ClipId { track, index }))
     }
 
     /// Moves a track to `index`; the others keep their order.
@@ -768,10 +955,11 @@ impl Sequence {
         }
     }
 
-    /// Moves a clip to another track, its start as near `start` as the free time there allows: the
-    /// free time where the clip's middle would be. None if the clip does not fit into it.
+    /// Moves a clip to another track of the same kind, its start as near `start` as the free time
+    /// there allows: the free time where the clip's middle would be. The clips chained to it follow
+    /// it in time, on their own tracks. None if the clip does not fit there, or they can't follow.
     pub fn move_clip_to_track(&mut self, id: ClipId, track: usize, start: f64) -> Option<ClipId> {
-        if track == id.track || track >= self.tracks.len() {
+        if track == id.track || track >= self.tracks.len() || self.tracks[track].kind != self.tracks[id.track].kind {
             return None;
         }
         let len = self.clip(id).span().len();
@@ -779,8 +967,15 @@ impl Sequence {
         if gap.len() + SAME_TIME < len {
             return None;
         }
+        let start = clamp(start, gap.start, gap.end - len);
+        let delta = start - self.clip(id).start;
+        let others: Vec<ClipId> = self.group_of(id).into_iter().filter(|&member| member != id).collect();
+        if (self.room_for(&others, delta) - delta).abs() > SAME_TIME {
+            return None;
+        }
+        self.shift(&others, delta);
         let mut clip = self.tracks[id.track].clips.remove(id.index);
-        clip.start = clamp(start, gap.start, gap.end - len);
+        clip.start = start;
         let index = self.tracks[track].insert(clip);
         Some(ClipId { track, index })
     }
@@ -862,9 +1057,13 @@ impl Sequence {
         under.into_iter().filter_map(|id| self.split(id, t, min_len)).collect()
     }
 
-    /// Puts a clip's start at `t`. The export range stays: this is how a clip gets black around it.
+    /// Puts a clip's start at `t`, as far as the clips around it let it go; the clips chained to it
+    /// go along, as far as theirs let them. The export range stays: this is how a clip gets black
+    /// around it.
     pub fn move_clip(&mut self, id: ClipId, t: f64) {
-        self.tracks[id.track].move_clip(id.index, t);
+        let group = self.group_of(id);
+        let delta = self.room_for(&group, t - self.clip(id).start);
+        self.shift(&group, delta);
     }
 }
 
@@ -1149,7 +1348,7 @@ mod tests {
         sequence.move_clip(first, 2.0);
         sequence.fit_export();
 
-        let id = sequence.add_below(Clip::of(1, "b".into(), 5.0));
+        let id = sequence.add_below(Clip::of(1, "b".into(), 5.0), TrackKind::Video);
         assert_eq!(id, ClipId { track: 0, index: 0 });
         assert_eq!(sequence.tracks.len(), 2);
         assert_eq!((sequence.clip(id).source, sequence.clip(id).span()), (1, span(12.0, 17.0)));
@@ -1160,7 +1359,7 @@ mod tests {
 
         // Set by hand, it stays.
         sequence.export = span(0.0, 5.0);
-        sequence.add_below(Clip::of(2, "c".into(), 3.0));
+        sequence.add_below(Clip::of(2, "c".into(), 3.0), TrackKind::Video);
         assert_eq!(sequence.export, span(0.0, 5.0));
         assert_eq!(sequence.clip(ClipId { track: 0, index: 0 }).span(), span(17.0, 20.0));
         let ids: BTreeSet<_> = sequence.tracks.iter().map(|track| track.id).collect();
@@ -1196,7 +1395,7 @@ mod tests {
         let mut sequence = Sequence::new(Clip::new("a".into(), 10.0));
         sequence.tracks.clear();
         sequence.export = span(3.0, 8.0);
-        let id = sequence.add_below(Clip::of(4, "b".into(), 6.0));
+        let id = sequence.add_below(Clip::of(4, "b".into(), 6.0), TrackKind::Video);
         assert_eq!(sequence.clip(id).span(), span(3.0, 9.0));
         assert_eq!(sequence.export, span(3.0, 9.0));
     }
@@ -1204,7 +1403,7 @@ mod tests {
     #[test]
     fn removing_a_clip_leaves_its_track() {
         let mut sequence = Sequence::new(Clip::new("a".into(), 10.0));
-        sequence.add_below(Clip::of(1, "b".into(), 5.0));
+        sequence.add_below(Clip::of(1, "b".into(), 5.0), TrackKind::Video);
         sequence.remove_clip(ClipId { track: 0, index: 0 });
         assert_eq!(sequence.tracks.len(), 2);
         assert!(sequence.tracks[0].clips.is_empty());
@@ -1223,7 +1422,7 @@ mod tests {
     #[test]
     fn tracks_trade_places() {
         let mut sequence = Sequence::new(Clip::new("a".into(), 10.0));
-        sequence.add_below(Clip::of(1, "b".into(), 5.0));
+        sequence.add_below(Clip::of(1, "b".into(), 5.0), TrackKind::Video);
         let (bottom, top) = (sequence.tracks[0].id, sequence.tracks[1].id);
         assert_eq!(sequence.move_track(0, true), 1);
         assert_eq!((sequence.tracks[0].id, sequence.tracks[1].id), (top, bottom));
@@ -1384,9 +1583,9 @@ mod tests {
         assert_eq!(sequence.clip(ClipId { track: 2, index: 0 }).name, "c", "the track above moved up");
 
         // Pasted at 50 s on track 0: free there. At 5 s on track 0: a is there, so above it.
-        let pasted = sequence.paste(sequence.clip(b).clone(), 50.0, Some(0));
+        let pasted = sequence.paste(sequence.clip(b).clone(), 50.0, Some(0), TrackKind::Video);
         assert_eq!((pasted, sequence.clip(pasted).span()), (ClipId { track: 0, index: 2 }, span(50.0, 54.0)));
-        let pasted = sequence.paste(sequence.clip(b).clone(), 5.0, Some(0));
+        let pasted = sequence.paste(sequence.clip(b).clone(), 5.0, Some(0), TrackKind::Video);
         assert_eq!(pasted.track, 1);
         assert_eq!(sequence.clip(pasted).span(), span(5.0, 9.0), "exactly where it was asked to go");
     }
@@ -1455,8 +1654,8 @@ mod tests {
     #[test]
     fn empty_tracks_go_anywhere_and_tracks_move_to_any_place() {
         let mut sequence = Sequence::new(Clip::new("a".into(), 10.0));
-        assert_eq!(sequence.add_track(0), 0);
-        assert_eq!(sequence.add_track(99), 2);
+        assert_eq!(sequence.add_track(0, TrackKind::Video), 0);
+        assert_eq!(sequence.add_track(99, TrackKind::Video), 2);
         let ids: Vec<TrackId> = sequence.tracks.iter().map(|track| track.id).collect();
         assert_eq!(ids, [1, 0, 2]);
         assert!(sequence.tracks[0].clips.is_empty() && sequence.tracks[2].clips.is_empty());
@@ -1550,7 +1749,7 @@ mod tests {
     #[test]
     fn a_source_is_refitted_wherever_it_plays() {
         let mut sequence = Sequence::new(placed_clip());
-        sequence.add_below(Clip::of(1, "b".into(), 5.0));
+        sequence.add_below(Clip::of(1, "b".into(), 5.0), TrackKind::Video);
         sequence.tracks[0].clips.push(Clip { start: 50.0, ..placed_clip() });
         assert_eq!((sequence.uses(0), sequence.uses(1), sequence.uses(2)), (2, 1, 0));
         assert!(!sequence.refit_source(0, 30.0 + 1e-4));
@@ -1558,5 +1757,154 @@ mod tests {
         let outs: Vec<f64> = sequence.clips().filter(|(_, c)| c.source == 0).map(|(_, c)| c.source_out).collect();
         assert_eq!(outs, [6.0, 6.0]);
         assert_eq!(sequence.clip(ClipId { track: 0, index: 0 }).source_out, 5.0);
+    }
+
+    /// A video clip 10..20 s on track 0 with a fade in of 2 s and a fade out of 1 s, picture and
+    /// sound, coloured; its sound detached onto an audio track under it.
+    fn detached() -> (Sequence, ClipId, ClipId) {
+        let mut clip = placed_clip();
+        clip.add_fade(Edge::In);
+        clip.set_fade_length(Edge::In, 2.0);
+        clip.add_fade(Edge::Out);
+        clip.add_color();
+        let mut sequence = Sequence::new(clip);
+        let (picture, sound) = sequence.detach_sound(ClipId { track: 0, index: 0 }).unwrap();
+        (sequence, picture, sound)
+    }
+
+    #[test]
+    fn detached_sound_is_a_clip_of_its_own_on_an_audio_track_under_its_picture() {
+        let (sequence, picture, sound) = detached();
+        // A new audio track went under the video one, which moved up.
+        assert_eq!((picture, sound), (ClipId { track: 1, index: 0 }, ClipId { track: 0, index: 0 }));
+        assert_eq!(sequence.tracks.iter().map(|track| track.kind).collect::<Vec<_>>(), [TrackKind::Audio, TrackKind::Video]);
+        let (p, s) = (sequence.clip(picture), sequence.clip(sound));
+        assert_eq!((p.span(), s.span()), (span(10.0, 20.0), span(10.0, 20.0)));
+        assert_eq!((p.source_in, s.source_in), (2.0, 2.0));
+        // The picture is seen and not heard; the sound is heard and not seen.
+        assert!(p.sound_detached && !s.sound_detached);
+        assert!(!sequence.sounds(picture) && sequence.sounds(sound));
+        assert_eq!(sequence.shown_at(15.0), Some(picture));
+        assert_eq!(sequence.picture(span(0.0, 30.0)).iter().filter_map(|(_, id)| *id).collect::<Vec<_>>(), [picture]);
+        // The fades went apart: the picture's stay, the sound's went with the sound. The colour stayed.
+        let fades = |clip: &Clip| clip.effects.iter().filter_map(Effect::as_fade).map(|fade| (fade.edge, fade.picture, fade.sound)).collect::<Vec<_>>();
+        assert_eq!(fades(p), [(Edge::In, true, false), (Edge::Out, true, false)]);
+        assert_eq!(fades(s), [(Edge::In, false, true), (Edge::Out, false, true)]);
+        assert_eq!(s.fade(Edge::In).map(|fade| fade.seconds), Some(2.0));
+        assert!(p.color().is_some() && s.color().is_none());
+        // Chained; and there is nothing more to detach.
+        assert_eq!(sequence.group_of(picture), [sound, picture]);
+        let mut again = sequence.clone();
+        assert_eq!(again.detach_sound(picture), None);
+        assert_eq!(again.detach_sound(sound), None, "sound has no sound of its own to detach");
+    }
+
+    #[test]
+    fn a_free_audio_track_right_under_takes_the_sound() {
+        let (mut sequence, picture, _) = detached();
+        // Another video clip at 30..40 s on the video track: its sound goes onto the same audio track.
+        let other = sequence.place_clip(Some(picture.track), Clip { start: 30.0, ..Clip::new("b".into(), 10.0) }).unwrap();
+        let (other, sound) = sequence.detach_sound(other).unwrap();
+        assert_eq!(sequence.tracks.len(), 2);
+        assert_eq!((other.track, sound), (1, ClipId { track: 0, index: 1 }));
+        // Two groups, one for each.
+        assert_eq!(sequence.group_of(other), [sound, other]);
+    }
+
+    #[test]
+    fn chained_clips_move_together_as_far_as_all_of_them_can() {
+        let (mut sequence, picture, sound) = detached();
+        sequence.move_clip(picture, 14.0);
+        assert_eq!((sequence.clip(picture).start, sequence.clip(sound).start), (14.0, 14.0));
+        // Shifted on its own, then moved by the sound: the distance stays.
+        sequence.unchain(sound);
+        sequence.move_clip(sound, 15.0);
+        sequence.chain(sound, picture);
+        sequence.move_clip(sound, 16.0);
+        assert_eq!((sequence.clip(picture).start, sequence.clip(sound).start), (15.0, 16.0));
+        // A clip at 0..10 s on the audio track: the sound stops at 10 s, and the picture with it.
+        sequence.place_clip(Some(0), Clip::new("c".into(), 10.0));
+        let sound = ClipId { track: 0, index: 1 };
+        sequence.move_clip(picture, 0.0);
+        assert_eq!((sequence.clip(picture).start, sequence.clip(sound).start), (9.0, 10.0));
+        // Onto another video track: only the picture changes track, both go in time.
+        let top = sequence.add_track(2, TrackKind::Video);
+        let moved = sequence.move_clip_to_track(picture, top, 20.0).unwrap();
+        assert_eq!((moved.track, sequence.clip(moved).start, sequence.clip(sound).start), (2, 20.0, 21.0));
+        // Never onto a track of the other kind.
+        assert_eq!(sequence.move_clip_to_track(moved, 0, 40.0), None);
+        // Where the sound can't follow, the picture does not go.
+        sequence.place_clip(Some(0), Clip { start: 31.0, ..Clip::new("d".into(), 10.0) });
+        let lower = sequence.add_track(1, TrackKind::Video);
+        let moved = ClipId { track: 3, index: 0 };
+        assert_eq!(sequence.move_clip_to_track(moved, lower, 25.0), None);
+    }
+
+    #[test]
+    fn both_parts_of_a_cut_stay_chained_and_a_copy_is_chained_to_nothing() {
+        let (mut sequence, picture, sound) = detached();
+        let after = sequence.split(picture, 15.0, 0.5).unwrap();
+        assert_eq!(sequence.group_of(picture).len(), 3);
+        sequence.move_clip(after, 17.0);
+        assert_eq!((sequence.clip(picture).start, sequence.clip(sound).start, sequence.clip(after).start), (12.0, 12.0, 17.0));
+        let copy = sequence.duplicate(sound);
+        assert_eq!(sequence.tracks[copy.track].kind, TrackKind::Audio);
+        assert!(!sequence.is_chained(copy));
+        // A copy of sound pasted onto a video track goes onto a new audio track above it instead.
+        let pasted = sequence.paste(sequence.clip(sound).clone(), 40.0, Some(picture.track), TrackKind::Audio);
+        assert_eq!(sequence.tracks[pasted.track].kind, TrackKind::Audio);
+        assert_eq!(pasted.track, picture.track + 1);
+    }
+
+    #[test]
+    fn closing_a_gap_takes_chained_clips_along_while_they_have_room() {
+        // Video track: a 0..5, then the detached clip 10..20; audio track: its sound 10..20.
+        let (mut sequence, picture, sound) = detached();
+        sequence.place_clip(Some(picture.track), Clip::new("a".into(), 5.0));
+        let first = ClipId { track: 1, index: 0 };
+        sequence.ripple_delete(first);
+        let picture = ClipId { track: 1, index: 0 };
+        assert_eq!((sequence.clip(picture).start, sequence.clip(sound).start), (5.0, 5.0));
+        // Something in the sound's way: nothing moves.
+        let mut blocked = sequence.clone();
+        blocked.place_clip(Some(0), Clip { start: 2.0, ..Clip::new("e".into(), 3.0) });
+        blocked.place_clip(Some(1), Clip::new("f".into(), 3.0));
+        let (f, picture) = (ClipId { track: 1, index: 0 }, ClipId { track: 1, index: 1 });
+        blocked.ripple_delete(f);
+        let picture = ClipId { track: 1, index: picture.index - 1 };
+        assert_eq!(blocked.clip(picture).start, 5.0, "the sound had no room to go back: it stays, and so does the picture");
+    }
+
+    #[test]
+    fn chaining_joins_groups_and_unchaining_leaves_the_rest_together() {
+        let mut sequence = Sequence::new(Clip::new("a".into(), 10.0));
+        for start in [20.0, 40.0] {
+            sequence.place_clip(Some(0), Clip { start, ..Clip::new("b".into(), 5.0) });
+        }
+        let [a, b, c] = [0, 1, 2].map(|index| ClipId { track: 0, index });
+        sequence.chain(a, b);
+        sequence.chain(c, a);
+        assert_eq!(sequence.group_of(b), [a, b, c]);
+        sequence.unchain(a);
+        assert!(!sequence.is_chained(a));
+        assert_eq!(sequence.group_of(b), [b, c]);
+        // A group left with one clip is no group.
+        sequence.unchain(b);
+        assert!(!sequence.is_chained(c) && sequence.clip(c).link.is_none());
+        sequence.chain(a, b);
+        sequence.remove_clip(a);
+        assert!(sequence.clips().all(|(_, clip)| clip.link.is_none()));
+    }
+
+    #[test]
+    fn audio_tracks_and_detached_sound_are_saved_and_older_files_read() {
+        let (sequence, _, _) = detached();
+        let text = serde_json::to_string(&sequence).unwrap();
+        assert_eq!(serde_json::from_str::<Sequence>(&text).unwrap(), sequence);
+        assert!(text.contains(r#""kind":"Audio""#) && !text.contains(r#""kind":"Video""#), "a video track says nothing of its kind");
+        // A track and a clip from before: a video track, sound in its clip, chained to nothing.
+        let old: Track = serde_json::from_str(r#"{"id": 3, "clips": [{"name": "a", "start": 0.0, "source_in": 0.0, "source_out": 1.0, "source_duration": 1.0, "transform": {"cx": 0.5, "cy": 0.5, "zoom": 1.0, "angle_deg": 0.0, "mirror": false, "bars": false}}]}"#).unwrap();
+        assert_eq!(old.kind, TrackKind::Video);
+        assert!(!old.clips[0].sound_detached && old.clips[0].link.is_none());
     }
 }
