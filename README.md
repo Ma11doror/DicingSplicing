@@ -41,6 +41,8 @@ yt-dlp come along in the same folder.
   sound or the picture, delete it, and chain what is left to other clips.
 - Music and other sound files (MP3, WAV, M4A, FLAC, OGG, Opus) as sources, on audio tracks.
 
+Step by step, with pictures: [Working with sound](#working-with-sound).
+
 **Framing for the platform**
 
 ![The Telegram circle frame: the circle on the source, and the circle that will be sent](docs/screenshots/circle.png)
@@ -77,6 +79,9 @@ yt-dlp come along in the same folder.
    resize the frame on the picture.
 3. More videos or music: **Sources**, then **Add video or sound…** or **Download from a link…**. Drag a
    source onto the timeline; onto an audio track it goes as its sound only.
+
+   ![Sources: the videos and the music of the project, and the buttons to add more](docs/screenshots/sources.png)
+
 4. Pick a clip to change it in the **Clip** panel on the right: timing, framing, volume, effects.
    Right click a clip for its menu: detach its sound, chain it to another clip, fades, color, cut,
    duplicate, delete.
@@ -84,6 +89,32 @@ yt-dlp come along in the same folder.
 6. **Export** tab: choose a preset, then **Export**.
 
 Press **F1** in the editor for the list of keys.
+
+## Working with sound
+
+1. **Detach the sound of a clip.** Right click a video clip and choose **Detach sound**.
+
+   ![The menu of a video clip, with Detach sound](docs/screenshots/sound-detach.png)
+
+2. **The sound is now a clip of its own,** on an audio track right under its picture: move it, cut
+   it, trim it and fade it on its own. The picture says *sound detached*. The two are **chained**:
+   both carry a mark of two chain links, and when one is moved in time, the other goes along.
+   Select one, and the clips chained to it are outlined.
+
+   ![The picture on Video 2 and its sound on Audio 1, chained; music on Audio 2](docs/screenshots/sound-detached.png)
+
+3. **Chain any clips.** Right click a clip, choose **Chain to…**, then click the clip to chain it to;
+   Esc gives up. Here the music is about to be chained to the test card, to follow the card when it
+   is moved.
+
+   ![Chain to: the timeline waits for a click on the clip to chain the music to](docs/screenshots/sound-chain.png)
+
+4. **Unchain**, in the same menu, lets a clip move on its own again; the others stay chained. Both
+   parts of a cut stay chained: cut a piece out of the sound, delete it, and chain what is left to
+   other clips.
+5. **Music and other sound files** come in through **Sources**, **Add video or sound…**: MP3, WAV,
+   M4A, FLAC, OGG or Opus. Drag one onto an audio track; dropped anywhere else, it gets a new audio
+   track. A video dragged onto an audio track brings only its sound.
 
 ## Keys
 
@@ -209,5 +240,5 @@ Built with [egui and eframe](https://github.com/emilk/egui), [cpal](https://gith
 and written by [FFmpeg](https://ffmpeg.org); videos by link come through
 [yt-dlp](https://github.com/yt-dlp/yt-dlp).
 
-The pictures in the screenshots are drawn by FFmpeg itself: a test card, a Mandelbrot fractal and
-gradients.
+The pictures and the music in the screenshots are made by FFmpeg itself: a test card, a Mandelbrot
+fractal, gradients and two tones.
