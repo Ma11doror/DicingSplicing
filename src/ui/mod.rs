@@ -8,6 +8,7 @@ pub mod plugins;
 pub mod settings;
 pub mod sources;
 pub mod start;
+pub mod thumbnails;
 pub mod timeline;
 pub mod viewer;
 
@@ -32,6 +33,15 @@ pub fn grip_dots(painter: &Painter, center: Pos2, across: usize, down: usize, co
             painter.circle_filled(pos2(center.x + offset(column, across), center.y + offset(row, down)), GRIP_DOT_RADIUS, color);
         }
     }
+}
+
+/// An arrow up or down along `at.x`, the same everywhere: a line and a head, from 5 points on one
+/// side of `at` to 6 on the other, the head's side. Drawn, as the font has no arrows.
+pub fn paint_arrow(painter: &Painter, at: Pos2, up: bool, color: Color32) {
+    let dir = if up { -1.0 } else { 1.0 };
+    painter.line_segment([pos2(at.x, at.y - 5.0 * dir), pos2(at.x, at.y + 2.0 * dir)], Stroke::new(1.5, color));
+    let head = vec![pos2(at.x - 3.5, at.y + dir), pos2(at.x + 3.5, at.y + dir), pos2(at.x, at.y + 6.0 * dir)];
+    painter.add(Shape::convex_polygon(head, color, Stroke::NONE));
 }
 
 /// How big a curve's little graph is, in a list of curves.
@@ -91,4 +101,17 @@ pub fn pick_media() -> Option<PathBuf> {
         .add_filter("Sound", SOUND_EXTENSIONS)
         .add_filter("All files", &["*"])
         .pick_file()
+}
+
+/// Asks for files sources can be: any number of videos and sound files at once.
+pub fn pick_media_files() -> Vec<PathBuf> {
+    let both: Vec<&str> = VIDEO_EXTENSIONS.iter().chain(SOUND_EXTENSIONS).copied().collect();
+    rfd::FileDialog::new()
+        .set_title("Choose videos or sound files")
+        .add_filter("Video and sound", &both)
+        .add_filter("Video", VIDEO_EXTENSIONS)
+        .add_filter("Sound", SOUND_EXTENSIONS)
+        .add_filter("All files", &["*"])
+        .pick_files()
+        .unwrap_or_default()
 }

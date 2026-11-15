@@ -21,9 +21,9 @@ use crate::ui::flash;
 use crate::ui::framing::Framing;
 use crate::ui::picture::{frame_at, Picture};
 use crate::ui::timeline::track_name;
-use crate::ui::{curve_choice, grip_dots, paint_curve, pick_media};
+use crate::ui::{curve_choice, grip_dots, paint_curve, pick_media, pick_media_files};
 use crate::ui::plugins::PublishEnv;
-use crate::ui::sources::{self, SourceAction, SourceRow};
+use crate::ui::sources::{self, SourceAction, SourceRow, SourcesPanel};
 use crate::ui::timeline::{Section, SourceSound, Timeline, TimelineEnv, Tool};
 use crate::ui::viewer::{Layer, OutputView, SourceView};
 use egui::{Color32, Key, Modifiers, RichText, TextureHandle};
@@ -131,6 +131,8 @@ pub struct Editor {
     files: SourceFiles,
     /// Open the Sources list on the next frame: a video has just been added.
     show_sources: bool,
+    /// How the Sources list shows the sources, and what it keeps for that.
+    sources_panel: SourcesPanel,
     /// A part of the Clip tab that a plaque on the timeline led to: it flashes, from then.
     flash: Option<(Section, f64)>,
     /// That part is still to be scrolled into sight.
@@ -191,6 +193,7 @@ impl Editor {
             fps: 30.0,
             files: SourceFiles::new(),
             show_sources: false,
+            sources_panel: SourcesPanel::new(view.sources_view, view.sources_sort, view.sources_size, notify.clone()),
             flash: None,
             scroll_to: None,
             clipboard: None,
@@ -216,6 +219,9 @@ impl Editor {
                 expanded_tracks: self.timeline.expanded().filter(|id| self.sequence.tracks.iter().any(|track| track.id == *id)).collect(),
                 clip_panel_height: self.clip_panel_height,
                 timeline_height: self.timeline_height,
+                sources_view: self.sources_panel.view,
+                sources_sort: self.sources_panel.sort,
+                sources_size: self.sources_panel.size,
             },
         }
     }
@@ -571,14 +577,29 @@ impl Editor {
     }
 
     /// Adds a video to the project's sources, from a dialog, a drop or a plugin. A video that is
-    /// there already is not added again. The list opens to show it.
-    pub fn add_source(&mut self, path: PathBuf, name: Option<String>, meta: BTreeMap<String, String>) {
+    /// there already is not added again. The list opens to show it. Returns whether it is new.
+    pub fn add_source(&mut self, path: PathBuf, name: Option<String>, meta: BTreeMap<String, String>) -> bool {
         let path = std::path::absolute(&path).unwrap_or(path);
         let (id, new) = project::add_source(&mut self.sources, path.clone(), name, meta);
         if new {
             self.library.add(id, &path);
         }
+        self.sources_panel.note = None;
         self.show_sources = true;
+        new
+    }
+
+    /// Adds files to the sources at once, in the order given. The list says how many of them were
+    /// there already.
+    pub fn add_sources(&mut self, paths: Vec<PathBuf>) {
+        let total = paths.len();
+        let mut already = 0;
+        for path in paths {
+            if !self.add_source(path, None, BTreeMap::new()) {
+                already += 1;
+            }
+        }
+        self.sources_panel.note = sources::already_note(total, already);
     }
 
     /// Puts the whole source on a new track under the others, after the last clip, and goes there.
@@ -633,9 +654,16 @@ impl Editor {
         let rows: Vec<SourceRow> = self
             .sources
             .iter()
-            .map(|source| SourceRow { source, state: self.library.state(source.id), info: self.library.info(source.id), uses: self.sequence.uses(source.id) })
+            .map(|source| SourceRow {
+                source,
+                state: self.library.state(source.id),
+                info: self.library.info(source.id),
+                uses: self.sequence.uses(source.id),
+                cache: self.library.cache(source.id),
+                sound: self.library.sound_graph(source.id),
+            })
             .collect();
-        let action = sources::sources_button(ui, &rows, plugins, std::mem::take(&mut self.show_sources));
+        let action = sources::sources_button(ui, &rows, plugins, std::mem::take(&mut self.show_sources), &mut self.sources_panel);
         if let Some((count, progress)) = self.library.preparing() {
             let more = if count > 1 { format!(", {} more waiting", count - 1) } else { String::new() };
             let text = format!("Preparing frames {:.0}%{more}", progress * 100.0);
@@ -650,8 +678,9 @@ impl Editor {
             SourceAction::Locate(id) => self.locate(id),
             SourceAction::Remove(id) => self.remove_source(id),
             SourceAction::AddVideo => {
-                if let Some(path) = pick_media() {
-                    self.add_source(path, None, BTreeMap::new());
+                let files = pick_media_files();
+                if !files.is_empty() {
+                    self.add_sources(files);
                 }
             }
             SourceAction::Plugin(i) => return Some(i),

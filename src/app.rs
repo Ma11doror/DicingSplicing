@@ -30,6 +30,11 @@ pub fn title() -> String {
     format!("DicingSplicing {}", crash::VERSION)
 }
 
+/// A project's folder, or its file.
+fn is_project(path: &Path) -> bool {
+    path.is_dir() || path.file_name().is_some_and(|name| name == PROJECT_FILE)
+}
+
 /// A new project, made in the background: its video has to be read first.
 struct Opened {
     project: Project,
@@ -73,6 +78,8 @@ pub struct EditorApp {
     recent: Vec<RecentProject>,
     /// A video to open as soon as there is a workspace.
     waiting_video: Option<PathBuf>,
+    /// Videos dropped along with the one a project is being opened for: they join it once it is open.
+    pending_sources: Vec<PathBuf>,
     plugins: Vec<Plugin>,
     /// The plugins, while they are still being looked for.
     finding_plugins: Option<Receiver<(Vec<Plugin>, Vec<String>)>>,
@@ -128,6 +135,7 @@ impl EditorApp {
             opening: None,
             recent: Vec::new(),
             waiting_video: None,
+            pending_sources: Vec::new(),
             plugins: Vec::new(),
             finding_plugins: Some(finding_plugins),
             source_window: SourceWindow::default(),
@@ -169,6 +177,10 @@ impl EditorApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{} — {}", project.name, title())));
         self.settings.remember_project(&dir);
         self.editor = Some(Editor::new(project, dir, cache_root, ctx));
+        let pending = std::mem::take(&mut self.pending_sources);
+        if let Some(editor) = self.editor.as_mut().filter(|_| !pending.is_empty()) {
+            editor.add_sources(pending);
+        }
     }
 
     fn close_project(&mut self, ctx: &egui::Context) {
@@ -178,6 +190,21 @@ impl EditorApp {
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title()));
         self.refresh_recent();
+    }
+
+    /// What was dropped on the window. Videos dropped on an open project join its sources. Otherwise
+    /// what was dropped opens: a project, or a new one made from the first video, and the other
+    /// videos join it once it is open.
+    fn open_dropped(&mut self, dropped: Vec<PathBuf>, ctx: &egui::Context) {
+        let (projects, files): (Vec<PathBuf>, Vec<PathBuf>) = dropped.into_iter().partition(|path| is_project(path));
+        if let Some(editor) = self.editor.as_mut().filter(|_| !files.is_empty()) {
+            editor.add_sources(files);
+            return;
+        }
+        let mut files = files.into_iter();
+        let Some(first) = projects.into_iter().next().or_else(|| files.next()) else { return };
+        self.pending_sources = files.collect();
+        self.open_path(first, ctx);
     }
 
     /// Opens whatever was dropped or asked for: a project, or a video.
@@ -237,6 +264,7 @@ impl EditorApp {
             Ok(project) => project,
             Err(error) => {
                 self.errors.push(format!("{error:#}"));
+                self.pending_sources.clear();
                 return;
             }
         };
@@ -247,6 +275,7 @@ impl EditorApp {
         }
         let Some(cache_root) = self.workspace.as_ref().map(Workspace::cache_dir) else {
             self.errors.push(format!("{} is not in a projects folder. Choose one first.", dir.display()));
+            self.pending_sources.clear();
             return;
         };
         // Its videos are looked at in the editor: one that is not there is marked, not in the way.
@@ -287,6 +316,7 @@ impl EditorApp {
             Ok(Ok(Opened { project, dir, cache_root })) => self.show_project(project, dir, cache_root, ctx),
             Ok(Err(error)) => {
                 self.errors.push(format!("Can't open {label}: {error:#}"));
+                self.pending_sources.clear();
                 self.refresh_recent();
             }
             Err(_) => {}
@@ -400,7 +430,7 @@ impl eframe::App for EditorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_opening(ctx);
         self.poll_plugins();
-        let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
 
         self.top_panel(ctx);
         let workspace_root = self.workspace.as_ref().map(|workspace| workspace.root.clone());
@@ -409,18 +439,15 @@ impl eframe::App for EditorApp {
         }
         if let Some(fetched) = self.source_window.show(ctx, self.workspace.as_ref(), &self.settings) {
             match &mut self.editor {
-                Some(editor) if self.fetch_into_editor => editor.add_source(fetched.path, fetched.name, fetched.meta),
+                Some(editor) if self.fetch_into_editor => {
+                    editor.add_source(fetched.path, fetched.name, fetched.meta);
+                }
                 _ => self.open_fetched(fetched, ctx),
             }
         }
 
-        if let Some(path) = dropped {
-            // A video dropped on an open project joins its sources; a project opens as it is.
-            let is_project = path.is_dir() || path.file_name().is_some_and(|name| name == PROJECT_FILE);
-            match &mut self.editor {
-                Some(editor) if !is_project => editor.add_source(path, None, BTreeMap::new()),
-                _ => self.open_path(path, ctx),
-            }
+        if !dropped.is_empty() {
+            self.open_dropped(dropped, ctx);
         }
         if let Some(editor) = &mut self.editor {
             editor.ui(ctx, &self.plugins, self.workspace.as_ref(), &self.settings);

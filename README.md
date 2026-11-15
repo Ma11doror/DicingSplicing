@@ -26,6 +26,9 @@ yt-dlp come along in the same folder.
   seen; the sound of all of them is mixed.
 - Videos are linked, not copied. Add them from a file, by dropping them on the window, or by a link
   (YouTube, song.link and whatever else [yt-dlp](https://github.com/yt-dlp/yt-dlp) understands).
+- Add many files at once, from the dialog or dropped on the window. The sources show as a list or as
+  thumbnails, sorted by name, by when they were added or by the files' dates. Move the pointer across
+  a thumbnail to run through its video.
 - Move clips along and between tracks, trim them by their edges, cut them with the Blade or at the
   playhead, duplicate, copy and paste, delete with or without closing the gap. Undo and redo
   everything.
@@ -77,10 +80,13 @@ Step by step, with pictures: [Working with sound](#working-with-sound).
 1. On the start screen, **New project from a video…**, or drop a video on the window.
 2. Open **Frames** at the top left and pick the main frame, such as *Telegram circle*. Move and
    resize the frame on the picture.
-3. More videos or music: **Sources**, then **Add video or sound…** or **Download from a link…**. Drag a
-   source onto the timeline; onto an audio track it goes as its sound only.
+3. More videos or music: **Sources**, then **Add video or sound…** (as many files as you like) or
+   **Download from a link…**. Drag a source onto the timeline; onto an audio track it goes as its sound
+   only. At the top of Sources, the two buttons at the left show the sources as a list or as
+   thumbnails. **Sorting:** at the right puts them in order; the arrow after it turns the order round.
+   The dots at the bottom right corner make the list larger or smaller.
 
-   ![Sources: the videos and the music of the project, and the buttons to add more](docs/screenshots/sources.png)
+   ![Sources as thumbnails: the pointer over Fractal dive runs through its video](docs/screenshots/sources.png)
 
 4. Pick a clip to change it in the **Clip** panel on the right: timing, framing, volume, effects.
    Right click a clip for its menu: detach its sound, chain it to another clip, fades, color, cut,

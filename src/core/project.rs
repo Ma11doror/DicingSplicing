@@ -71,6 +71,39 @@ pub struct ViewState {
     pub clip_panel_height: Option<f32>,
     /// How tall the timeline is, once its border has been dragged.
     pub timeline_height: Option<f32>,
+    /// How the Sources list shows the sources, and in what order.
+    pub sources_view: SourcesView,
+    pub sources_sort: SourcesSort,
+    /// How much room the Sources list gives the sources, once its corner has been dragged.
+    pub sources_size: Option<[f32; 2]>,
+}
+
+/// How the Sources list shows the sources.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourcesView {
+    /// A line for each: its name, and what is known about it.
+    #[default]
+    List,
+    /// A frame of each, as a file explorer shows videos.
+    Thumbnails,
+}
+
+/// What the Sources list orders the sources by.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourcesOrder {
+    Name,
+    /// The order they came into the project in.
+    #[default]
+    Added,
+    /// When their files were last changed.
+    Modified,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SourcesSort {
+    pub by: SourcesOrder,
+    pub descending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -201,6 +234,9 @@ mod tests {
             expanded_tracks: vec![0],
             clip_panel_height: Some(280.0),
             timeline_height: Some(360.0),
+            sources_view: SourcesView::Thumbnails,
+            sources_sort: SourcesSort { by: SourcesOrder::Modified, descending: true },
+            sources_size: Some([720.0, 450.0]),
         };
         project
     }

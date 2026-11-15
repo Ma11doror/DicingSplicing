@@ -23,7 +23,7 @@ use crate::core::edit::{Clip, ClipId, Curve, Edge, Effect, SourceId, Sequence, S
 use crate::media::geometry::Transform;
 use crate::media::timecode;
 use crate::media::waveform::Peaks;
-use crate::ui::{curve_choice, grip_dots};
+use crate::ui::{curve_choice, grip_dots, paint_arrow};
 use egui::{pos2, vec2, Align2, Color32, CursorIcon, FontId, Mesh, PointerButton, Pos2, Rect, RichText, Rounding, Sense, Shape, Stroke};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
@@ -1665,10 +1665,7 @@ fn add_track_button(ui: &mut egui::Ui, arrow: Option<bool>, enabled: bool) -> eg
     painter.line_segment([pos2(plus - 4.0, center.y), pos2(plus + 4.0, center.y)], stroke);
     painter.line_segment([pos2(plus, center.y - 4.0), pos2(plus, center.y + 4.0)], stroke);
     if let Some(up) = arrow {
-        let (x, dir) = (center.x + 7.0, if up { -1.0 } else { 1.0 });
-        painter.line_segment([pos2(x, center.y - 5.0 * dir), pos2(x, center.y + 2.0 * dir)], stroke);
-        let head = vec![pos2(x - 3.5, center.y + 1.0 * dir), pos2(x + 3.5, center.y + 1.0 * dir), pos2(x, center.y + 6.0 * dir)];
-        painter.add(Shape::convex_polygon(head, color, Stroke::NONE));
+        paint_arrow(painter, pos2(center.x + 7.0, center.y), up, color);
     }
     response
 }

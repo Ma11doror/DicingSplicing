@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+**Sources**
+
+- Add many files at once, from the dialog or dropped on the window; dropped on the start screen, the
+  first makes a new project and the others join it. Files that are in the project already are not
+  added again, and the list says so.
+- Sort the sources by name (numbers by their value, as in the file explorer), by when they were
+  added, or by the files' dates.
+- See them as thumbnails: a frame of each, its length, the graph of a sound file. Moving the pointer
+  across a thumbnail runs through its video.
+- The list keeps its size when the view changes; the dots at its corner make it larger or smaller.
+
 ## v0.1.0 — 2026-11-11
 
 The first release.
