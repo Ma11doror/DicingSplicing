@@ -30,6 +30,26 @@ pub fn title() -> String {
     format!("DicingSplicing {}", crash::VERSION)
 }
 
+/// Runs the editor until its window is closed.
+pub fn run() -> eframe::Result<()> {
+    // Before anything can go wrong: without a console, the report is all that is left of it.
+    crash::install(crash::logs_folder());
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title(title())
+            .with_inner_size([1280.0, 820.0])
+            .with_min_inner_size([900.0, 560.0])
+            .with_drag_and_drop(true),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "DicingSplicing",
+        native_options,
+        Box::new(|cc| Ok(Box::new(EditorApp::new(cc)))),
+    )
+}
+
 /// A project's folder, or its file.
 fn is_project(path: &Path) -> bool {
     path.is_dir() || path.file_name().is_some_and(|name| name == PROJECT_FILE)

@@ -783,6 +783,80 @@ impl Sequence {
         }
     }
 
+    /// Puts `clip` on `track` where its clip at `index` starts, right after its last clip when
+    /// `index` is how many it has, or at the start of the export range when it has none. The clips
+    /// from `index` on move later by the new clip's length, each with the clips chained to it. None,
+    /// with nothing changed, if one of them can't go that far: a clip chained to it has no room on
+    /// its own track. An export range that fitted the clips, or had none to fit, takes it in.
+    pub fn ripple_insert(&mut self, track: usize, index: usize, clip: Clip) -> Option<ClipId> {
+        let fit = self.export_fits() || self.content().is_none();
+        let mut next = self.clone();
+        let id = next.insert_shifting(track, index, clip)?;
+        if fit {
+            next.fit_export();
+        }
+        *self = next;
+        Some(id)
+    }
+
+    /// Takes the clip at `from` on `track` out, closing the gap it leaves, and puts it back as the
+    /// clip at `to`, moving the ones from there on later: clips that went one after another still
+    /// do, in the new order. None, with nothing changed, if the clip is chained to another, or the
+    /// clips after either place can't move with the clips chained to them.
+    pub fn ripple_move(&mut self, track: usize, from: usize, to: usize) -> Option<ClipId> {
+        let count = self.tracks.get(track)?.clips.len();
+        if from >= count || to >= count || self.is_chained(ClipId { track, index: from }) {
+            return None;
+        }
+        let fit = self.export_fits();
+        let mut next = self.clone();
+        let clip = next.tracks[track].clips.remove(from);
+        if !next.ripple_shift(track, from, -clip.span().len()) {
+            return None;
+        }
+        let id = next.insert_shifting(track, to, clip)?;
+        if fit {
+            next.fit_export();
+        }
+        *self = next;
+        Some(id)
+    }
+
+    /// Makes a clip play another part of its source, `part` in source seconds. It keeps its start,
+    /// and the clips after it on its track move by as much as it got longer or shorter, each with
+    /// the clips chained to it; its fades shorten to fit it. False, with nothing changed, if the
+    /// part is not in the source, the clip is chained to another, or the clips after it can't move
+    /// that far.
+    pub fn ripple_retime(&mut self, id: ClipId, part: Span) -> bool {
+        if !self.has(id) || self.is_chained(id) {
+            return false;
+        }
+        let clip = self.clip(id);
+        if part.start < 0.0 || part.len() < SAME_TIME || part.end > clip.source_duration + SAME_TIME {
+            return false;
+        }
+        let delta = part.len() - clip.span().len();
+        let fit = self.export_fits();
+        let mut next = self.clone();
+        let later = |sequence: &mut Sequence| sequence.ripple_shift(id.track, id.index + 1, delta);
+        // A clip that grows needs the room first; one that shrinks leaves it first.
+        if delta > 0.0 && !later(&mut next) {
+            return false;
+        }
+        let clip = next.clip_mut(id);
+        clip.source_in = part.start;
+        clip.source_out = part.end.min(clip.source_duration);
+        clip.fit_fades();
+        if delta <= 0.0 && !later(&mut next) {
+            return false;
+        }
+        if fit {
+            next.fit_export();
+        }
+        *self = next;
+        true
+    }
+
     /// Removes a clip. Its track stays, even when it is left empty.
     pub fn remove_clip(&mut self, id: ClipId) {
         let fitted = self.export_fits();
@@ -854,6 +928,47 @@ impl Sequence {
         for &id in group {
             self.clip_mut(id).start += delta;
         }
+    }
+
+    /// `ripple_insert` without the export range. When it fails, some clips may have moved: it is
+    /// done on a copy.
+    fn insert_shifting(&mut self, track: usize, index: usize, mut clip: Clip) -> Option<ClipId> {
+        let clips = &self.tracks.get(track)?.clips;
+        if index > clips.len() {
+            return None;
+        }
+        clip.start = match clips.get(index) {
+            Some(next) => next.start,
+            None => clips.last().map_or(self.export.start, Clip::end),
+        };
+        clip.link = None;
+        if !self.ripple_shift(track, index, clip.span().len()) {
+            return None;
+        }
+        Some(ClipId { track, index: self.tracks[track].insert(clip) })
+    }
+
+    /// Moves the clips of `track` from `index` on by `delta` seconds, each with the clips chained to
+    /// it: the last one first when they go later, the first one first when they go earlier, so that
+    /// each goes into room the others have left. Whether all of them could go the whole way; when
+    /// not, some may have moved: it is done on a copy.
+    fn ripple_shift(&mut self, track: usize, index: usize, delta: f64) -> bool {
+        let count = self.tracks[track].clips.len();
+        let order: Vec<usize> = if delta > 0.0 { (index..count).rev().collect() } else { (index..count).collect() };
+        let mut moved: Vec<ClipId> = Vec::new();
+        for index in order {
+            let id = ClipId { track, index };
+            if moved.contains(&id) {
+                continue;
+            }
+            let group: Vec<ClipId> = self.group_of(id).into_iter().filter(|member| !moved.contains(member)).collect();
+            if (self.room_for(&group, delta) - delta).abs() > SAME_TIME {
+                return false;
+            }
+            self.shift(&group, delta);
+            moved.extend(group);
+        }
+        true
     }
 
     fn next_link(&self) -> LinkId {
@@ -1906,5 +2021,98 @@ mod tests {
         let old: Track = serde_json::from_str(r#"{"id": 3, "clips": [{"name": "a", "start": 0.0, "source_in": 0.0, "source_out": 1.0, "source_duration": 1.0, "transform": {"cx": 0.5, "cy": 0.5, "zoom": 1.0, "angle_deg": 0.0, "mirror": false, "bars": false}}]}"#).unwrap();
         assert_eq!(old.kind, TrackKind::Video);
         assert!(!old.clips[0].sound_detached && old.clips[0].link.is_none());
+    }
+
+    /// One video track with a 0..10, b 10..14 and c 14..20, one after another; the export range fits.
+    fn three_in_a_row() -> Sequence {
+        let mut sequence = Sequence::new(Clip { source_out: 10.0, ..Clip::new("a".into(), 30.0) });
+        sequence.tracks[0].clips.push(Clip { start: 10.0, ..Clip::of(1, "b".into(), 4.0) });
+        sequence.tracks[0].clips.push(Clip { start: 14.0, ..Clip::of(2, "c".into(), 6.0) });
+        sequence.fit_export();
+        sequence
+    }
+
+    fn names_and_starts(sequence: &Sequence, track: usize) -> Vec<(&str, f64)> {
+        sequence.tracks[track].clips.iter().map(|clip| (clip.name.as_str(), clip.start)).collect()
+    }
+
+    #[test]
+    fn an_insert_moves_the_clips_from_its_place_on_by_its_length() {
+        let mut sequence = three_in_a_row();
+        // Another video track: its clip stays where it is.
+        sequence.tracks.push(track_of(vec![Clip { start: 12.0, ..Clip::of(3, "d".into(), 4.0) }]));
+        let id = sequence.ripple_insert(0, 1, Clip::of(4, "n".into(), 5.0)).unwrap();
+        assert_eq!(id, ClipId { track: 0, index: 1 });
+        assert_eq!(names_and_starts(&sequence, 0), [("a", 0.0), ("n", 10.0), ("b", 15.0), ("c", 19.0)]);
+        assert_eq!(sequence.tracks[1].clips[0].start, 12.0);
+        assert_eq!(sequence.export, span(0.0, 25.0), "a fitted export range takes it in");
+        // As many as there are: after the last one.
+        let last = sequence.ripple_insert(0, 4, Clip::of(5, "z".into(), 2.0)).unwrap();
+        assert_eq!(sequence.clip(last).span(), span(25.0, 27.0));
+        assert_eq!(sequence.ripple_insert(0, 9, Clip::of(5, "x".into(), 2.0)), None);
+        assert_eq!(sequence.ripple_insert(7, 0, Clip::of(5, "x".into(), 2.0)), None, "no such track");
+    }
+
+    #[test]
+    fn an_insert_on_an_empty_track_goes_to_the_start_of_the_export_range() {
+        let mut sequence = three_in_a_row();
+        let empty = sequence.add_track(1, TrackKind::Video);
+        let id = sequence.ripple_insert(empty, 0, Clip::of(4, "n".into(), 5.0)).unwrap();
+        assert_eq!(sequence.clip(id).span(), span(0.0, 5.0));
+    }
+
+    #[test]
+    fn an_insert_takes_chained_clips_along_or_changes_nothing() {
+        // The picture 10..20 on the video track, its sound 10..20 on the audio track under it.
+        let (mut sequence, picture, sound) = detached();
+        let mut blocked = sequence.clone();
+        let id = sequence.ripple_insert(picture.track, 0, Clip::of(1, "n".into(), 5.0)).unwrap();
+        assert_eq!(sequence.clip(id).span(), span(10.0, 15.0));
+        let picture = ClipId { track: picture.track, index: 1 };
+        assert_eq!((sequence.clip(picture).start, sequence.clip(sound).start), (15.0, 15.0));
+        // Something in the sound's way: nothing changes at all.
+        blocked.place_clip(Some(sound.track), Clip { start: 22.0, ..Clip::of(2, "m".into(), 3.0) });
+        let before = blocked.clone();
+        assert_eq!(blocked.ripple_insert(picture.track, 0, Clip::of(1, "n".into(), 5.0)), None);
+        assert_eq!(blocked, before);
+    }
+
+    #[test]
+    fn a_moved_clip_takes_its_new_place_and_all_stay_one_after_another() {
+        let mut sequence = three_in_a_row();
+        assert_eq!(sequence.ripple_move(0, 0, 2), Some(ClipId { track: 0, index: 2 }));
+        assert_eq!(names_and_starts(&sequence, 0), [("b", 0.0), ("c", 4.0), ("a", 10.0)]);
+        assert_eq!(sequence.export, span(0.0, 20.0));
+        sequence.ripple_move(0, 2, 0).unwrap();
+        assert_eq!(names_and_starts(&sequence, 0), [("a", 0.0), ("b", 10.0), ("c", 14.0)]);
+        sequence.ripple_move(0, 1, 1).unwrap();
+        assert_eq!(names_and_starts(&sequence, 0), [("a", 0.0), ("b", 10.0), ("c", 14.0)], "its own place: as it was");
+        assert_eq!(sequence.ripple_move(0, 3, 0), None);
+        assert_eq!(sequence.ripple_move(0, 0, 3), None);
+        let (mut detached, picture, _) = detached();
+        assert_eq!(detached.ripple_move(picture.track, picture.index, 0), None, "chained: it would leave its sound");
+    }
+
+    #[test]
+    fn a_retimed_clip_keeps_its_start_and_the_ones_after_it_follow() {
+        let mut sequence = three_in_a_row();
+        let a = ClipId { track: 0, index: 0 };
+        assert!(sequence.ripple_retime(a, span(5.0, 20.0)));
+        assert_eq!((sequence.clip(a).source_in, sequence.clip(a).source_out), (5.0, 20.0));
+        assert_eq!(names_and_starts(&sequence, 0), [("a", 0.0), ("b", 15.0), ("c", 19.0)]);
+        assert_eq!(sequence.export, span(0.0, 25.0));
+        // Shorter than its fade: the fade shortens too.
+        sequence.clip_mut(a).add_fade(Edge::Out);
+        sequence.clip_mut(a).set_fade_length(Edge::Out, 5.0);
+        assert!(sequence.ripple_retime(a, span(2.0, 4.0)));
+        assert_eq!(names_and_starts(&sequence, 0), [("a", 0.0), ("b", 2.0), ("c", 6.0)]);
+        assert!(sequence.clip(a).fade_lengths().1 <= 2.0);
+        assert_eq!(sequence.export, span(0.0, 12.0));
+        let before = sequence.clone();
+        assert!(!sequence.ripple_retime(a, span(25.0, 40.0)), "past the end of its 30 s source");
+        assert!(!sequence.ripple_retime(a, span(4.0, 4.0)));
+        assert_eq!(sequence, before);
+        let (mut detached, picture, _) = detached();
+        assert!(!detached.ripple_retime(picture, span(2.0, 8.0)), "chained");
     }
 }

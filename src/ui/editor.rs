@@ -6,6 +6,7 @@
 
 use crate::core::edit::{Clip, ClipId, Color, Curve, Edge, Effect, Sequence, SourceId, Span, TrackKind};
 use crate::core::history::History;
+use crate::core::lock::EditorLock;
 use crate::core::plugins::Plugin;
 use crate::core::project::{self, Project, Source, ViewState, RENDERS_FOLDER};
 use crate::core::settings::Settings;
@@ -140,6 +141,8 @@ pub struct Editor {
     /// The clip Ctrl+C copied, and what it put into the system's clipboard to say so: Ctrl+V pastes
     /// the clip only while that text is still there.
     clipboard: Option<(Clip, TrackKind, String)>,
+    /// Keeps ds-tool from changing the project while it is open here. Last, so that it goes last.
+    _lock: Option<EditorLock>,
 }
 
 impl Editor {
@@ -150,6 +153,7 @@ impl Editor {
             let ctx = ctx.clone();
             Arc::new(move || ctx.request_repaint())
         };
+        let lock = EditorLock::take(&dir);
         let mut library = Library::new(cache_root, notify.clone());
         for source in &project.sources {
             library.add(source.id, &source.path);
@@ -197,6 +201,7 @@ impl Editor {
             flash: None,
             scroll_to: None,
             clipboard: None,
+            _lock: lock,
         }
     }
 

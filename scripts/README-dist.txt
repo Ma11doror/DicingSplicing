@@ -19,6 +19,8 @@ Press F1 in the editor for the list of keys.
 In this folder
 --------------
 dicing_splicing.exe            the editor
+ds-tool.exe                    makes and changes projects from the command line, for scripts and agents
+ds-tool.md, project-file.md    how to use ds-tool; the project file, for what ds-tool does not do
 dicing_splicing-link.exe       plugin: videos by link (YouTube, song.link and others)
 dicing_splicing-telegram.exe   plugin: sends a finished video to Telegram
 dicing_splicing.pdb            names for the error reports
@@ -29,6 +31,12 @@ THIRD-PARTY-LICENSES.txt       the licenses of the libraries built into the prog
 
 If videos by link stop downloading, update yt-dlp: run "yt-dlp.exe -U" in this folder. A yt-dlp
 installed separately (winget install yt-dlp.yt-dlp) is used before the one here.
+
+Scripts and AI agents
+---------------------
+ds-tool.exe lays recordings out in a project from the command line: "ds-tool help" lists its
+commands, and ds-tool.md tells how to use it, with a request to give an AI agent. While the
+editor has a project open, ds-tool leaves it alone: close the project in the editor first.
 
 Telegram
 --------

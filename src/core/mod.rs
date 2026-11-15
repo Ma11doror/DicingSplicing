@@ -3,6 +3,7 @@ pub mod edit;
 pub mod export;
 pub mod files;
 pub mod history;
+pub mod lock;
 pub mod plugins;
 pub mod preset;
 pub mod project;
