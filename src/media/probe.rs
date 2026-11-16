@@ -24,6 +24,7 @@ impl Rational {
 }
 
 /// What a file is. A file of sound only has no size and no frame rate: 0 by 0 at 0 frames a second.
+/// An image has a size and no length: its duration is 0.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MediaInfo {
     pub duration: f64,
@@ -32,18 +33,34 @@ pub struct MediaInfo {
     pub height: u32,
     pub fps: Rational,
     pub has_audio: bool,
+    /// It is an image: one picture, with no length of its own.
+    #[serde(default)]
+    pub image: bool,
 }
 
 pub fn probe(path: &Path) -> Result<MediaInfo> {
+    let mut info = parse(&ffprobe(path, &["-show_format", "-show_streams"])?)?;
+    // A photo says how it is turned in its first frame, not in its stream: ffmpeg turns it when it
+    // decodes it all the same.
+    if info.image {
+        let frames = ffprobe(path, &["-select_streams", "V:0", "-show_frames", "-read_intervals", "%+#1"])?;
+        (info.width, info.height) = turned(info.width, info.height, first_frame_rotation(&frames));
+    }
+    Ok(info)
+}
+
+/// What ffprobe tells about `path` with `args`, as JSON.
+fn ffprobe(path: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let output = tools::command(tools::FFPROBE)
-        .args(["-v", "error", "-print_format", "json", "-show_format", "-show_streams"])
+        .args(["-v", "error", "-print_format", "json"])
+        .args(args)
         .arg(path)
         .output()
         .context("failed to run ffprobe")?;
     if !output.status.success() {
         bail!("ffprobe failed: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
-    parse(&output.stdout)
+    Ok(output.stdout)
 }
 
 #[derive(Deserialize)]
@@ -61,6 +78,7 @@ struct ProbeStream {
     avg_frame_rate: Option<String>,
     r_frame_rate: Option<String>,
     duration: Option<String>,
+    nb_frames: Option<String>,
     #[serde(default)]
     side_data_list: Vec<SideData>,
     #[serde(default)]
@@ -87,7 +105,38 @@ struct Disposition {
 
 #[derive(Deserialize)]
 struct ProbeFormat {
+    format_name: Option<String>,
     duration: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ProbeFrames {
+    #[serde(default)]
+    frames: Vec<ProbeFrame>,
+}
+
+#[derive(Deserialize)]
+struct ProbeFrame {
+    #[serde(default)]
+    side_data_list: Vec<SideData>,
+}
+
+/// How far the first frame in ffprobe's `-show_frames` JSON is turned, in degrees: 0 if it says
+/// nothing of it.
+fn first_frame_rotation(json: &[u8]) -> f64 {
+    let frames: Option<ProbeFrames> = serde_json::from_slice(json).ok();
+    let first = frames.and_then(|frames| frames.frames.into_iter().next());
+    first.and_then(|frame| frame.side_data_list.iter().find_map(|d| d.rotation)).unwrap_or(0.0)
+}
+
+/// The size of a picture of `width` by `height` turned by `rotation` degrees, as it is shown.
+fn turned(width: u32, height: u32, rotation: f64) -> (u32, u32) {
+    let quarter_turns = (rotation / 90.0).round() as i64;
+    if quarter_turns.rem_euclid(2) == 1 {
+        (height, width)
+    } else {
+        (width, height)
+    }
 }
 
 impl MediaInfo {
@@ -113,7 +162,7 @@ fn parse(json: &[u8]) -> Result<MediaInfo> {
             .and_then(|d| d.parse::<f64>().ok())
             .filter(|d| *d > 0.0)
             .context("can't determine the duration")?;
-        return Ok(MediaInfo { duration, width: 0, height: 0, fps: Rational { num: 0, den: 1 }, has_audio });
+        return Ok(MediaInfo { duration, width: 0, height: 0, fps: Rational { num: 0, den: 1 }, has_audio, image: false });
     };
 
     let (w, h) = (
@@ -126,13 +175,19 @@ fn parse(json: &[u8]) -> Result<MediaInfo> {
         .find_map(|d| d.rotation)
         .or_else(|| video.tags.rotate.as_deref().and_then(|r| r.parse().ok()))
         .unwrap_or(0.0);
-    let quarter_turns = (rotation / 90.0).round() as i64;
-    let (width, height) = if quarter_turns.rem_euclid(2) == 1 { (h, w) } else { (w, h) };
+    let (width, height) = turned(w, h, rotation);
 
-    let fps = [&video.avg_frame_rate, &video.r_frame_rate]
-        .into_iter()
-        .find_map(|r| r.as_deref().and_then(Rational::parse))
-        .context("can't determine the frame rate")?;
+    // One picture: what ffmpeg reads as an image, and a GIF of one frame. An animated GIF is a
+    // video. An image's rate is only how ffmpeg would repeat it, its length none.
+    let format = probe.format.as_ref().and_then(|f| f.format_name.as_deref()).unwrap_or_default();
+    let image = format == "image2" || format.ends_with("_pipe") || (format == "gif" && video.nb_frames.as_deref() == Some("1"));
+    let rate = [&video.avg_frame_rate, &video.r_frame_rate].into_iter().find_map(|r| r.as_deref().and_then(Rational::parse));
+    if image {
+        let fps = rate.unwrap_or(Rational { num: 25, den: 1 });
+        return Ok(MediaInfo { duration: 0.0, width, height, fps, has_audio: false, image: true });
+    }
+
+    let fps = rate.context("can't determine the frame rate")?;
     let duration = probe
         .format
         .as_ref()
@@ -142,7 +197,7 @@ fn parse(json: &[u8]) -> Result<MediaInfo> {
         .filter(|d| *d > 0.0)
         .context("can't determine the duration")?;
 
-    Ok(MediaInfo { duration, width, height, fps, has_audio })
+    Ok(MediaInfo { duration, width, height, fps, has_audio, image: false })
 }
 
 #[cfg(test)]
@@ -197,5 +252,50 @@ mod tests {
         assert_eq!(info.fps, Rational { num: 25, den: 1 });
         assert!(!info.has_audio);
         assert_eq!(info.duration, 3.5);
+    }
+
+    #[test]
+    fn an_image_is_one_picture_with_no_length() {
+        // What ffprobe 9 says of a PNG, a JPEG and GIFs: a PNG has no duration, a JPEG one frame's.
+        let png = br#"{
+            "streams": [{"codec_type": "video", "codec_name": "png", "width": 640, "height": 360,
+                         "avg_frame_rate": "25/1", "r_frame_rate": "25/1"}],
+            "format": {"format_name": "png_pipe", "nb_streams": 1}
+        }"#;
+        let info = parse(png).unwrap();
+        assert!(info.image && info.has_video() && !info.has_audio);
+        assert_eq!((info.width, info.height, info.duration), (640, 360, 0.0));
+        let jpeg = br#"{
+            "streams": [{"codec_type": "video", "codec_name": "mjpeg", "width": 4000, "height": 3000,
+                         "avg_frame_rate": "25/1", "r_frame_rate": "25/1", "duration": "0.040000"}],
+            "format": {"format_name": "image2", "duration": "0.040000"}
+        }"#;
+        let info = parse(jpeg).unwrap();
+        assert!(info.image);
+        assert_eq!((info.width, info.height, info.duration), (4000, 3000, 0.0));
+        let gif = |frames: &str, duration: &str| {
+            format!(
+                r#"{{"streams": [{{"codec_type": "video", "codec_name": "gif", "width": 320, "height": 180,
+                    "avg_frame_rate": "10/1", "r_frame_rate": "10/1", "duration": "{duration}", "nb_frames": "{frames}"}}],
+                   "format": {{"format_name": "gif", "duration": "{duration}"}}}}"#
+            )
+        };
+        let still = parse(gif("1", "0.100000").as_bytes()).unwrap();
+        assert!(still.image && still.duration == 0.0, "a GIF of one frame is an image");
+        let animated = parse(gif("20", "2.000000").as_bytes()).unwrap();
+        assert!(!animated.image && animated.duration == 2.0, "an animated GIF is a video");
+    }
+
+    #[test]
+    fn a_photo_is_turned_as_its_first_frame_says() {
+        // A photo taken upright: its EXIF says to turn it, and ffmpeg 9 says so in the first frame.
+        let frames = br#"{"frames": [{"media_type": "video", "width": 640, "height": 360, "side_data_list": [
+            {"side_data_type": "3x3 displaymatrix", "rotation": -90},
+            {"side_data_type": "EXIF metadata", "size": 14}]}]}"#;
+        assert_eq!(first_frame_rotation(frames), -90.0);
+        assert_eq!(turned(640, 360, -90.0), (360, 640));
+        assert_eq!(turned(640, 360, 180.0), (640, 360));
+        assert_eq!(first_frame_rotation(br#"{"frames": [{"media_type": "video"}]}"#), 0.0);
+        assert_eq!(first_frame_rotation(b"not json"), 0.0);
     }
 }

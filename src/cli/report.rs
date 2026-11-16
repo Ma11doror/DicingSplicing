@@ -22,9 +22,12 @@ pub struct Line {
     pub start: f64,
     pub length: f64,
     pub file: String,
-    /// The part of the file it plays.
+    /// The part of the file it plays; of a still, the moment of the frame it holds.
     pub from: f64,
     pub to: f64,
+    /// It shows one picture all along: an image, or a frame held.
+    pub still: bool,
+    pub image: bool,
     /// How fast it plays that part: 2 is twice as fast, so half as long. Set in the editor.
     pub speed: f64,
     /// All of its picture is in the frame, with black bars around it, as Fit makes it.
@@ -57,8 +60,10 @@ pub fn summary(project: &Project) -> Summary {
                     start: clip.start,
                     length: clip.span().len(),
                     file: file_of(clip.source),
-                    from: clip.source_in,
-                    to: clip.source_out,
+                    from: clip.still.unwrap_or(clip.source_in),
+                    to: clip.still.unwrap_or(clip.source_out),
+                    still: clip.still.is_some(),
+                    image: clip.is_image(),
                     speed: clip.speed(),
                     bars: clip.transform.bars && clip.transform.zoom < 1.0 - ROUNDING,
                 })
@@ -118,7 +123,12 @@ impl Summary {
                 let file = file_label(Path::new(&line.file));
                 let at = if line.speed == 1.0 { String::new() } else { format!(", at {}", speed_text(line.speed)) };
                 let bars = if line.bars { ", with black bars" } else { "" };
-                text.push_str(&format!("\n  {:>3}  {}  {}  {name:<width$}  {file} {} to {}{at}{bars}", line.number, format(line.start), format(line.length), format(line.from), format(line.to)));
+                let plays = match (line.still, line.image) {
+                    (true, true) => format!("{file}, an image"),
+                    (true, false) => format!("{file}, its frame at {} held", format(line.from)),
+                    (false, _) => format!("{file} {} to {}", format(line.from), format(line.to)),
+                };
+                text.push_str(&format!("\n  {:>3}  {}  {}  {name:<width$}  {plays}{at}{bars}", line.number, format(line.start), format(line.length)));
             }
         }
         if !self.others.is_empty() {
@@ -137,7 +147,7 @@ impl Summary {
         let clips: Vec<Value> = self
             .lines
             .iter()
-            .map(|line| json!({"number": line.number, "name": line.name, "start": line.start, "length": line.length, "file": line.file, "from": line.from, "to": line.to, "speed": line.speed, "bars": line.bars}))
+            .map(|line| json!({"number": line.number, "name": line.name, "start": line.start, "length": line.length, "file": line.file, "from": line.from, "to": line.to, "speed": line.speed, "still": line.still, "image": line.image, "bars": line.bars}))
             .collect();
         let others: Vec<Value> = self.others.iter().map(|(name, count)| json!({"name": name, "clips": count})).collect();
         json!({
@@ -187,6 +197,13 @@ pub fn problems(project: &Project, probe: &dyn Fn(&Path) -> Result<MediaInfo>) -
         for (i, clip) in clips.iter().enumerate() {
             match project.sources.iter().find(|source| source.id == clip.source) {
                 None => problems.push(format!("{} plays a source the project does not have", at(i))),
+                // A still holds a frame, and its length is its own.
+                Some(source) if clip.still.is_some() => {
+                    let held = clip.still.unwrap_or_default();
+                    if let Some(&length) = lengths.get(&clip.source).filter(|&&length| held > length + ROUNDING) {
+                        problems.push(format!("{} holds the frame of {} at {}, and the file is {} long: the editor holds its last frame", at(i), source.label(), format(held), format(length)));
+                    }
+                }
                 Some(source) => {
                     if let Some(&length) = lengths.get(&clip.source).filter(|&&length| clip.source_out > length + ROUNDING) {
                         problems.push(format!(
@@ -268,6 +285,54 @@ mod tests {
         assert!(summary.text().contains("install.mp4 00:12.00 to 04:05.00, at ×2\n") || summary.text().ends_with("install.mp4 00:12.00 to 04:05.00, at ×2"), "{}", summary.text());
         assert!(summary.text().contains("  00:12.50  01:56.50  "), "half as long: {}", summary.text());
         assert_eq!(summary.json()["clips"][1]["speed"], 2.0);
+    }
+
+    #[test]
+    fn an_image_put_in_the_editor_is_shown_and_left_to_the_editor() {
+        let mut project = lesson();
+        let (logo, _) = crate::core::project::add_source(&mut project.sources, "C:/rec/logo.png".into(), Some("logo.png".into()), Default::default());
+        let image = crate::core::edit::Clip::image(logo, "Logo".into());
+        project.sequence.ripple_insert(0, 1, image).unwrap();
+        let summary = summary(&project);
+        assert!(summary.text().contains("  00:12.50  00:05.00  Logo"), "{}", summary.text());
+        assert!(summary.text().contains("  logo.png, an image\n"), "{}", summary.text());
+        assert!(summary.text().contains("  install.mp4 00:12.00 to 04:05.00"), "the next one moved along: {}", summary.text());
+        let json = summary.json();
+        assert_eq!((json["clips"][1]["still"].as_bool(), json["clips"][1]["image"].as_bool()), (Some(true), Some(true)));
+        assert_eq!((json["clips"][1]["from"].as_f64(), json["clips"][1]["to"].as_f64()), (Some(0.0), Some(0.0)));
+        assert_eq!(json["clips"][0]["still"], false);
+        // Trimmed or cut, it has no recording time: the editor does that.
+        let refused = crate::cli::pieces::retime(&mut project, 2, None, Some(3.0)).unwrap_err().to_string();
+        assert_eq!(refused, "clip 2 is an image: it plays no part of a recording, so its times are changed in the editor");
+        assert!(crate::cli::pieces::blade(&mut project, 2, 1.0).is_err());
+        // An image is not put in by ds-tool.
+        let info = MediaInfo { duration: 0.0, image: true, ..video(1.0) };
+        let refused = put(&mut project, &piece("logo.png", None, None, None), &info, None).unwrap_err().to_string();
+        assert!(refused.contains("logo.png is an image"), "{refused}");
+    }
+
+    #[test]
+    fn a_still_is_wrong_only_when_its_frame_is_past_the_end_of_its_file() {
+        let dir = std::env::temp_dir().join(format!("dicing_splicing_report_stills_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (logo, recording) = (dir.join("logo.png"), dir.join("recording.mp4"));
+        std::fs::write(&logo, "").unwrap();
+        std::fs::write(&recording, "").unwrap();
+        let mut project = new_project("Stills", PresetId::Landscape);
+        let (image, _) = crate::core::project::add_source(&mut project.sources, logo, None, Default::default());
+        let (held, _) = crate::core::project::add_source(&mut project.sources, recording, None, Default::default());
+        let track = find_video_track(&project.sequence).unwrap();
+        project.sequence.ripple_insert(track, 0, crate::core::edit::Clip::image(image, "Logo".into())).unwrap();
+        let frame = crate::core::edit::Clip { still: Some(40.0), source_duration: 60.0, ..crate::core::edit::Clip::image(held, "Held".into()) };
+        project.sequence.ripple_insert(track, 1, frame).unwrap();
+        // The image has no length, and its clip is as long as it is made; the recording turned out
+        // shorter than the moment its frame is held at.
+        let probe = |path: &Path| -> Result<MediaInfo> {
+            Ok(if path.ends_with("logo.png") { MediaInfo { duration: 0.0, image: true, ..video(1.0) } } else { video(30.0) })
+        };
+        assert_eq!(problems(&project, &probe), ["Video 1, clip 2 holds the frame of recording.mp4 at 00:40.00, and the file is 00:30.00 long: the editor holds its last frame"]);
+        assert!(summary(&project).text().contains("  recording.mp4, its frame at 00:40.00 held"), "{}", summary(&project).text());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

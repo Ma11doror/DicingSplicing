@@ -4,7 +4,7 @@
 
 use crate::core::tools;
 use crate::media::probe::{MediaInfo, Rational};
-use crate::media::Notify;
+use crate::media::{Notify, OVER_BLACK};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
@@ -231,8 +231,10 @@ impl MediaCache {
         };
 
         if cache.info.has_video() {
+            // An image is one frame; what is transparent in it is black.
+            let over_black = if cache.info.image { format!("{OVER_BLACK},") } else { String::new() };
             let filter = format!(
-                "fps={}/{}:start_time=0,scale={}:{}:flags=bicubic",
+                "{over_black}fps={}/{}:start_time=0,scale={}:{}:flags=bicubic",
                 format.fps.num, format.fps.den, format.width, format.height
             );
             #[rustfmt::skip]
@@ -569,7 +571,7 @@ mod tests {
 
     #[test]
     fn frame_format_limits_size_and_rate() {
-        let info = |w, h, num, den| MediaInfo { duration: 1.0, width: w, height: h, fps: Rational { num, den }, has_audio: false };
+        let info = |w, h, num, den| MediaInfo { duration: 1.0, width: w, height: h, fps: Rational { num, den }, has_audio: false, image: false };
         let f = FrameFormat::for_source(&info(1920, 1080, 60000, 1001));
         assert_eq!((f.width, f.height, f.fps), (960, 540, Rational { num: 60000, den: 2002 }));
         let f = FrameFormat::for_source(&info(1080, 1920, 25, 1));
@@ -630,6 +632,67 @@ mod tests {
         let cache = MediaCache::open_in(&root, &source, notify).unwrap();
         assert!(cache.build.is_none(), "the second open must reuse the cache");
         assert_eq!(cache.frame_count(), 50);
+        drop(cache);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An image's cache is its one picture, turned as the photo says, and black where it is
+    /// transparent.
+    #[test]
+    fn an_image_is_one_frame_turned_upright_and_black_where_it_is_transparent() {
+        if tools::check(tools::FFMPEG).is_err() || tools::check(tools::FFPROBE).is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("dicing_splicing_image_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Half transparent red on the left half, all transparent white on the right.
+        let png = dir.join("half.png");
+        let picture = "color=c=red@0.5:s=40x20,format=rgba,pad=80:20:0:0:color=white@0";
+        let status = tools::command(tools::FFMPEG).args(["-v", "error", "-f", "lavfi", "-i", picture, "-frames:v", "1"]).arg(&png).status().unwrap();
+        assert!(status.success());
+        // A photo stored lying on its side, with an EXIF orientation that stands it up.
+        let lying = dir.join("lying.jpg");
+        let status = tools::command(tools::FFMPEG).args(["-v", "error", "-f", "lavfi", "-i", "testsrc=s=64x32", "-frames:v", "1"]).arg(&lying).status().unwrap();
+        assert!(status.success());
+        let jpeg = fs::read(&lying).unwrap();
+        // An APP1 segment right after the start: Exif, a little-endian TIFF header and one entry,
+        // the orientation (0x0112), a SHORT of value 6: turn it a quarter clockwise.
+        let mut exif = b"Exif\0\0II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0\0\0\0\0".to_vec();
+        let mut app1 = vec![0xFF, 0xE1];
+        app1.extend_from_slice(&((exif.len() + 2) as u16).to_be_bytes());
+        app1.append(&mut exif);
+        let photo = dir.join("photo.jpg");
+        fs::write(&photo, [&jpeg[..2], &app1, &jpeg[2..]].concat()).unwrap();
+
+        let (root, notify): (_, Notify) = (dir.join("cache"), Arc::new(|| {}));
+        let ready = |cache: &MediaCache| {
+            let started = Instant::now();
+            while !matches!(cache.status(), CacheStatus::Ready) {
+                assert!(!matches!(cache.status(), CacheStatus::Failed(_)), "the build failed");
+                assert!(started.elapsed() < Duration::from_secs(60), "the build timed out");
+                thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let frame = |cache: &MediaCache| {
+            let (offset, len) = cache.frames.get(0).unwrap();
+            let bytes = fs::read(cache.frames_path()).unwrap();
+            image::load_from_memory(&bytes[offset as usize..][..len as usize]).unwrap().to_rgb8()
+        };
+        let cache = MediaCache::open_in(&root, &png, notify.clone()).unwrap();
+        assert!(cache.info.image && cache.info.duration == 0.0);
+        ready(&cache);
+        assert_eq!(cache.frame_count(), 1);
+        let rgb = frame(&cache);
+        let [r, g, b] = rgb.get_pixel(10, 10).0;
+        assert!((110..=145).contains(&r) && g < 20 && b < 20, "half of red over black: {r} {g} {b}");
+        let [r, g, b] = rgb.get_pixel(70, 10).0;
+        assert!(r < 20 && g < 20 && b < 20, "nothing over black: {r} {g} {b}");
+
+        let cache = MediaCache::open_in(&root, &photo, notify).unwrap();
+        assert_eq!((cache.info.width, cache.info.height), (32, 64), "stood up");
+        ready(&cache);
+        assert_eq!(frame(&cache).dimensions(), (32, 64));
         drop(cache);
         let _ = fs::remove_dir_all(&dir);
     }

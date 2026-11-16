@@ -7,7 +7,7 @@ use crate::core::edit::SourceId;
 use crate::core::tools;
 use crate::media::cache::MediaCache;
 use crate::media::probe::MediaInfo;
-use crate::media::Notify;
+use crate::media::{Notify, OVER_BLACK};
 use egui::{ColorImage, TextureHandle, TextureId, TextureOptions, Vec2};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
@@ -38,8 +38,9 @@ impl Shown {
 enum Origin {
     /// The bytes of a frame in the editor's cache of the source.
     Cache { frames: PathBuf, offset: u64, len: u32 },
-    /// ffmpeg takes the frame at `at` seconds from the file itself.
-    Ffmpeg { file: PathBuf, at: f64 },
+    /// ffmpeg takes the frame at `at` seconds from the file itself; of an `image`, its picture, with
+    /// what is transparent in it black.
+    Ffmpeg { file: PathBuf, at: f64, image: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -155,7 +156,7 @@ impl Thumbnails {
         let info = info.filter(|info| info.has_video())?;
         let origin = cache
             .and_then(|cache| cached(cache, poster_frame(cache)))
-            .unwrap_or_else(|| Origin::Ffmpeg { file: path.to_owned(), at: info.duration * POSTER_AT });
+            .unwrap_or_else(|| Origin::Ffmpeg { file: path.to_owned(), at: info.duration * POSTER_AT, image: info.image });
         self.posters.insert(id, Poster::Asked(path.to_owned()));
         let job = Job { id, path: path.to_owned(), what: What::Poster, origin, max };
         self.shared.queue.lock().unwrap().posters.push_back(job);
@@ -244,7 +245,7 @@ fn work(shared: &Shared, notify: &Notify) {
 fn make(origin: &Origin, max: [u32; 2]) -> Result<ColorImage, String> {
     let jpeg = match origin {
         Origin::Cache { frames, offset, len } => read_at(frames, *offset, *len).map_err(|error| format!("can't read {}: {error}", frames.display()))?,
-        Origin::Ffmpeg { file, at } => grab(file, *at, max)?,
+        Origin::Ffmpeg { file, at, image } => grab(file, *at, *image, max)?,
     };
     let picture = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg).map_err(|error| error.to_string())?;
     let small = picture.thumbnail(max[0].max(1), max[1].max(1)).to_rgba8();
@@ -259,9 +260,10 @@ fn read_at(path: &Path, offset: u64, len: u32) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// One frame of the file, as a JPEG that fits in `max`.
-fn grab(file: &Path, at: f64, max: [u32; 2]) -> Result<Vec<u8>, String> {
-    let scale = format!("scale={}:{}:force_original_aspect_ratio=decrease:force_divisible_by=2", max[0].max(2), max[1].max(2));
+/// One frame of the file, as a JPEG that fits in `max`; of an `image`, its picture over black.
+fn grab(file: &Path, at: f64, image: bool, max: [u32; 2]) -> Result<Vec<u8>, String> {
+    let flat = if image { format!("{OVER_BLACK},") } else { String::new() };
+    let scale = format!("{flat}scale={}:{}:force_original_aspect_ratio=decrease:force_divisible_by=2", max[0].max(2), max[1].max(2));
     let output = tools::command(tools::FFMPEG)
         .args(["-v", "error", "-ss", &format!("{:.3}", at.max(0.0)), "-i"])
         .arg(file)

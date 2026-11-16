@@ -119,8 +119,10 @@ the command line, or numbers of seconds; `"fit": true` is `--fit`.
 
 - The text: what was done, then the project. With `--json`, the same as an object: `done`, and
   `project` with `name`, `frame`, `ratio`, `clips` (each with `number`, `name`, `start`, `length`,
-  `file`, `from` and `to`, in seconds, `speed`, and `bars`, true for a picture shown whole with black
-  bars), `length`, `export`, `other_tracks` and `warnings`. `check` adds `problems`.
+  `file`, `from` and `to`, in seconds, `speed`, `still`, `image`, and `bars`, true for a picture
+  shown whole with black bars), `length`, `export`, `other_tracks` and `warnings`. `check` adds
+  `problems`. `still` is true for a clip that shows one picture all along, and `image` for one of an
+  image; `from` and `to` of such a clip are both the moment of its picture in the file.
 - The exit code is 0 when it did what was asked. When it can't, it is 1, the reason is on the error
   output, and the project stays as it was. `check` answers 1 when it finds a problem.
 - A mistake in how the command is written comes with how it is written.
@@ -129,7 +131,9 @@ the command line, or numbers of seconds; `"fit": true` is `--fit`.
 
 - ds-tool works on Video 1, the top video track. A project made by ds-tool has only that one; tracks
   added in the editor stay as they are, and `show` lists them.
-- Videos only: a file without a picture, such as music, is refused.
+- Videos only: a file without a picture, such as music, is refused, and so is an image. Images go
+  onto the timeline in the editor; `show` lists such a clip as "an image", and `trim` and `blade`
+  leave it to the editor.
 - A clip chained to another in the editor, as a picture to its detached sound, is left to the editor:
   delete, move, trim and blade refuse it rather than part them.
 - While the editor has the project open, ds-tool changes nothing: the editor saves what it shows by

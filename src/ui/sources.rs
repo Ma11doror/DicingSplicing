@@ -228,8 +228,8 @@ pub fn sources_button(ui: &mut egui::Ui, rows: &[SourceRow], plugins: &[Plugin],
             ui.label(RichText::new(note).weak().small());
         }
         ui.horizontal_wrapped(|ui| {
-            let hint = "Files from the disk, as many as you like: videos, or sound only, such as music. They are not copied: the project links to them";
-            if ui.button("Add video or sound…").on_hover_text(hint).clicked() {
+            let hint = "Files from the disk, as many as you like: videos, sound only, such as music, and images. They are not copied: the project links to them";
+            if ui.button("Add video, sound or image…").on_hover_text(hint).clicked() {
                 action = Some(SourceAction::AddVideo);
             }
             for (i, plugin) in plugins.iter().enumerate().filter(|(_, plugin)| plugin.kind == PluginKind::Source) {
@@ -303,7 +303,9 @@ fn source_row(ui: &mut egui::Ui, row: &SourceRow, changed: Option<SystemTime>) -
 fn details(row: &SourceRow, changed: Option<SystemTime>) -> Option<String> {
     let info = row.info?;
     let sound = if info.has_audio { "sound" } else { "no sound" };
-    let mut details = if info.has_video() {
+    let mut details = if info.image {
+        format!("Image {}×{} · {}", info.width, info.height, placed(row.uses))
+    } else if info.has_video() {
         format!("{} · {}×{} · {sound} · {}", timecode::format(info.duration), info.width, info.height, placed(row.uses))
     } else {
         format!("{} · sound only · {}", timecode::format(info.duration), placed(row.uses))
@@ -329,6 +331,7 @@ fn state_text(row: &SourceRow) -> Option<(String, bool)> {
         SourceState::Opening => Some(("Opening…".to_owned(), false)),
         SourceState::Waiting => Some(("Its frames wait for another video's".to_owned(), false)),
         SourceState::Preparing(_) if row.info.is_some_and(|info| !info.has_video()) => Some(("Reading the sound".to_owned(), false)),
+        SourceState::Preparing(_) if row.info.is_some_and(|info| info.image) => Some(("Preparing the picture".to_owned(), false)),
         SourceState::Preparing(progress) => Some((format!("Preparing frames {:.0}%", progress * 100.0), false)),
         SourceState::Ready => None,
         SourceState::Missing => Some(("The file is not there".to_owned(), true)),
@@ -419,7 +422,8 @@ fn paint_tile(ui: &mut egui::Ui, row: &SourceRow, panel: &mut SourcesPanel) {
 
     let small = TextStyle::Small.resolve(ui.style());
     if let Some(info) = row.info {
-        let text = painter.layout_no_wrap(timecode::format(info.duration), small.clone(), Color32::WHITE);
+        let length = if info.image { "Image".to_owned() } else { timecode::format(info.duration) };
+        let text = painter.layout_no_wrap(length, small.clone(), Color32::WHITE);
         let badge = Rect::from_min_size(picture.right_bottom() - text.size() - vec2(8.0, 6.0), text.size() + vec2(6.0, 2.0));
         painter.rect_filled(badge, 3.0, BADGE_BACKGROUND);
         painter.galley(badge.min + vec2(3.0, 1.0), text, Color32::WHITE);

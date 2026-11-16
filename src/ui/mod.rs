@@ -18,6 +18,8 @@ use std::path::PathBuf;
 
 pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "mov", "webm", "avi", "m4v"];
 pub const SOUND_EXTENSIONS: &[&str] = &["mp3", "wav", "m4a", "aac", "flac", "ogg", "opus"];
+/// A GIF of one frame is an image, an animated one a video: ffprobe tells which.
+pub const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "gif"];
 
 /// How dots of a grip are apart, and how big they are.
 const GRIP_STEP: f32 = 4.0;
@@ -91,26 +93,31 @@ pub fn pick_video() -> Option<PathBuf> {
         .pick_file()
 }
 
-/// Asks for a file a source can be: a video, or sound only.
+/// Every kind of file a source can be: videos, sound files and images.
+fn media_extensions() -> Vec<&'static str> {
+    VIDEO_EXTENSIONS.iter().chain(SOUND_EXTENSIONS).chain(IMAGE_EXTENSIONS).copied().collect()
+}
+
+/// Asks for a file a source can be: a video, sound only, or an image.
 pub fn pick_media() -> Option<PathBuf> {
-    let both: Vec<&str> = VIDEO_EXTENSIONS.iter().chain(SOUND_EXTENSIONS).copied().collect();
     rfd::FileDialog::new()
-        .set_title("Choose a video or a sound file")
-        .add_filter("Video and sound", &both)
+        .set_title("Choose a video, a sound file or an image")
+        .add_filter("Video, sound and images", &media_extensions())
         .add_filter("Video", VIDEO_EXTENSIONS)
         .add_filter("Sound", SOUND_EXTENSIONS)
+        .add_filter("Images", IMAGE_EXTENSIONS)
         .add_filter("All files", &["*"])
         .pick_file()
 }
 
-/// Asks for files sources can be: any number of videos and sound files at once.
+/// Asks for files sources can be: any number of videos, sound files and images at once.
 pub fn pick_media_files() -> Vec<PathBuf> {
-    let both: Vec<&str> = VIDEO_EXTENSIONS.iter().chain(SOUND_EXTENSIONS).copied().collect();
     rfd::FileDialog::new()
-        .set_title("Choose videos or sound files")
-        .add_filter("Video and sound", &both)
+        .set_title("Choose videos, sound files or images")
+        .add_filter("Video, sound and images", &media_extensions())
         .add_filter("Video", VIDEO_EXTENSIONS)
         .add_filter("Sound", SOUND_EXTENSIONS)
+        .add_filter("Images", IMAGE_EXTENSIONS)
         .add_filter("All files", &["*"])
         .pick_files()
         .unwrap_or_default()

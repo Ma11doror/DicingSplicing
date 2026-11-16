@@ -1,6 +1,7 @@
 //! The window: settings, the workspace, opening projects and hosting the editor.
 
 use crate::core::crash;
+use crate::core::edit::Clip;
 use crate::core::plugins::{self, Fetched, Plugin};
 use crate::core::project::{self, Project, PROJECT_FILE};
 use crate::core::settings::{self, Settings};
@@ -78,7 +79,8 @@ impl NewProject {
         let info = probe::probe(&video)?;
         let name = name.unwrap_or_else(|| video.file_stem().map_or_else(|| "project".to_owned(), |stem| stem.to_string_lossy().into_owned()));
         let dir = workspace.new_project_dir(&name)?;
-        let mut project = Project::new(name, video, info.duration);
+        let first = Clip::whole(0, name.clone(), &info);
+        let mut project = Project::new(name, video, first);
         if let Some(source) = project.sources.first_mut() {
             source.meta = meta;
         }

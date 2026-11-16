@@ -27,7 +27,7 @@ use crate::ui::timeline::track_name;
 use crate::ui::{curve_choice, grip_dots, paint_curve, pick_media, pick_media_files};
 use crate::ui::plugins::PublishEnv;
 use crate::ui::sources::{self, SourceAction, SourceRow, SourcesPanel};
-use crate::ui::timeline::{Section, SourceSound, Timeline, TimelineEnv, Tool};
+use crate::ui::timeline::{Has, Section, SourceSound, Timeline, TimelineEnv, Tool};
 use crate::ui::viewer::{Layer, OutputView, SourceView};
 use egui::{Color32, Key, Modifiers, RichText, TextureHandle};
 use std::collections::{BTreeMap, BTreeSet};
@@ -146,6 +146,8 @@ pub struct Editor {
     /// The clip whose speed could not change last time it was asked to: the clips after it could not
     /// move that far. Its Speed block says so.
     speed_refused: Option<ClipId>,
+    /// The still whose length could not change last time, for the same reason. Its Timing says so.
+    length_refused: Option<ClipId>,
     /// The sound of the clips that play faster or slower, for playing them.
     stretcher: Stretcher,
     /// Keeps ds-tool from changing the project while it is open here. Last, so that it goes last.
@@ -209,6 +211,7 @@ impl Editor {
             scroll_to: None,
             clipboard: None,
             speed_refused: None,
+            length_refused: None,
             stretcher: Stretcher::new(notify.clone()),
             _lock: lock,
         }
@@ -340,6 +343,9 @@ impl Editor {
         if self.speed_refused != self.selected {
             self.speed_refused = None;
         }
+        if self.length_refused != self.selected {
+            self.length_refused = None;
+        }
     }
 
     /// Asks for the frames the views will need: the selected clip's for the middle, the one seen at
@@ -347,7 +353,7 @@ impl Editor {
     fn request_frames(&mut self) {
         let t = self.shown_time();
         let framed = self.selected.filter(|id| self.sequence.tracks[id.track].kind == TrackKind::Video);
-        let center = framed.map(|id| self.sequence.clip(id)).map(|clip| (clip.source, clip.source_time(t)));
+        let center = framed.map(|id| self.sequence.clip(id)).map(|clip| (clip.source, clip.picture_time(t)));
         let mut center_frame = None;
         if let Some((source, time)) = center {
             if let Some(cache) = self.library.cache(source) {
@@ -357,13 +363,13 @@ impl Editor {
         self.output_shares_center = false;
         if let Some((clip, cache)) = self.under_at(t).and_then(|id| Some((self.sequence.clip(id), self.library.cache(self.sequence.clip(id).source)?))) {
             self.under.set_color(clip.graded());
-            self.under.want(clip.source, clip.source_time(t), cache);
+            self.under.want(clip.source, clip.picture_time(t), cache);
         }
         if let Some(clip) = self.sequence.shown_at(t).map(|id| self.sequence.clip(id)) {
             let graded = clip.graded();
             self.output.set_color(graded);
             if let Some(cache) = self.library.cache(clip.source) {
-                let time = clip.source_time(t);
+                let time = clip.picture_time(t);
                 // In its own colour it is a picture of its own: the middle shows the source as it is.
                 self.output_shares_center = graded.is_none() && center_frame == Some((clip.source, frame_at(cache, time)));
                 if !self.output_shares_center {
@@ -646,7 +652,7 @@ impl Editor {
     /// Puts the whole source on a new track under the others, after the last clip, and goes there.
     fn add_to_timeline(&mut self, id: SourceId) {
         let (Some(source), Some(info)) = (self.sources.iter().find(|source| source.id == id), self.library.info(id)) else { return };
-        let clip = Clip::of(id, source.label(), info.duration);
+        let clip = Clip::whole(id, source.label(), info);
         // A file of sound only goes onto an audio track.
         let kind = if info.has_video() { TrackKind::Video } else { TrackKind::Audio };
         let added = self.sequence.add_below(clip, kind);
@@ -820,12 +826,12 @@ impl Editor {
         let fps = self.fps;
         let frame = self.frame();
         let missing = self.missing();
-        let placeable: BTreeMap<SourceId, (String, f64, bool)> = self
+        let placeable: BTreeMap<SourceId, (Clip, Has)> = self
             .sources
             .iter()
             .filter_map(|source| {
                 let info = self.library.info(source.id)?;
-                Some((source.id, (source.label(), info.duration, info.has_video())))
+                Some((source.id, (Clip::whole(source.id, source.label(), info), Has { picture: info.has_video(), sound: info.has_audio })))
             })
             .collect();
         // The graph of each source's sound: none for a video without sound.
@@ -1018,7 +1024,7 @@ impl Editor {
         // The frame of the new clip is on its way: what was there stays meanwhile. Only when it is
         // just being decoded, not while that video's frames are still being prepared: then the old
         // picture would stand for another clip.
-        let ready = self.library.cache(clip.source).is_some_and(|cache| cache.frames.get(frame_at(cache, clip.source_time(self.shown_time()))).is_some());
+        let ready = self.library.cache(clip.source).is_some_and(|cache| cache.frames.get(frame_at(cache, clip.picture_time(self.shown_time()))).is_some());
         if let Some(drawn) = self.drawn.filter(|_| ready) {
             if let Some(texture) = self.output.of(drawn.source).or(self.center.of(drawn.source)) {
                 return (Some(texture), None, drawn);
@@ -1087,7 +1093,8 @@ impl Editor {
         let zero = self.sequence.export.start;
         let (fps, at_playhead) = (self.fps, self.frame_start(self.position));
         let clip = self.sequence.clip(id);
-        let (span, source_in, source_out, name, speed) = (clip.span(), clip.source_in, clip.source_out, clip.name.clone(), clip.speed());
+        let (span, source_in, source_out, name, speed, still) = (clip.span(), clip.source_in, clip.source_out, clip.name.clone(), clip.speed(), clip.still);
+        let image = clip.is_image();
         let track = track_name(&self.sequence, id.track);
         let kind = self.sequence.tracks[id.track].kind;
         let detached = self.sequence.clip(id).sound_detached;
@@ -1117,14 +1124,30 @@ impl Editor {
             ui.end_row();
             ui.label("Length");
             let mut length = span.len();
-            if ui.add(time_value(&mut length, fps)).changed() {
+            // A still is as long as it is made: the clips after it make room, or take what it gave up.
+            if still.is_some() {
+                let field = ui.add(time_value(&mut length, fps)).on_hover_text("How long it lasts: the clips after it on its track move along");
+                if field.changed() {
+                    let done = self.sequence.set_length(id, length.max(self.frame()));
+                    self.length_refused = (!done).then_some(id);
+                }
+            } else if ui.add(time_value(&mut length, fps)).changed() {
                 self.trim_end(span.start + length);
             }
             ui.end_row();
         });
-        let at = if speed == 1.0 { String::new() } else { format!(", at {}", speed_text(speed)) };
-        let from = format!("From its source {} to {}{at}. Delete removes the clip.", timecode::format(source_in), timecode::format(source_out));
+        let from = match still {
+            Some(_) if image => "Its image all along, as long as you make it. Delete removes the clip.".to_owned(),
+            Some(at) => format!("The frame of its source at {} all along. Delete removes the clip.", timecode::format(at)),
+            None => {
+                let at = if speed == 1.0 { String::new() } else { format!(", at {}", speed_text(speed)) };
+                format!("From its source {} to {}{at}. Delete removes the clip.", timecode::format(source_in), timecode::format(source_out))
+            }
+        };
         ui.label(RichText::new(from).weak().small());
+        if self.length_refused == Some(id) {
+            ui.label(RichText::new("The clips after it can't move that far: one chained to them has no room.").color(ERROR).small());
+        }
         ui.separator();
 
         let source = self.sequence.clip(id).source;
@@ -1205,7 +1228,7 @@ impl Editor {
             };
             ui.label(RichText::new(text).weak());
             ui.separator();
-        } else if info.as_ref().is_some_and(|info| info.has_audio) {
+        } else if info.as_ref().is_some_and(|info| info.has_audio) && still.is_none() {
             let clip = self.sequence.clip_mut(id);
             let sound_section = flash::frame(ui, sound_flash, false).show(ui, |ui| {
                 ui.heading("Sound");
@@ -1229,7 +1252,8 @@ impl Editor {
 
         let refused = self.speed_refused == Some(id);
         let clip = self.sequence.clip_mut(id);
-        let (picture, sound) = (kind == TrackKind::Video, kind == TrackKind::Audio || !detached);
+        // A still has no sound to fade.
+        let (picture, sound) = (kind == TrackKind::Video, (kind == TrackKind::Audio || !detached) && still.is_none());
         let effects_section = flash::frame(ui, effects_flash, false).show(ui, |ui| effects_editor(ui, clip, picture, sound, refused));
         // A new speed makes the clip longer or shorter, and the clips after it move along.
         if let Some(change) = effects_section.inner {
@@ -1253,6 +1277,15 @@ impl Editor {
             return;
         };
         egui::Grid::new("source").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+            if info.image {
+                ui.label("Size");
+                ui.label(format!("{}×{}", info.width, info.height));
+                ui.end_row();
+                ui.label("Picture");
+                ui.label("an image: no length, no sound");
+                ui.end_row();
+                return;
+            }
             if info.has_video() {
                 ui.label("Size");
                 ui.label(format!("{}×{}", info.width, info.height));
@@ -1497,10 +1530,13 @@ fn effects_editor(ui: &mut egui::Ui, clip: &mut Clip, picture: bool, sound: bool
                 ui.close_menu();
             }
         }
-        let add = ui.add_enabled(clip.speed_effect().is_none(), egui::Button::new("Speed"));
-        if add.on_disabled_hover_text("The clip has one").clicked() {
-            clip.add_speed();
-            ui.close_menu();
+        // A still shows one frame however fast.
+        if clip.still.is_none() {
+            let add = ui.add_enabled(clip.speed_effect().is_none(), egui::Button::new("Speed"));
+            if add.on_disabled_hover_text("The clip has one").clicked() {
+                clip.add_speed();
+                ui.close_menu();
+            }
         }
     });
     speed_change

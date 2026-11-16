@@ -7,6 +7,7 @@
 use crate::core::export::ExportSettings;
 use crate::core::preset::Output;
 use crate::media::geometry::Transform;
+use crate::media::probe::MediaInfo;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -70,6 +71,8 @@ pub type SourceId = u32;
 
 /// How long a fade is when it is added, like the sound fades of the export.
 pub const DEFAULT_FADE: f64 = 1.0;
+/// How long an image lasts when it is put on the timeline.
+pub const IMAGE_LENGTH: f64 = 5.0;
 
 /// An edge of a clip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,6 +292,11 @@ pub struct Clip {
     /// and the sound detached from it are, until one of them is unchained.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<LinkId>,
+    /// It is a still: it shows the frame of its source at this source time all along, an image or a
+    /// freeze frame, and has no sound. Its `source_in` and `source_out` count its own time then, from
+    /// 0: they say how long it lasts, which its source does not limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub still: Option<f64>,
 }
 
 /// What chained clips have in common.
@@ -300,6 +308,7 @@ fn full_volume() -> f64 {
 
 impl Clip {
     /// The whole first source, from the start of the timeline.
+    #[cfg(test)]
     pub fn new(name: String, source_duration: f64) -> Self {
         Self::of(0, name, source_duration)
     }
@@ -319,13 +328,44 @@ impl Clip {
             effects: Vec::new(),
             sound_detached: false,
             link: None,
+            still: None,
         }
     }
 
+    /// The picture of an image `source`, for `IMAGE_LENGTH` seconds from the start of the timeline.
+    pub fn image(source: SourceId, name: String) -> Self {
+        Self { still: Some(0.0), source_out: IMAGE_LENGTH, ..Self::of(source, name, 0.0) }
+    }
+
+    /// All of `source`, with `info` in it, from the start of the timeline: a recording as long as it
+    /// is, an image for `IMAGE_LENGTH` seconds.
+    pub fn whole(source: SourceId, name: String, info: &MediaInfo) -> Self {
+        if info.image {
+            Self::image(source, name)
+        } else {
+            Self::of(source, name, info.duration)
+        }
+    }
+
+    /// Whether it shows an image: a still of a source with no length of its own.
+    pub fn is_image(&self) -> bool {
+        self.still.is_some() && self.source_duration <= 0.0
+    }
+
     /// The source turned out to have another length: its file was replaced. The trim stays as far as
-    /// it can; if nothing of it is left, the clip takes the whole source.
+    /// it can; if nothing of it is left, the clip takes the whole source. A still keeps its length,
+    /// and its frame stays within the source; a clip whose file is an image now, with no length,
+    /// becomes a still of it, as long as it was.
     pub fn refit_source(&mut self, duration: f64) {
+        if self.still.is_none() && duration <= 0.0 {
+            let length = self.span().len();
+            (self.still, self.source_in, self.source_out) = (Some(0.0), 0.0, length);
+        }
         self.source_duration = duration;
+        if let Some(frame) = &mut self.still {
+            *frame = frame.min(duration).max(0.0);
+            return;
+        }
         if self.source_in >= duration {
             self.source_in = 0.0;
             self.source_out = duration;
@@ -342,8 +382,12 @@ impl Clip {
         }
     }
 
-    /// How fast it plays its source: 1 without a Speed effect.
+    /// How fast it plays its source: 1 without a Speed effect, and for a still, which shows one
+    /// frame however fast.
     pub fn speed(&self) -> f64 {
+        if self.still.is_some() {
+            return 1.0;
+        }
         self.speed_effect().map_or(1.0, |speed| speed.played())
     }
 
@@ -352,11 +396,11 @@ impl Clip {
         self.effects.iter().find_map(Effect::as_speed)
     }
 
-    /// Adds a Speed effect that changes nothing yet, unless there is one. Returns whether it was
-    /// added. Its length stays: another speed is set by `Sequence::set_speed`, which moves the clips
-    /// after it.
+    /// Adds a Speed effect that changes nothing yet, unless there is one or the clip is a still.
+    /// Returns whether it was added. Its length stays: another speed is set by `Sequence::set_speed`,
+    /// which moves the clips after it.
     pub fn add_speed(&mut self) -> bool {
-        if self.speed_effect().is_some() {
+        if self.speed_effect().is_some() || self.still.is_some() {
             return false;
         }
         self.effects.push(Effect::Speed(Speed { factor: 1.0 }));
@@ -388,15 +432,23 @@ impl Clip {
         Span { start: self.start, end: self.end() }
     }
 
-    /// Where the whole source would be if it were not trimmed.
+    /// Where the whole source would be if it were not trimmed. A still is all there is of itself.
     pub fn source_span(&self) -> Span {
+        if self.still.is_some() {
+            return self.span();
+        }
         let offset = self.offset();
         Span { start: offset, end: offset + self.source_duration / self.speed() }
     }
 
-    /// Source time at timeline time `t`, also outside the trimmed part.
+    /// Source time at timeline time `t`, also outside the trimmed part. A still's own time.
     pub fn source_time(&self, t: f64) -> f64 {
         self.source_in + (t - self.start) * self.speed()
+    }
+
+    /// The source time of the frame seen at timeline time `t`: a still shows the same one all along.
+    pub fn picture_time(&self, t: f64) -> f64 {
+        self.still.unwrap_or_else(|| self.source_time(t))
     }
 
     /// Timeline time at which the source is at `source` seconds: the other way round from
@@ -528,19 +580,40 @@ impl Clip {
     }
 
     /// Moves the start edge to `t`, not before `lo`; the picture stays where it is on the timeline.
+    /// A still has no source to run out of: only `lo` stops it.
     fn trim_start(&mut self, t: f64, lo: f64, min_len: f64) {
-        let (offset, speed) = (self.offset(), self.speed());
-        self.start = clamp(t, lo.max(offset), self.end() - min_len);
-        self.source_in = ((self.start - offset) * speed).max(0.0);
+        if self.still.is_some() {
+            let end = self.end();
+            self.start = clamp(t, lo, end - min_len);
+            self.source_in = 0.0;
+            self.source_out = end - self.start;
+        } else {
+            let (offset, speed) = (self.offset(), self.speed());
+            self.start = clamp(t, lo.max(offset), self.end() - min_len);
+            self.source_in = ((self.start - offset) * speed).max(0.0);
+        }
         self.fit_fades();
     }
 
-    /// Moves the end edge to `t`, not after `hi`.
+    /// Moves the end edge to `t`, not after `hi`. A still goes as far as `hi`.
     fn trim_end(&mut self, t: f64, hi: f64, min_len: f64) {
-        let (offset, speed) = (self.offset(), self.speed());
-        let end = clamp(t, self.start + min_len, hi.min(offset + self.source_duration / speed));
-        self.source_out = ((end - offset) * speed).min(self.source_duration);
+        if self.still.is_some() {
+            let end = clamp(t, self.start + min_len, hi);
+            self.source_out = self.source_in + (end - self.start);
+        } else {
+            let (offset, speed) = (self.offset(), self.speed());
+            let end = clamp(t, self.start + min_len, hi.min(offset + self.source_duration / speed));
+            self.source_out = ((end - offset) * speed).min(self.source_duration);
+        }
         self.fit_fades();
+    }
+
+    /// A still's own time counts from 0 again, after a cut has taken its first part.
+    fn settle_still(&mut self) {
+        if self.still.is_some() {
+            self.source_out -= self.source_in;
+            self.source_in = 0.0;
+        }
     }
 }
 
@@ -697,10 +770,10 @@ impl Sequence {
     }
 
     /// Whether the sound of a clip is heard: on a track that is not muted, not muted itself, and on
-    /// an audio track, or on a video track if its sound was not detached.
+    /// an audio track, or on a video track if its sound was not detached. A still has none.
     pub fn sounds(&self, id: ClipId) -> bool {
         let (track, clip) = (&self.tracks[id.track], self.clip(id));
-        !track.muted && clip.gain() > 0.0 && (track.kind == TrackKind::Audio || !clip.sound_detached)
+        !track.muted && clip.gain() > 0.0 && (track.kind == TrackKind::Audio || !clip.sound_detached) && clip.still.is_none()
     }
 
     /// The video tracks' clips: what can be seen.
@@ -910,10 +983,10 @@ impl Sequence {
     /// Makes a clip play another part of its source, `part` in source seconds. It keeps its start,
     /// and the clips after it on its track move by as much as it got longer or shorter, each with
     /// the clips chained to it; its fades shorten to fit it. False, with nothing changed, if the
-    /// part is not in the source, the clip is chained to another, or the clips after it can't move
-    /// that far.
+    /// part is not in the source, the clip is chained to another or is a still, which plays no part
+    /// of its source, or the clips after it can't move that far.
     pub fn ripple_retime(&mut self, id: ClipId, part: Span) -> bool {
-        if !self.has(id) || self.is_chained(id) {
+        if !self.has(id) || self.is_chained(id) || self.clip(id).still.is_some() {
             return false;
         }
         let clip = self.clip(id);
@@ -944,9 +1017,16 @@ impl Sequence {
 
     /// Makes clip `id` play its source `factor` times as fast, by its Speed effect, added if it has
     /// none: see `resize` for the clips after it. False, with nothing changed, if they can't move
-    /// that far.
+    /// that far, or the clip is a still, which shows one frame however fast.
     pub fn set_speed(&mut self, id: ClipId, factor: f64) -> bool {
-        self.resize(id, |clip| clip.set_speed(factor))
+        self.has(id) && self.clip(id).still.is_none() && self.resize(id, |clip| clip.set_speed(factor))
+    }
+
+    /// Makes still clip `id` last `seconds`: see `resize` for the clips after it. False, with nothing
+    /// changed, if it is no still, `seconds` is no length, or the clips after it can't move that far.
+    pub fn set_length(&mut self, id: ClipId, seconds: f64) -> bool {
+        let still = self.has(id) && self.clip(id).still.is_some();
+        still && seconds.is_finite() && seconds > 0.0 && self.resize(id, |clip| clip.source_out = clip.source_in + seconds)
     }
 
     /// Takes clip `id`'s Speed effect off: it plays its source as it is again, see `set_speed`.
@@ -1168,9 +1248,9 @@ impl Sequence {
     /// it: the one there if it is free at that time, else a new one. The two are chained. The sound's
     /// part of the fades goes with the sound; the colour stays with the picture; both keep the speed,
     /// so that they stay together. Returns where the picture and the sound are now, or None if the
-    /// clip has no sound of its own to detach.
+    /// clip has no sound of its own to detach, like a still.
     pub fn detach_sound(&mut self, id: ClipId) -> Option<(ClipId, ClipId)> {
-        if self.tracks[id.track].kind != TrackKind::Video || self.clip(id).sound_detached {
+        if self.tracks[id.track].kind != TrackKind::Video || self.clip(id).sound_detached || self.clip(id).still.is_some() {
             return None;
         }
         let link = self.clip(id).link.unwrap_or_else(|| self.next_link());
@@ -1309,6 +1389,7 @@ impl Sequence {
         // The fade in stays with the part before the cut, the fade out goes with the part after it.
         // Both keep the colour.
         let mut after = Clip { start: t, source_in: cut, ..clip.clone() };
+        after.settle_still();
         after.effects.retain(|effect| !effect.is_fade_at(Edge::In));
         after.fit_fades();
         let before = self.clip_mut(id);
@@ -2400,5 +2481,104 @@ mod tests {
         assert_eq!(serde_json::from_value::<Clip>(written).unwrap().speed(), 1.0, "no speed at all plays as it is");
         let old: Clip = serde_json::from_value(serde_json::to_value(placed_clip()).unwrap()).unwrap();
         assert_eq!((old.speed(), old.span()), (1.0, span(10.0, 20.0)));
+    }
+
+    fn image_info() -> MediaInfo {
+        MediaInfo { duration: 0.0, width: 1920, height: 1080, fps: crate::media::probe::Rational { num: 25, den: 1 }, has_audio: false, image: true }
+    }
+
+    #[test]
+    fn an_image_shows_its_one_picture_for_as_long_as_it_lasts() {
+        let image = Clip::whole(4, "logo".into(), &image_info());
+        assert_eq!((image.source, image.span(), image.still), (4, span(0.0, IMAGE_LENGTH), Some(0.0)));
+        assert!(image.is_image());
+        assert_eq!((image.picture_time(0.0), image.picture_time(4.9), image.picture_time(100.0)), (0.0, 0.0, 0.0));
+        assert_eq!(image.source_span(), image.span(), "nothing of it is left out: no ghost");
+        // A recording is still all of it, and shows its frames one after another.
+        let video = MediaInfo { duration: 30.0, image: false, has_audio: true, ..image_info() };
+        let whole = Clip::whole(1, "a".into(), &video);
+        assert_eq!((whole.span(), whole.still, whole.picture_time(2.5)), (span(0.0, 30.0), None, 2.5));
+        assert!(!whole.is_image());
+        // However fast: one picture.
+        let mut sped = image.clone();
+        assert!(!sped.add_speed());
+        sped.effects.push(Effect::Speed(Speed { factor: 2.0 }));
+        assert_eq!((sped.speed(), sped.span()), (1.0, span(0.0, IMAGE_LENGTH)), "a speed written into its file changes nothing");
+        let mut sequence = Sequence::new(image);
+        assert!(!sequence.set_speed(ClipId { track: 0, index: 0 }, 2.0));
+    }
+
+    #[test]
+    fn an_image_is_trimmed_as_far_as_its_neighbours_let_it() {
+        // A video 0..3, the image 5..10, a video 12..20.
+        let image = Clip { start: 5.0, ..Clip::image(1, "logo".into()) };
+        let mut track = track_of(vec![Clip { source_out: 3.0, ..Clip::new("a".into(), 30.0) }, image, Clip { start: 12.0, source_out: 8.0, ..Clip::of(2, "b".into(), 30.0) }]);
+        track.trim_start(1, 1.0, 0.5);
+        assert_eq!((track.clips[1].span(), track.clips[1].source_in, track.clips[1].source_out), (span(3.0, 10.0), 0.0, 7.0));
+        track.trim_end(1, 15.0, 0.5);
+        assert_eq!(track.clips[1].span(), span(3.0, 12.0));
+        track.trim_end(1, 2.0, 0.5);
+        assert_eq!(track.clips[1].span(), span(3.0, 3.5));
+        track.trim_start(1, 9.0, 0.5);
+        assert_eq!((track.clips[1].span(), track.clips[1].source_in), (span(3.0, 3.5), 0.0), "kept a minimal length");
+        // Alone, it goes as far as it is dragged.
+        let mut alone = track_of(vec![Clip { start: 5.0, ..Clip::image(1, "logo".into()) }]);
+        alone.trim_end(0, 1000.0, 0.5);
+        alone.trim_start(0, -50.0, 0.5);
+        assert_eq!(alone.clips[0].span(), span(-50.0, 1000.0));
+        assert_eq!(alone.clips[0].picture_time(500.0), 0.0);
+    }
+
+    #[test]
+    fn a_cut_image_is_two_and_a_new_length_moves_the_clips_after_it() {
+        // The image 0..5 with fades, a video 5..9 after it.
+        let mut image = Clip::image(1, "logo".into());
+        image.add_fade(Edge::In);
+        image.add_fade(Edge::Out);
+        let mut sequence = Sequence::new(image);
+        sequence.tracks[0].clips.push(Clip { start: 5.0, source_out: 4.0, ..Clip::of(2, "b".into(), 30.0) });
+        sequence.fit_export();
+        let first = ClipId { track: 0, index: 0 };
+        let second = sequence.split(first, 2.0, MIN).unwrap();
+        let (a, b) = (sequence.clip(first), sequence.clip(second));
+        assert_eq!((a.span(), a.source_in, a.source_out, a.still), (span(0.0, 2.0), 0.0, 2.0, Some(0.0)));
+        assert_eq!((b.span(), b.source_in, b.source_out, b.still), (span(2.0, 5.0), 0.0, 3.0, Some(0.0)));
+        assert!(a.fade(Edge::In).is_some() && a.fade(Edge::Out).is_none() && b.fade(Edge::Out).is_some());
+        assert!(sequence.set_length(first, 4.0));
+        assert_eq!(names_and_starts(&sequence, 0), [("logo", 0.0), ("logo", 4.0), ("b", 7.0)]);
+        assert_eq!(sequence.export, span(0.0, 11.0), "a fitted export range goes on fitting");
+        assert!(sequence.set_length(first, 1.0));
+        assert_eq!(names_and_starts(&sequence, 0), [("logo", 0.0), ("logo", 1.0), ("b", 4.0)]);
+        let before = sequence.clone();
+        assert!(!sequence.set_length(first, 0.0), "no length");
+        assert!(!sequence.set_length(first, f64::NAN));
+        assert!(!sequence.set_length(ClipId { track: 0, index: 2 }, 3.0), "a recording is trimmed instead");
+        assert_eq!(sequence, before);
+    }
+
+    #[test]
+    fn a_still_has_no_sound_and_no_part_of_a_recording() {
+        let mut sequence = Sequence::new(Clip::image(1, "logo".into()));
+        let id = ClipId { track: 0, index: 0 };
+        assert!(!sequence.sounds(id));
+        assert_eq!(sequence.detach_sound(id), None);
+        assert!(!sequence.ripple_retime(id, span(0.0, 2.0)));
+        assert_eq!(sequence.tracks.len(), 1);
+    }
+
+    #[test]
+    fn a_still_is_saved_as_such_and_a_recording_that_became_an_image_is_shown_as_one() {
+        let json = serde_json::to_value(Clip::image(1, "logo".into())).unwrap();
+        assert_eq!((json["still"].as_f64(), json["source_out"].as_f64()), (Some(0.0), Some(IMAGE_LENGTH)));
+        let back: Clip = serde_json::from_value(json).unwrap();
+        assert_eq!(back, Clip::image(1, "logo".into()));
+        assert_eq!(serde_json::to_value(placed_clip()).unwrap().get("still"), None, "a recording's clip says nothing of it");
+        // Its file was pointed to an image: the clip shows it, as long as it was.
+        let mut clip = placed_clip();
+        clip.set_speed(2.0);
+        clip.refit_source(0.0);
+        assert_eq!((clip.span(), clip.still, clip.is_image()), (span(10.0, 15.0), Some(0.0), true));
+        let mut sequence = Sequence::new(Clip::image(1, "logo".into()));
+        assert!(!sequence.refit_source(1, 0.0), "an image stays as it is");
     }
 }

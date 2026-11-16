@@ -735,7 +735,7 @@ mod tests {
     #[test]
     fn a_run_that_writes_nothing_leaves_the_video_ready() {
         let sequence = Sequence::new(Clip::new("a".into(), 1.0));
-        let info = crate::media::probe::MediaInfo { duration: 1.0, width: 16, height: 16, fps: crate::media::probe::Rational { num: 25, den: 1 }, has_audio: false };
+        let info = crate::media::probe::MediaInfo { duration: 1.0, width: 16, height: 16, fps: crate::media::probe::Rational { num: 25, den: 1 }, has_audio: false, image: false };
         let output = std::env::temp_dir().join(format!("dicing_splicing_export_{}.png", std::process::id()));
         let files = SourceFiles::from([(0, crate::media::SourceFile { path: "there is no such video.mp4".into(), info })]);
         let task = render::frame_task(&files, &sequence, 0.0, &output).unwrap();

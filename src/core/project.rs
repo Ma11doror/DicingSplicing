@@ -12,9 +12,10 @@ use std::path::{Path, PathBuf};
 pub const PROJECT_FILE: &str = "project.json";
 pub const RENDERS_FOLDER: &str = "renders";
 /// 2: several tracks, each with an id of its own. 3: effects on clips. 4: curves of fades. 5: colour.
-/// 6: audio tracks, detached sound and chained clips. 7: the speed of a clip. An editor that knows
-/// less can't open such a file, and so can't lose what it does not know by saving it.
-pub const VERSION: u32 = 7;
+/// 6: audio tracks, detached sound and chained clips. 7: the speed of a clip. 8: images, clips that
+/// hold one picture. An editor that knows less can't open such a file, and so can't lose what it
+/// does not know by saving it.
+pub const VERSION: u32 = 8;
 
 /// A video the project uses. It is not copied: the project remembers where it is.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -117,12 +118,12 @@ pub struct Project {
 }
 
 impl Project {
-    /// A new project of one video, all of it on the timeline.
-    pub fn new(name: String, video: PathBuf, duration: f64) -> Self {
+    /// A new project of one file, its source 0, with `first` on the timeline: a clip of that file.
+    pub fn new(name: String, video: PathBuf, first: Clip) -> Self {
         Self {
             version: VERSION,
             sources: vec![Source { id: 0, path: video, name: Some(name.clone()), meta: BTreeMap::new() }],
-            sequence: Sequence::new(Clip::new(name.clone(), duration)),
+            sequence: Sequence::new(first),
             name,
             view: ViewState::default(),
         }
@@ -208,7 +209,7 @@ mod tests {
 
     /// A project with something non-default in every part of it.
     fn edited() -> Project {
-        let mut project = Project::new("clip".into(), "C:/videos/clip.mp4".into(), 30.0);
+        let mut project = Project::new("clip".into(), "C:/videos/clip.mp4".into(), Clip::new("clip".into(), 30.0));
         let id = ClipId { track: 0, index: 0 };
         let sequence = &mut project.sequence;
         sequence.trim_start(id, 2.0, 0.1);
@@ -287,7 +288,7 @@ mod tests {
         let (a, b) = (dir.join("a.mp4"), dir.join("b.mp4"));
         fs::write(&a, "a").unwrap();
         fs::write(&b, "b").unwrap();
-        let mut sources = Project::new("first".into(), a.clone(), 1.0).sources;
+        let mut sources = Project::new("first".into(), a.clone(), Clip::new("first".into(), 1.0)).sources;
         assert_eq!(add_source(&mut sources, b.clone(), None, BTreeMap::new()), (1, true));
         // The same file, written another way.
         let again = dir.join(".").join("a.mp4");
@@ -348,10 +349,10 @@ mod tests {
         let projects = dir.join("projects");
         let a = projects.join("a");
         fs::create_dir_all(&a).unwrap();
-        Project::new("a".into(), other.clone(), 1.0).save(&a).unwrap();
+        Project::new("a".into(), other.clone(), Clip::new("a".into(), 1.0)).save(&a).unwrap();
         let b = projects.join("b");
         fs::create_dir_all(&b).unwrap();
-        Project::new("b".into(), video.clone(), 1.0).save(&b).unwrap();
+        Project::new("b".into(), video.clone(), Clip::new("b".into(), 1.0)).save(&b).unwrap();
         // Something that is not a project doesn't get in the way.
         fs::create_dir_all(projects.join("c")).unwrap();
 

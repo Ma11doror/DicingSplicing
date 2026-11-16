@@ -5,7 +5,7 @@ use crate::core::export::{ExportSettings, FrameRate, Rate, VideoCodec, EVEN_LOUD
 use crate::core::preset::Preset;
 use crate::core::tools;
 use crate::media::geometry::{Mask, Outline, Transform};
-use crate::media::{color, Notify, SourceFile, SourceFiles};
+use crate::media::{color, Notify, SourceFile, SourceFiles, OVER_BLACK};
 use anyhow::{bail, Context, Result};
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -152,12 +152,14 @@ fn reaching(sequence: &Sequence) -> impl Iterator<Item = (ClipId, &Clip)> {
 }
 
 /// The result's frame rate, as ffmpeg takes it and as a number. "As the source" is the highest rate
-/// of the clips that are seen, so that none of them loses frames.
+/// of the clips that are seen, so that none of them loses frames; a still has none to lose, so only
+/// stills are 30 frames a second.
 fn frame_rate(sequence: &Sequence, files: &SourceFiles) -> (String, f64) {
     match sequence.settings.frame_rate {
         FrameRate::Fixed(fps) => (fps.to_string(), fps),
         FrameRate::Source => {
-            let seen = sequence.picture(sequence.export).into_iter().filter_map(|(_, id)| files.get(&sequence.clip(id?).source));
+            let moving = sequence.picture(sequence.export).into_iter().filter_map(|(_, id)| id).map(|id| sequence.clip(id)).filter(|clip| clip.still.is_none());
+            let seen = moving.filter_map(|clip| files.get(&clip.source));
             let fastest = seen.map(|file| file.info.fps).max_by(|a, b| a.as_f64().total_cmp(&b.as_f64()));
             fastest.map_or_else(|| ("30".to_owned(), 30.0), |fps| (format!("{}/{}", fps.num, fps.den), fps.as_f64()))
         }
@@ -233,6 +235,23 @@ fn add_input(args: &mut Vec<OsString>, inputs: &mut usize, path: &Path, start: f
     args.push(path.into());
     *inputs += 1;
     (*inputs - 1, seek)
+}
+
+/// Adds an input for the frame of `file` seen at its time `frame`: an image's one picture, or the
+/// frame of a recording that started at or before `frame`, on its frame grid. Returns the input's
+/// number and when, in the input's own time, that frame starts at the earliest.
+fn add_frame_input(args: &mut Vec<OsString>, inputs: &mut usize, file: &SourceFile, frame: f64) -> (usize, f64) {
+    if file.info.image {
+        args.push("-i".into());
+        args.push((&file.path).into());
+        *inputs += 1;
+        return (*inputs - 1, 0.0);
+    }
+    let fps = file.info.fps.as_f64();
+    let shown = ((frame * fps + 1e-6).floor() / fps).max(0.0);
+    let (input, seek) = add_input(args, inputs, &file.path, shown, shown + 1.0 / fps, f64::INFINITY);
+    // Half a frame early: a frame a little off its place on the grid is still that frame.
+    (input, (shown - seek - 0.5 / fps).max(0.0))
 }
 
 /// A fade of a clip as the filters see it: from source time `at`, for `length` seconds.
@@ -311,6 +330,30 @@ struct Frames<'a> {
     pixels: [u32; 2],
 }
 
+/// The filters of `fades` in a clip's picture, where its own time `zero` is 0: ffmpeg's `fade` for a
+/// straight one, the mask of a curved one. `transparent`: they take the picture into transparency,
+/// else into black. `name` tells the mask's own labels apart.
+fn fade_chain(fades: &[FadeAt], zero: f64, transparent: bool, name: &str) -> String {
+    let mut fade = String::new();
+    if transparent && !fades.is_empty() {
+        fade += ",format=yuva420p";
+    }
+    let mut mask = String::new();
+    for f in fades {
+        if f.curve == Curve::Linear {
+            fade += &format!(",fade=t={}:st={:.6}:d={:.6}{}", f.kind(), f.at - zero, f.length, if transparent { ":alpha=1" } else { "" });
+        } else {
+            // White, its contrast around mid gray taken from 1 to -1: the mask's value is the level
+            // times 255. Brightness stays 0: ffmpeg rounds it to whole percents.
+            mask += &format!(",eq=contrast='2*({})-1':eval=frame", f.level(zero));
+        }
+    }
+    if !mask.is_empty() {
+        fade += &format!(",split[{name}c][{name}m];[{name}m]alphaextract{mask}[{name}a];[{name}c][{name}a]alphamerge");
+    }
+    fade
+}
+
 /// The filters that make the frames of `clip` for the run of result frames `(first, count)`, ending
 /// in `label`. Its fades take its picture into black, or with `alpha` into transparency, for what is
 /// under it to show through.
@@ -323,46 +366,47 @@ fn clip_frames(frames: &Frames, args: &mut Vec<OsString>, inputs: &mut usize, id
     let file = file_of(frames.files, clip)?;
     // The source's moment at the first frame. Frames before it stay until `fps`, which needs them to
     // know what is on screen at that moment; a source that ends a frame early has its last frame held.
-    // The clip goes through its source at its speed.
+    // The clip goes through its source at its speed. A still goes through its own time.
     let speed = clip.speed();
     let start = clip.source_time(sequence.export.start + first as f64 / rate);
     let end = start + count as f64 / rate * speed;
     let (fades, latest) = fade_filters_of(clip, start, end, false);
-    let (input, seek) = add_input(args, inputs, &file.path, start, end, latest);
-    let (from, to) = (start - seek, end - seek);
-    // Fades go by the input's own timestamps, before they are moved to the result's.
     let curved = fades.iter().any(|fade| fade.curve != Curve::Linear);
     let transparent = alpha || curved;
     let name = label.trim_matches(['[', ']']);
-    let mut fade = String::new();
-    if transparent && !fades.is_empty() {
-        fade += ",format=yuva420p";
-    }
-    let mut mask = String::new();
-    for f in &fades {
-        if f.curve == Curve::Linear {
-            fade += &format!(",fade=t={}:st={:.6}:d={:.6}{}", f.kind(), f.at - seek, f.length, if transparent { ":alpha=1" } else { "" });
-        } else {
-            // White, its contrast around mid gray taken from 1 to -1: the mask's value is the level
-            // times 255. Brightness stays 0: ffmpeg rounds it to whole percents.
-            mask += &format!(",eq=contrast='2*({})-1':eval=frame", f.level(seek));
-        }
-    }
-    if !mask.is_empty() {
-        fade += &format!(",split[{name}c][{name}m];[{name}m]alphaextract{mask}[{name}a];[{name}c][{name}a]alphamerge");
-    }
     let frame = frame_filter(file.info.width as f64, file.info.height as f64, &clip.transform, sequence.output.outline(), frames.pixels);
     let format = if transparent { "yuva420p" } else { "yuv420p" };
     let over_black = curved && !alpha;
     let out = if over_black { format!("[{name}o]") } else { label.to_owned() };
     // The colour comes first: a fade into black ends in black whatever the contrast.
     let colored = clip.graded().map_or_else(String::new, |grade| color::filters(&grade));
-    // From the source's moment `start` on, as fast as the clip plays.
-    let timed = if speed == 1.0 { format!("PTS{:+.6}/TB", -from) } else { format!("(PTS{:+.6}/TB)/{speed:.6}", -from) };
-    let mut filters = format!(
-        "[{input}:V:0]trim=end={to:.6}{colored}{fade},setpts={timed},fps={fps}:start_time=0,{frame},\
-         tpad=stop=-1:stop_mode=clone,trim=end_frame={count},format={format}{out}"
-    );
+    let mut filters = match clip.still {
+        // One frame, coloured and framed once, then repeated at the result's rate. The copies are
+        // timed by the clip's own time, from `start` at the first one, for its fades to go by; then
+        // from 0, as the result's frames. What is transparent in an image is black.
+        Some(at) => {
+            let (input, at) = add_frame_input(args, inputs, file, at);
+            let fade = fade_chain(&fades, 0.0, transparent, name);
+            let flat = if file.info.image { format!(",{OVER_BLACK}") } else { String::new() };
+            format!(
+                "[{input}:V:0]trim=start={at:.6},trim=end_frame=1{flat}{colored},{frame},loop=loop=-1:size=1,\
+                 settb=AVTB,setpts=(N/({fps})+{start:.6})/TB{fade},setpts=PTS-STARTPTS,fps={fps}:start_time=0,\
+                 trim=end_frame={count},format={format}{out}"
+            )
+        }
+        // Fades go by the input's own timestamps, before they are moved to the result's.
+        None => {
+            let (input, seek) = add_input(args, inputs, &file.path, start, end, latest);
+            let (from, to) = (start - seek, end - seek);
+            let fade = fade_chain(&fades, seek, transparent, name);
+            // From the source's moment `start` on, as fast as the clip plays.
+            let timed = if speed == 1.0 { format!("PTS{:+.6}/TB", -from) } else { format!("(PTS{:+.6}/TB)/{speed:.6}", -from) };
+            format!(
+                "[{input}:V:0]trim=end={to:.6}{colored}{fade},setpts={timed},fps={fps}:start_time=0,{frame},\
+                 tpad=stop=-1:stop_mode=clone,trim=end_frame={count},format={format}{out}"
+            )
+        }
+    };
     if over_black {
         let [px, py] = frames.pixels;
         filters += &format!(
@@ -790,7 +834,7 @@ mod tests {
     const H: u32 = 360;
 
     fn info(duration: f64) -> MediaInfo {
-        MediaInfo { duration, width: W, height: H, fps: Rational { num: 25, den: 1 }, has_audio: true }
+        MediaInfo { duration, width: W, height: H, fps: Rational { num: 25, den: 1 }, has_audio: true, image: false }
     }
 
     fn sequence(duration: f64) -> Sequence {
@@ -1205,6 +1249,130 @@ mod tests {
         assert_eq!(frame_rate(&s, &files), ("25/1".to_owned(), 25.0));
         s.settings.frame_rate = FrameRate::Fixed(30.0);
         assert_eq!(output_fps(&s, &files), 30.0);
+    }
+
+    /// A PNG, 3 s from 2 s, after a video: read once, without a seek, and held.
+    fn logo_after_a_video() -> (Sequence, SourceFiles, ClipId) {
+        let mut s = Sequence::new(Clip { source_out: 2.0, ..Clip::new("a".into(), 30.0) });
+        let logo = s.place_clip(Some(0), Clip { start: 2.0, source_out: 3.0, ..Clip::image(1, "logo".into()) }).unwrap();
+        s.clip_mut(logo).add_fade(Edge::In);
+        s.settings.frame_rate = FrameRate::Source;
+        let mut files = files(Path::new("a.mp4"), &info(30.0));
+        let png = MediaInfo { duration: 0.0, has_audio: false, image: true, ..info(0.0) };
+        files.insert(1, SourceFile { path: "logo.png".into(), info: png });
+        (s, files, logo)
+    }
+
+    #[test]
+    fn an_image_is_read_once_and_held_and_fades_by_its_own_time() {
+        let (mut s, files, logo) = logo_after_a_video();
+        let graph = |s: &Sequence| plan(&files, s, Path::new("out.mp4")).unwrap().args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ");
+        let all = graph(&s);
+        assert!(all.contains("-t 3.000000 -i a.mp4 -i logo.png "), "{all}");
+        // Made black where it is transparent and framed once, then held: 75 frames, its fade by
+        // its own time.
+        assert!(all.contains("[1:V:0]trim=start=0.000000,trim=end_frame=1,format=rgba,premultiply=inplace=1,crop="), "{all}");
+        assert!(
+            all.contains(
+                ",setsar=1,loop=loop=-1:size=1,settb=AVTB,setpts=(N/(25/1)+0.000000)/TB,fade=t=in:st=0.000000:d=1.000000,\
+                 setpts=PTS-STARTPTS,fps=25/1:start_time=0,trim=end_frame=75,format=yuv420p[p1]"
+            ),
+            "{all}"
+        );
+        // From half way into its fade: the fade goes on from there. Only the image is seen then: as
+        // the source is 30 frames a second, the video's rate otherwise.
+        assert_eq!(frame_rate(&s, &files).0, "25/1");
+        s.export.start = 2.5;
+        assert!(graph(&s).contains("setpts=(N/(30)+0.500000)/TB,fade=t=in:st=0.000000:d=1.000000,"), "{}", graph(&s));
+        assert_eq!(frame_rate(&s, &files), ("30".to_owned(), 30.0));
+        s.export = s.clip(logo).span();
+        // No sound of its own: only the video's is heard.
+        assert_eq!(heard(&s, &files).len(), 0);
+    }
+
+    /// A copy of a JPEG that says, in its EXIF, to turn it by `orientation`: 6 is a quarter turn
+    /// clockwise, as a phone held upright writes it.
+    fn with_orientation(jpeg: &[u8], orientation: u8) -> Vec<u8> {
+        let mut exif = b"Exif\0\0II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
+        exif.extend_from_slice(&[orientation, 0, 0, 0, 0, 0, 0, 0]);
+        let mut app1 = vec![0xFF, 0xE1];
+        app1.extend_from_slice(&((exif.len() + 2) as u16).to_be_bytes());
+        app1.append(&mut exif);
+        [&jpeg[..2], &app1, &jpeg[2..]].concat()
+    }
+
+    /// The mean colour of rows `rows` of a frame of `width` pixels, as red, green and blue.
+    fn rows_color(rgb: &[u8], width: u32, rows: std::ops::Range<u32>) -> [f64; 3] {
+        let part = &rgb[(rows.start * width * 3) as usize..(rows.end * width * 3) as usize];
+        let channel = |c: usize| part.iter().skip(c).step_by(3).map(|v| *v as f64).sum::<f64>() / (part.len() / 3) as f64;
+        [channel(0), channel(1), channel(2)]
+    }
+
+    /// An image in the file: as long as its clip, its picture all along, its fade; black where it is
+    /// transparent; a photo upright, as its EXIF says.
+    #[test]
+    fn an_image_is_in_the_file_as_long_as_its_clip() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let dir = temp_dir("image");
+        let png = dir.join("picture.png");
+        ffmpeg(&["-f", "lavfi", "-i", &format!("testsrc=size={W}x{H}"), "-frames:v", "1", png.to_str().unwrap()]);
+        let info = probe::probe(&png).unwrap();
+        assert!(info.image && info.duration == 0.0, "{info:?}");
+        let files = files(&png, &info);
+        // 3 s, coming in over 1 s, alone: as the source, 30 frames a second.
+        let mut s = Sequence::new(Clip { source_out: 3.0, ..Clip::image(0, "picture".into()) });
+        let id = ClipId { track: 0, index: 0 };
+        s.clip_mut(id).add_fade(Edge::In);
+        s.output = Output { preset: PresetId::Landscape, ..Output::default() };
+        s.settings.size = OutputSize::LongSide(320);
+        s.settings.speed = Speed::Ultrafast;
+        s.settings.fades = (0.0, 0.0);
+        s.settings.frame_rate = FrameRate::Source;
+        let path = render_all(&files, &s, &dir.join("image.mp4"));
+        let result = probe::probe(&path).unwrap();
+        assert!((result.duration - 3.0).abs() < 0.05, "duration {}", result.duration);
+        assert_eq!((result.width, result.height, result.fps, result.has_audio), (320, 180, Rational { num: 30, den: 1 }, false));
+        let scaled = dir.join("scaled.png");
+        ffmpeg(&["-i", png.to_str().unwrap(), "-vf", "scale=320:180:flags=lanczos", scaled.to_str().unwrap()]);
+        let want = rgb_at(&scaled, 0.0, 320, 180);
+        for t in [1.0, 2.0, 2.9] {
+            let error = mean_difference(&rgb_at(&path, t, 320, 180), &want);
+            assert!(error < 6.0, "at {t} s the picture differs by {error:.1}");
+        }
+        let (half, full) = (mean_level(&rgb_at(&path, 0.5, 320, 180)), mean_level(&want));
+        assert!((half / full - 0.5).abs() < 0.08, "half way into the fade: {half:.1} of {full:.1}");
+
+        // Half transparent red on the left, nothing on the right: over black.
+        let clear = dir.join("clear.png");
+        ffmpeg(&["-f", "lavfi", "-i", "color=c=red@0.5:s=320x360,format=rgba,pad=640:360:0:0:color=white@0", "-frames:v", "1", clear.to_str().unwrap()]);
+        let files = SourceFiles::from([(0, SourceFile { path: clear.clone(), info: probe::probe(&clear).unwrap() })]);
+        let path = render_all(&files, &s, &dir.join("clear.mp4"));
+        let rgb = rgb_at(&path, 2.0, 320, 180);
+        let half_of = |range: std::ops::Range<u32>| {
+            let pixels: Vec<[u8; 3]> = rgb.chunks(3).enumerate().filter(|(i, _)| range.contains(&((*i as u32) % 320))).map(|(_, p)| [p[0], p[1], p[2]]).collect();
+            [0, 1, 2].map(|c| pixels.iter().map(|p| p[c] as f64).sum::<f64>() / pixels.len() as f64)
+        };
+        let (left, right) = (half_of(20..140), half_of(180..300));
+        assert!((left[0] - 128.0).abs() < 20.0 && left[1] < 20.0 && left[2] < 20.0, "half of red over black: {left:?}");
+        assert!(right.iter().all(|c| *c < 20.0), "nothing over black: {right:?}");
+
+        // A photo stored lying on its side, red on the left: upright, red at the top.
+        let lying = dir.join("lying.jpg");
+        ffmpeg(&["-f", "lavfi", "-i", "color=red:s=64x64[a];color=blue:s=64x64[b];[a][b]hstack", "-frames:v", "1", lying.to_str().unwrap()]);
+        let photo = dir.join("photo.jpg");
+        fs::write(&photo, with_orientation(&fs::read(&lying).unwrap(), 6)).unwrap();
+        let info = probe::probe(&photo).unwrap();
+        assert_eq!((info.width, info.height), (64, 128));
+        let files = SourceFiles::from([(0, SourceFile { path: photo.clone(), info })]);
+        s.output = Output { preset: PresetId::Vertical, ..Output::default() };
+        let path = render_all(&files, &s, &dir.join("photo.mp4"));
+        let rgb = rgb_at(&path, 2.0, 180, 320);
+        let (top, bottom) = (rows_color(&rgb, 180, 20..120), rows_color(&rgb, 180, 200..300));
+        assert!(top[0] > 200.0 && top[2] < 60.0, "red at the top: {top:?}");
+        assert!(bottom[2] > 200.0 && bottom[0] < 60.0, "blue at the bottom: {bottom:?}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

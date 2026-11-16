@@ -82,6 +82,9 @@ pub fn put(project: &mut Project, piece: &Piece, info: &MediaInfo, before: Optio
     if !info.has_video() {
         bail!("{label} has no picture: ds-tool puts videos on {TRACK}");
     }
+    if info.image {
+        bail!("{label} is an image: ds-tool puts videos on {TRACK}. Images go onto the timeline in the editor");
+    }
     let part = part_of(&label, piece.from, piece.to, Span { start: 0.0, end: info.duration }, info.duration)?;
     let track = match find_video_track(&project.sequence) {
         Some(track) => track,
@@ -99,6 +102,15 @@ pub fn put(project: &mut Project, piece: &Piece, info: &MediaInfo, before: Optio
     }
     let id = project.sequence.ripple_insert(track, index, clip).ok_or_else(|| anyhow!("the clips after it can't move: {NO_ROOM}"))?;
     Ok(id.index + 1)
+}
+
+/// A still, an image or a frame held, plays no part of a recording: its times are the editor's.
+fn refuse_still(clip: &Clip, number: usize) -> Result<()> {
+    if clip.still.is_some() {
+        let what = if clip.is_image() { "an image" } else { "a frame held" };
+        bail!("clip {number} is {what}: it plays no part of a recording, so its times are changed in the editor");
+    }
+    Ok(())
 }
 
 /// Takes clip `number` off Video 1; the clips after it move back by its length. Returns the clip.
@@ -125,6 +137,7 @@ pub fn reorder(project: &mut Project, from: usize, to: usize) -> Result<Clip> {
 pub fn retime(project: &mut Project, number: usize, from: Option<f64>, to: Option<f64>) -> Result<(Clip, Clip)> {
     let id = clip_id(&project.sequence, number)?;
     let clip = project.sequence.clip(id).clone();
+    refuse_still(&clip, number)?;
     let label = project.sources.iter().find(|source| source.id == clip.source).map_or_else(|| clip.name.clone(), |source| source.label());
     let part = part_of(&label, from, to, Span { start: clip.source_in, end: clip.source_out }, clip.source_duration)?;
     refuse_chained(&project.sequence, id, number)?;
@@ -140,6 +153,7 @@ pub fn retime(project: &mut Project, number: usize, from: Option<f64>, to: Optio
 pub fn blade(project: &mut Project, number: usize, at: f64) -> Result<Clip> {
     let id = clip_id(&project.sequence, number)?;
     let clip = project.sequence.clip(id).clone();
+    refuse_still(&clip, number)?;
     let frame = frame_of(&project.sequence);
     // Where the recording is at `at` on the timeline: a clip at another speed gets there sooner or
     // later. Each part is a frame of the result or more.
@@ -233,7 +247,7 @@ pub mod tests {
     use crate::media::probe::Rational;
 
     pub fn video(duration: f64) -> MediaInfo {
-        MediaInfo { duration, width: 1920, height: 1080, fps: Rational { num: 30, den: 1 }, has_audio: true }
+        MediaInfo { duration, width: 1920, height: 1080, fps: Rational { num: 30, den: 1 }, has_audio: true, image: false }
     }
 
     pub fn piece(file: &str, from: Option<f64>, to: Option<f64>, name: Option<&str>) -> Piece {

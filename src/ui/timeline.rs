@@ -300,11 +300,30 @@ pub struct TimelineEnv<'a> {
     pub fps: f64,
     /// Sources whose file is not there: their clips are marked.
     pub missing: &'a BTreeSet<SourceId>,
-    /// Sources that can be dropped on the timeline: what their clip is called, how long it is, and
-    /// whether it has a picture.
-    pub placeable: &'a BTreeMap<SourceId, (String, f64, bool)>,
+    /// Sources that can be dropped on the timeline: the clip of each as it would be put there, and
+    /// what it has.
+    pub placeable: &'a BTreeMap<SourceId, (Clip, Has)>,
     /// The graph of each source's sound, for unfolded rows.
     pub sounds: &'a BTreeMap<SourceId, SourceSound>,
+}
+
+/// What a source has, for where it can go on the timeline: a picture is seen on a video track, sound
+/// is heard on an audio track too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Has {
+    pub picture: bool,
+    pub sound: bool,
+}
+
+impl Has {
+    /// Whether a clip of it is of use on a track of `kind`: seen on a video track, heard on an audio
+    /// one. An image on an audio track would be neither.
+    fn fits(self, kind: TrackKind) -> bool {
+        match kind {
+            TrackKind::Video => self.picture,
+            TrackKind::Audio => self.sound,
+        }
+    }
 }
 
 /// What a track's menu or the buttons over the rows asked for, done once the rows are drawn.
@@ -826,7 +845,9 @@ impl Timeline {
             // In this egui it gives something back only as the menu closes: whether it is still
             // open is asked separately.
             let kind = sequence.tracks[id.track].kind;
-            let has_sound = matches!(env.sounds.get(&sequence.clip(id).source), Some(SourceSound::Graph(_)));
+            // A still shows one frame, without sound, however fast.
+            let still = sequence.clip(id).still.is_some();
+            let has_sound = matches!(env.sounds.get(&sequence.clip(id).source), Some(SourceSound::Graph(_))) && !still;
             let chained = sequence.is_chained(id);
             response.context_menu(|ui| {
                 // Its sound, and what it is chained to.
@@ -877,7 +898,7 @@ impl Timeline {
                     ui.close_menu();
                 }
                 let sped = clip.speed_effect().is_some();
-                let speed = ui.button(if sped { "Remove speed" } else { "Add speed" }).on_hover_text("How fast it plays: the clips after it on its track move along").clicked();
+                let speed = !still && ui.button(if sped { "Remove speed" } else { "Add speed" }).on_hover_text("How fast it plays: the clips after it on its track move along").clicked();
                 if speed {
                     if sped {
                         unspeed = true;
@@ -977,16 +998,17 @@ impl Timeline {
         }
 
         // A source dragged from the list: where it would go, and there it goes when let go.
-        let dragged_source = |source: &SourceId| Some((*source, env.placeable.get(source)?));
-        self.ghost = response.dnd_hover_payload::<SourceId>().and_then(|source| dragged_source(&source)).and_then(|(_, (name, len, picture))| {
+        let dragged_source = |source: &SourceId| env.placeable.get(source);
+        self.ghost = response.dnd_hover_payload::<SourceId>().and_then(|source| dragged_source(&source)).and_then(|(clip, has)| {
             // While a source is dragged, the timeline is not the hovered widget: the pointer says where it is.
-            let (place, start) = drop_place(&layout, view, sequence, pointer.filter(|p| rect.contains(*p))?, *len, frame, *picture);
-            Some(Ghost { place, span: Span { start, end: start + len }, name: name.clone() })
+            let len = clip.span().len();
+            let (place, start) = drop_place(&layout, view, sequence, pointer.filter(|p| rect.contains(*p))?, len, frame, *has);
+            Some(Ghost { place, span: Span { start, end: start + len }, name: clip.name.clone() })
         });
-        if let Some((source, (name, len, picture))) = response.dnd_release_payload::<SourceId>().and_then(|source| dragged_source(&source)) {
+        if let Some((clip, has)) = response.dnd_release_payload::<SourceId>().and_then(|source| dragged_source(&source)) {
             if let Some(p) = pointer {
-                let (place, start) = drop_place(&layout, view, sequence, p, *len, frame, *picture);
-                let clip = Clip { start, ..Clip::of(source, name.clone(), *len) };
+                let (place, start) = drop_place(&layout, view, sequence, p, clip.span().len(), frame, *has);
+                let clip = Clip { start, ..clip.clone() };
                 if let Some(id) = put(sequence, place, clip) {
                     *selected = Some(id);
                     out.edit_started = true;
@@ -1290,7 +1312,16 @@ impl Timeline {
                             text += "  ·  file missing";
                         }
                         let color = if missing { MISSING_COLOR } else { Color32::from_white_alpha(if track.hidden { 120 } else { 220 }) };
-                        inside.text(pos2(text_x, area.center().y), Align2::LEFT_CENTER, text, FontId::proportional(12.0), color);
+                        let written = inside.text(pos2(text_x, area.center().y), Align2::LEFT_CENTER, text, FontId::proportional(12.0), color);
+                        // A still says so on a plaque after its name, folded or not.
+                        if clip.still.is_some() {
+                            let what = if clip.is_image() { "Image" } else { "Freeze" };
+                            let chip = place_chips(ui, area, written.right() + 2.0, vec![Chip { text: what.to_owned(), section: Section::Frame }]);
+                            for (rect, chip) in chip {
+                                inside.rect_filled(rect, 4.0, CHIP_COLOR);
+                                inside.text(rect.center(), Align2::CENTER_CENTER, chip.text, FontId::proportional(11.0), Color32::WHITE);
+                            }
+                        }
                     }
                     Lane::Effects => {
                         inside.rect_filled(area, 0.0, LANE_SHADE);
@@ -1322,6 +1353,11 @@ impl Timeline {
                     Lane::Sound if clip.sound_detached => {
                         inside.rect_filled(area, 0.0, LANE_SHADE);
                         inside.text(pos2(text_x, area.center().y), Align2::LEFT_CENTER, "sound detached: a clip of its own", FontId::proportional(11.0), weak);
+                    }
+                    // A still holds a picture, even of a recording with sound.
+                    Lane::Sound if clip.still.is_some() => {
+                        inside.rect_filled(area, 0.0, LANE_SHADE);
+                        inside.text(pos2(text_x, area.center().y), Align2::LEFT_CENTER, "no sound", FontId::proportional(11.0), weak);
                     }
                     Lane::Sound => {
                         inside.rect_filled(area, 0.0, LANE_SHADE);
@@ -1613,17 +1649,28 @@ fn paint_sound(painter: &egui::Painter, area: Rect, clip: &Clip, view: View, pea
 /// with a `picture` goes onto an audio row too, as its sound; one of sound only never onto a video
 /// row, but onto a new audio row above it.
 #[allow(clippy::too_many_arguments)]
-fn drop_place(layout: &Layout, view: View, sequence: &Sequence, p: Pos2, len: f64, frame: f64, picture: bool) -> (Place, f64) {
+fn drop_place(layout: &Layout, view: View, sequence: &Sequence, p: Pos2, len: f64, frame: f64, has: Has) -> (Place, f64) {
     let start = (view.t(p.x) / frame).round() * frame;
-    let own = if picture { TrackKind::Video } else { TrackKind::Audio };
+    let own = if has.picture { TrackKind::Video } else { TrackKind::Audio };
     let Some(row) = layout.row_at(p.y) else { return (Place::Bottom(own), start) };
-    let kind = sequence.tracks[row.track].kind;
-    if kind == TrackKind::Video && !picture {
-        return (Place::Above(row.track, TrackKind::Audio), start);
+    let mut track = row.track;
+    // Where it would be of no use, it goes where it is: sound only onto a new audio track above a
+    // video row; a picture without sound over an audio row as if over the nearest video row, the one
+    // above it or else under it, or with none, onto a new video track above it.
+    if !has.fits(sequence.tracks[track].kind) {
+        if !has.picture {
+            return (Place::Above(track, TrackKind::Audio), start);
+        }
+        let video = |other: &usize| sequence.tracks[*other].kind == TrackKind::Video;
+        match (track + 1..sequence.tracks.len()).find(video).or_else(|| (0..track).rev().find(video)) {
+            Some(nearest) => track = nearest,
+            None => return (Place::Above(track, TrackKind::Video), start),
+        }
     }
-    match sequence.tracks[row.track].gap_at(start + len / 2.0).filter(|gap| gap.len() + 1e-6 >= len) {
-        Some(gap) => (Place::Into(row.track), start.max(gap.start).min(gap.end - len)),
-        None => (Place::Above(row.track, kind), start),
+    let kind = sequence.tracks[track].kind;
+    match sequence.tracks[track].gap_at(start + len / 2.0).filter(|gap| gap.len() + 1e-6 >= len) {
+        Some(gap) => (Place::Into(track), start.max(gap.start).min(gap.end - len)),
+        None => (Place::Above(track, kind), start),
     }
 }
 
@@ -2043,7 +2090,8 @@ mod tests {
         let mut sequence = Sequence::new(Clip { start: 30.0, source_out: 5.0, ..Clip::new("a".into(), 60.0) });
         sequence.tracks[0].clips.push(Clip { start: 50.0, source_out: 10.0, ..Clip::new("b".into(), 60.0) });
         let layout = layout(&sequence, 102.0);
-        let at = |x: f32, len: f64| drop_place(&layout, view(), &sequence, pos2(x, 80.0), len, 0.04, true);
+        let (video, sound) = (Has { picture: true, sound: true }, Has { picture: false, sound: true });
+        let at = |x: f32, len: f64| drop_place(&layout, view(), &sequence, pos2(x, 80.0), len, 0.04, video);
         // Into the gap of 15 s between them, pulled in to fit.
         let (place, start) = at(510.0, 8.0);
         assert_eq!(place, Place::Into(0));
@@ -2057,10 +2105,10 @@ mod tests {
         assert_eq!(place, Place::Above(0, TrackKind::Video));
         assert!((start - 32.0).abs() < 1e-9, "{start}");
         // Not over a row, on the ruler: a new row under the others.
-        assert_eq!(drop_place(&layout, view(), &sequence, pos2(510.0, 40.0), 2.0, 0.04, true).0, Place::Bottom(TrackKind::Video));
+        assert_eq!(drop_place(&layout, view(), &sequence, pos2(510.0, 40.0), 2.0, 0.04, video).0, Place::Bottom(TrackKind::Video));
         // Sound only, over a video row: onto a new audio row above it, even where there is room.
-        assert_eq!(drop_place(&layout, view(), &sequence, pos2(550.0, 80.0), 8.0, 0.04, false).0, Place::Above(0, TrackKind::Audio));
-        assert_eq!(drop_place(&layout, view(), &sequence, pos2(510.0, 40.0), 2.0, 0.04, false).0, Place::Bottom(TrackKind::Audio));
+        assert_eq!(drop_place(&layout, view(), &sequence, pos2(550.0, 80.0), 8.0, 0.04, sound).0, Place::Above(0, TrackKind::Audio));
+        assert_eq!(drop_place(&layout, view(), &sequence, pos2(510.0, 40.0), 2.0, 0.04, sound).0, Place::Bottom(TrackKind::Audio));
 
         // Put there: above means between that row and the one over it.
         let mut sequence = sequence.clone();
@@ -2068,6 +2116,42 @@ mod tests {
         let id = put(&mut sequence, Place::Above(0, TrackKind::Video), Clip { start: 32.0, ..Clip::of(1, "d".into(), 2.0) }).unwrap();
         assert_eq!(id, ClipId { track: 1, index: 0 });
         assert_eq!(sequence.tracks.iter().map(|track| track.clips.len()).collect::<Vec<_>>(), [1, 1, 2]);
+    }
+
+    #[test]
+    fn a_picture_without_sound_dropped_on_an_audio_row_goes_where_it_is_seen() {
+        // Video 1 at the top with a clip at 30..35 s (x = 400..450), Audio 1 under it with music at
+        // 30..60 s, 10 px per second.
+        let mut sequence = Sequence::new(Clip { start: 30.0, source_out: 5.0, ..Clip::new("a".into(), 60.0) });
+        let audio = sequence.add_track(0, TrackKind::Audio);
+        sequence.place_clip(Some(audio), Clip { start: 30.0, source_out: 30.0, ..Clip::of(1, "music".into(), 60.0) }).unwrap();
+        let video = 1;
+        let rows = layout(&sequence, 300.0);
+        let y = rows.row(audio).unwrap().body.center().y;
+        let over_audio = |x: f32, has: Has| drop_place(&rows, view(), &sequence, pos2(x, y), 5.0, 0.04, has);
+        let image = Has { picture: true, sound: false };
+        // Into the video row where it has room, at the time it was dropped at.
+        let (place, start) = over_audio(600.0, image);
+        assert_eq!(place, Place::Into(video));
+        assert!((start - 50.0).abs() < 1e-9, "{start}");
+        // Over its clip: onto a new video row above it, over the clip.
+        assert_eq!(over_audio(420.0, image).0, Place::Above(video, TrackKind::Video));
+        // A video with sound brings its sound there, as before, and so does sound only.
+        assert_eq!(over_audio(800.0, Has { picture: true, sound: true }).0, Place::Into(audio));
+        assert_eq!(over_audio(800.0, Has { picture: false, sound: true }).0, Place::Into(audio));
+        // A video row only under the audio row: that one.
+        let mut under = sequence.clone();
+        under.move_track(audio, true);
+        assert_eq!(under.tracks.iter().map(|track| track.kind).collect::<Vec<_>>(), [TrackKind::Video, TrackKind::Audio]);
+        let rows = layout(&under, 300.0);
+        let y = rows.row(1).unwrap().body.center().y;
+        assert_eq!(drop_place(&rows, view(), &under, pos2(600.0, y), 5.0, 0.04, image).0, Place::Into(0));
+        // No video row at all: a new one above the audio row.
+        let mut only_sound = sequence.clone();
+        only_sound.remove_track(video);
+        let rows = layout(&only_sound, 300.0);
+        let y = rows.row(0).unwrap().body.center().y;
+        assert_eq!(drop_place(&rows, view(), &only_sound, pos2(600.0, y), 5.0, 0.04, image).0, Place::Above(0, TrackKind::Video));
     }
 
     #[test]
