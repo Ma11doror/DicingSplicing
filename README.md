@@ -29,6 +29,9 @@ yt-dlp come along in the same folder.
 - Add many files at once, from the dialog or dropped on the window. The sources show as a list or as
   thumbnails, sorted by name, by when they were added or by the files' dates. Move the pointer across
   a thumbnail to run through its video.
+- Images too: PNG, JPEG, WebP, BMP, TIFF, or a GIF of one frame. An image lasts 5 s on the timeline;
+  its **Length** in the Clip panel makes it longer or shorter, and the clips after it on its track
+  move along. Photos stand the way they were taken, and what is transparent is black.
 - Move clips along and between tracks, trim them by their edges, cut them with the Blade or at the
   playhead, duplicate, copy and paste, delete with or without closing the gap. Undo and redo
   everything.
@@ -65,6 +68,11 @@ Step by step, with pictures: [Working with sound](#working-with-sound).
 - Color: exposure, contrast, saturation and temperature.
 - Speed, from ×0.25 to ×16: the sound keeps its pitch, and the clips after it on its track move
   along as it gets shorter or longer.
+- **Freeze frame** (F, or the clip's menu): the frame at the playhead stays on screen for 2 s,
+  without sound, then the clip plays on from it. The clip stays one: the frame held is a part of it
+  tinted blue, with a snowflake. The clips after it on its track move later, and so does the sound
+  detached from it. The dots on the bottom edge of the selected clip drag it: the left ones to
+  another frame, the right ones longer or shorter. The Clip panel has both too.
 - What the Output panel shows is what the file gets: the same formulas run in the preview and
   in the export.
 
@@ -82,11 +90,12 @@ Step by step, with pictures: [Working with sound](#working-with-sound).
 1. On the start screen, **New project from a video…**, or drop a video on the window.
 2. Open **Frames** at the top left and pick the main frame, such as *Telegram circle*. Move and
    resize the frame on the picture.
-3. More videos or music: **Sources**, then **Add video or sound…** (as many files as you like) or
-   **Download from a link…**. Drag a source onto the timeline; onto an audio track it goes as its sound
-   only. At the top of Sources, the two buttons at the left show the sources as a list or as
-   thumbnails. **Sorting:** at the right puts them in order; the arrow after it turns the order round.
-   The dots at the bottom right corner make the list larger or smaller.
+3. More videos, music or images: **Sources**, then **Add video, sound or image…** (as many files as
+   you like) or **Download from a link…**. Drag a source onto the timeline; onto an audio track a
+   video goes as its sound only, and an image to the video track nearest to it. At the top of
+   Sources, the two buttons at the left show the sources as a list or as thumbnails. **Sorting:** at
+   the right puts them in order; the arrow after it turns the order round. The dots at the bottom
+   right corner make the list larger or smaller.
 
    ![Sources as thumbnails: the pointer over Fractal dive runs through its video](docs/screenshots/sources.png)
 
@@ -120,9 +129,9 @@ Press **F1** in the editor for the list of keys.
 4. **Unchain**, in the same menu, lets a clip move on its own again; the others stay chained. Both
    parts of a cut stay chained: cut a piece out of the sound, delete it, and chain what is left to
    other clips.
-5. **Music and other sound files** come in through **Sources**, **Add video or sound…**: MP3, WAV,
-   M4A, FLAC, OGG or Opus. Drag one onto an audio track; dropped anywhere else, it gets a new audio
-   track. A video dragged onto an audio track brings only its sound.
+5. **Music and other sound files** come in through **Sources**, **Add video, sound or image…**:
+   MP3, WAV, M4A, FLAC, OGG or Opus. Drag one onto an audio track; dropped anywhere else, it gets a
+   new audio track. A video dragged onto an audio track brings only its sound.
 
 ## Keys
 
@@ -137,6 +146,7 @@ Press **F1** in the editor for the list of keys.
 | I / O | Start / end the export range at the playhead |
 | [ / ] | Trim the selected clip's start / end to the playhead |
 | Ctrl+B | Cut the selected clip at the playhead |
+| F | Freeze frame: hold the frame at the playhead for 2 s |
 | Ctrl+D | Duplicate the selected clip, right after it |
 | Ctrl+C / Ctrl+V | Copy the selected clip / paste it at the playhead |
 | Delete | Delete the selected clip |
@@ -155,6 +165,7 @@ Press **F1** in the editor for the list of keys.
 | Drag a clip | Moves it, also onto another track of its kind; chained clips go along |
 | Drag an edge of the selected clip | Trims it |
 | Drag the dots on the top edge of the selected clip | Changes the length of its fade |
+| Drag the dots on the bottom edge of the selected clip | Holds another frame (left) or holds it longer or shorter (right) |
 | Right click on a clip | Its menu |
 | Double click on a clip | Unfolds or folds its track |
 | Drag with the right or middle button | Moves along the time, and the tracks up and down |

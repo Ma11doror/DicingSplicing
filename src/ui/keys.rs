@@ -23,6 +23,7 @@ const GROUPS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("[ / ]", "Trim the selected clip's start / end to the playhead"),
             ("Ctrl+B", "Cut the selected clip at the playhead"),
+            ("F", "Freeze frame: hold the frame at the playhead for 2 s; the rest of the clip and the clips after it move later"),
             ("Ctrl+D", "Duplicate the selected clip, right after it"),
             ("Ctrl+C / Ctrl+V", "Copy the selected clip / paste it at the playhead"),
             ("Delete", "Delete the selected clip"),
@@ -43,7 +44,9 @@ const GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("Drag a clip", "Move it, also onto another track of its kind; the clips chained to it go along"),
             ("Drag an edge of the selected clip", "Trim it"),
             ("Drag the dots on its top edge", "Change the length of its fade"),
-            ("Right click on a clip", "Its menu: detach its sound, chain it to another clip, fades, color, speed, a cut there, delete"),
+            ("Drag the dots on its bottom edge", "A frame it holds: the left ones hold another frame, the right ones hold it longer or shorter"),
+            ("Right click on a clip", "Its menu: detach its sound, chain it to another clip, fades, color, speed, a cut there, a freeze frame, delete"),
+            ("Right click on a frame held", "Remove freeze, as well as the clip's menu"),
             ("Double click on a clip", "Unfold or fold its track: effects and sound"),
             ("Drag the ruler or an empty place", "Move along the time, and over the tracks up and down too"),
             ("Drag with the right or middle button", "The same, wherever it starts"),

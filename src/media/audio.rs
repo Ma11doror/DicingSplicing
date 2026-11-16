@@ -40,6 +40,9 @@ pub struct Segment {
     pub fade_in: f64,
     pub fade_out: f64,
     pub curves: (Curve, Curve),
+    /// Where the fades go by when the segment is a part of a clip's sound, the clip's own edges: a
+    /// clip that holds a frame is silent then, and sounds in parts. None: its own edges.
+    pub edges: Option<(f64, f64)>,
 }
 
 impl Segment {
@@ -50,12 +53,13 @@ impl Segment {
 
     /// What the segment's sound is multiplied by at `t`: its gain and its fades.
     pub fn level(&self, t: f64) -> f32 {
+        let (start, end) = self.edges.unwrap_or((self.start, self.end));
         let mut fade = 1.0f64;
         if self.fade_in > 0.0 {
-            fade = fade.min(self.curves.0.level(Edge::In, (t - self.start) / self.fade_in));
+            fade = fade.min(self.curves.0.level(Edge::In, (t - start) / self.fade_in));
         }
         if self.fade_out > 0.0 {
-            fade = fade.min(self.curves.1.level(Edge::Out, (t - (self.end - self.fade_out)) / self.fade_out));
+            fade = fade.min(self.curves.1.level(Edge::Out, (t - (end - self.fade_out)) / self.fade_out));
         }
         self.gain * fade.clamp(0.0, 1.0) as f32
     }
@@ -325,6 +329,9 @@ mod tests {
         assert_eq!(range.mix(10.0), (0.25, 0.25));
         assert_eq!(Segment { gain: 0.5, ..segment }.level(3.0), 0.25);
         // By curves: an ease in rises slowly, an ease out falls fast and lingers.
+        // A part of a clip that holds a frame before it: its fades go by the clip's edges.
+        let part = Segment { start: 4.0, edges: Some((2.0, 12.0)), ..segment };
+        assert_eq!((part.level(3.0), part.level(4.0), part.level(10.0)), (segment.level(3.0), 1.0, 0.5));
         let eased = Segment { curves: (Curve::EaseIn, Curve::EaseOut), ..segment };
         assert_eq!((eased.level(3.0), eased.level(10.0)), (0.25, 0.25));
         assert_eq!((eased.level(2.5), eased.level(8.5)), (0.0625, 0.765625));

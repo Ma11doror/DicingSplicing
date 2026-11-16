@@ -30,6 +30,9 @@ pub struct Line {
     pub image: bool,
     /// How fast it plays that part: 2 is twice as fast, so half as long. Set in the editor.
     pub speed: f64,
+    /// The frames it holds on the way, each the moment of the file and for how long, in the order
+    /// they come. Set in the editor.
+    pub holds: Vec<(f64, f64)>,
     /// All of its picture is in the frame, with black bars around it, as Fit makes it.
     pub bars: bool,
 }
@@ -65,6 +68,7 @@ pub fn summary(project: &Project) -> Summary {
                     still: clip.still.is_some(),
                     image: clip.is_image(),
                     speed: clip.speed(),
+                    holds: clip.holds().iter().map(|hold| (hold.at, hold.span.len())).collect(),
                     bars: clip.transform.bars && clip.transform.zoom < 1.0 - ROUNDING,
                 })
                 .collect()
@@ -121,7 +125,10 @@ impl Summary {
             for line in &self.lines {
                 let name = shortened(&line.name, width);
                 let file = file_label(Path::new(&line.file));
-                let at = if line.speed == 1.0 { String::new() } else { format!(", at {}", speed_text(line.speed)) };
+                let mut at = if line.speed == 1.0 { String::new() } else { format!(", at {}", speed_text(line.speed)) };
+                for (moment, seconds) in &line.holds {
+                    at += &format!(", holding its frame at {} for {}", format(*moment), format(*seconds));
+                }
                 let bars = if line.bars { ", with black bars" } else { "" };
                 let plays = match (line.still, line.image) {
                     (true, true) => format!("{file}, an image"),
@@ -147,7 +154,10 @@ impl Summary {
         let clips: Vec<Value> = self
             .lines
             .iter()
-            .map(|line| json!({"number": line.number, "name": line.name, "start": line.start, "length": line.length, "file": line.file, "from": line.from, "to": line.to, "speed": line.speed, "still": line.still, "image": line.image, "bars": line.bars}))
+            .map(|line| {
+                let holds: Vec<Value> = line.holds.iter().map(|(at, seconds)| json!({"at": at, "seconds": seconds})).collect();
+                json!({"number": line.number, "name": line.name, "start": line.start, "length": line.length, "file": line.file, "from": line.from, "to": line.to, "speed": line.speed, "holds": holds, "still": line.still, "image": line.image, "bars": line.bars})
+            })
             .collect();
         let others: Vec<Value> = self.others.iter().map(|(name, count)| json!({"name": name, "clips": count})).collect();
         json!({
@@ -285,6 +295,25 @@ mod tests {
         assert!(summary.text().contains("install.mp4 00:12.00 to 04:05.00, at ×2\n") || summary.text().ends_with("install.mp4 00:12.00 to 04:05.00, at ×2"), "{}", summary.text());
         assert!(summary.text().contains("  00:12.50  01:56.50  "), "half as long: {}", summary.text());
         assert_eq!(summary.json()["clips"][1]["speed"], 2.0);
+    }
+
+    #[test]
+    fn a_frame_held_in_the_editor_is_told_and_cut_with_the_clip() {
+        let mut project = lesson();
+        let install = crate::core::edit::ClipId { track: 0, index: 1 };
+        // At 20 s of the timeline the recording is at 19.5 s: held there for 2 s.
+        assert!(project.sequence.freeze(install, 20.0, 2.0));
+        let told = summary(&project);
+        let text = told.text();
+        assert!(text.contains("  00:12.50  03:55.00  "), "2 s longer: {text}");
+        assert!(text.contains("install.mp4 00:12.00 to 04:05.00, holding its frame at 00:19.50 for 00:02.00"), "{text}");
+        assert_eq!(told.json()["clips"][1]["holds"], json!([{"at": 19.5, "seconds": 2.0}]));
+        assert_eq!(told.json()["clips"][0]["holds"], json!([]));
+        // A cut where the frame starts to be held: the hold goes with the part after the cut.
+        crate::cli::pieces::blade(&mut project, 2, 19.5).unwrap();
+        let told = summary(&project);
+        assert_eq!(told.json()["clips"][2]["holds"], json!([{"at": 19.5, "seconds": 2.0}]), "{}", told.text());
+        assert_eq!(told.json()["clips"][1]["holds"], json!([]), "{}", told.text());
     }
 
     #[test]

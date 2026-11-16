@@ -73,6 +73,8 @@ pub type SourceId = u32;
 pub const DEFAULT_FADE: f64 = 1.0;
 /// How long an image lasts when it is put on the timeline.
 pub const IMAGE_LENGTH: f64 = 5.0;
+/// How long a frame is held when a freeze frame is made.
+pub const FREEZE_LENGTH: f64 = 2.0;
 
 /// An edge of a clip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,6 +237,17 @@ fn playable(factor: f64) -> f64 {
     }
 }
 
+/// A frame of the clip's source held on screen: when the clip gets to the moment `at` of its source,
+/// it stays there for `seconds`, without sound, and then plays on from there. The clip is that much
+/// longer. Its fades stay in the clip's own time and go on through it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Freeze {
+    /// The moment of the source whose frame is held, in source seconds.
+    pub at: f64,
+    /// How long it is held, in seconds of the timeline.
+    pub seconds: f64,
+}
+
 /// Something done to a clip. Effects apply in the order of the clip's list.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
@@ -242,6 +255,7 @@ pub enum Effect {
     Fade(Fade),
     Color(Color),
     Speed(Speed),
+    Freeze(Freeze),
 }
 
 impl Effect {
@@ -259,8 +273,48 @@ impl Effect {
         }
     }
 
+    pub fn as_freeze(&self) -> Option<&Freeze> {
+        match self {
+            Effect::Freeze(freeze) => Some(freeze),
+            _ => None,
+        }
+    }
+
     fn is_fade_at(&self, edge: Edge) -> bool {
         self.as_fade().is_some_and(|fade| fade.edge == edge)
+    }
+}
+
+/// A frame a clip holds, where it is on the timeline.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Hold {
+    /// Which of the clip's effects it is: its Freeze.
+    pub effect: usize,
+    /// The moment of the source whose frame is held.
+    pub at: f64,
+    pub span: Span,
+}
+
+/// A part of a clip's time in which its source goes on at one rate: as fast as the clip plays it,
+/// or not at all while a frame is held.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Run {
+    /// Where it is on the timeline.
+    pub span: Span,
+    /// The source time at its start.
+    pub source: f64,
+    /// How many seconds of the source go by in a second of the timeline: 0 while a frame is held.
+    pub rate: f64,
+}
+
+impl Run {
+    pub fn is_held(&self) -> bool {
+        self.rate == 0.0
+    }
+
+    /// Source time at timeline time `t`, also outside the run.
+    pub fn source_time(&self, t: f64) -> f64 {
+        self.source + (t - self.span.start) * self.rate
     }
 }
 
@@ -371,6 +425,9 @@ impl Clip {
             self.source_out = duration;
         }
         self.source_out = self.source_out.min(duration);
+        // A frame held that is not in what it plays any more goes.
+        let (from, to) = (self.source_in, self.source_out);
+        self.effects.retain(|effect| effect.as_freeze().is_none_or(|freeze| freeze.at >= from - SAME_TIME && freeze.at <= to + SAME_TIME));
     }
 
     /// What the clip's sound is multiplied by.
@@ -425,11 +482,67 @@ impl Clip {
     }
 
     pub fn end(&self) -> f64 {
-        self.start + (self.source_out - self.source_in) / self.speed()
+        self.start + (self.source_out - self.source_in) / self.speed() + self.held()
     }
 
     pub fn span(&self) -> Span {
         Span { start: self.start, end: self.end() }
+    }
+
+    /// Its Freeze effects that hold a frame of what it plays, for some time, with their places in its
+    /// list of effects. A still holds its one frame anyway.
+    fn freezes(&self) -> impl Iterator<Item = (usize, &Freeze)> {
+        let (from, to, moving) = (self.source_in, self.source_out, self.still.is_none());
+        self.effects.iter().enumerate().filter_map(|(index, effect)| Some((index, effect.as_freeze()?))).filter(move |(_, freeze)| {
+            moving && freeze.seconds.is_finite() && freeze.seconds > 0.0 && freeze.at >= from - SAME_TIME && freeze.at <= to + SAME_TIME
+        })
+    }
+
+    /// How long it holds frames, all of them together.
+    fn held(&self) -> f64 {
+        self.freezes().map(|(_, freeze)| freeze.seconds).sum()
+    }
+
+    /// The frames it holds, in the order they come, each where it is on the timeline.
+    pub fn holds(&self) -> Vec<Hold> {
+        let mut freezes: Vec<(usize, Freeze)> = self.freezes().map(|(effect, freeze)| (effect, *freeze)).collect();
+        freezes.sort_by(|a, b| a.1.at.total_cmp(&b.1.at).then(a.0.cmp(&b.0)));
+        let speed = self.speed();
+        let mut held = 0.0;
+        freezes
+            .into_iter()
+            .map(|(effect, freeze)| {
+                let at = clamp(freeze.at, self.source_in, self.source_out);
+                let start = self.start + (at - self.source_in) / speed + held;
+                held += freeze.seconds;
+                Hold { effect, at, span: Span { start, end: start + freeze.seconds } }
+            })
+            .collect()
+    }
+
+    /// Its time from its start to its end in runs, one after another: where it plays its source and
+    /// where it holds a frame.
+    pub fn runs(&self) -> Vec<Run> {
+        let speed = self.speed();
+        let mut runs = Vec::new();
+        let (mut t, mut source) = (self.start, self.source_in);
+        for hold in self.holds() {
+            if hold.span.start > t + SAME_TIME {
+                runs.push(Run { span: Span { start: t, end: hold.span.start }, source, rate: speed });
+            }
+            runs.push(Run { span: hold.span, source: hold.at, rate: 0.0 });
+            (t, source) = (hold.span.end, hold.at);
+        }
+        let end = self.end();
+        if end > t + SAME_TIME || runs.is_empty() {
+            runs.push(Run { span: Span { start: t, end }, source, rate: speed });
+        }
+        runs
+    }
+
+    /// The frame it holds at timeline time `t`, if it holds one then.
+    pub fn hold_at(&self, t: f64) -> Option<Hold> {
+        self.holds().into_iter().find(|hold| hold.span.contains(t))
     }
 
     /// Where the whole source would be if it were not trimmed. A still is all there is of itself.
@@ -438,12 +551,23 @@ impl Clip {
             return self.span();
         }
         let offset = self.offset();
-        Span { start: offset, end: offset + self.source_duration / self.speed() }
+        Span { start: offset, end: offset + self.source_duration / self.speed() + self.held() }
     }
 
-    /// Source time at timeline time `t`, also outside the trimmed part. A still's own time.
+    /// Source time at timeline time `t`, also outside the trimmed part: while a frame is held, the
+    /// moment of that frame. A still's own time.
     pub fn source_time(&self, t: f64) -> f64 {
-        self.source_in + (t - self.start) * self.speed()
+        let (mut time, mut source) = (self.start, self.source_in);
+        for hold in self.holds() {
+            if t < hold.span.start {
+                break;
+            }
+            if t < hold.span.end {
+                return hold.at;
+            }
+            (time, source) = (hold.span.end, hold.at);
+        }
+        source + (t - time) * self.speed()
     }
 
     /// The source time of the frame seen at timeline time `t`: a still shows the same one all along.
@@ -452,9 +576,79 @@ impl Clip {
     }
 
     /// Timeline time at which the source is at `source` seconds: the other way round from
-    /// `source_time`.
+    /// `source_time`. A frame held is first seen where it starts to be held.
     pub fn time_of(&self, source: f64) -> f64 {
-        self.start + (source - self.source_in) / self.speed()
+        let (mut time, mut from) = (self.start, self.source_in);
+        for hold in self.holds() {
+            if source <= hold.at + SAME_TIME {
+                break;
+            }
+            (time, from) = (hold.span.end, hold.at);
+        }
+        time + (source - from) / self.speed()
+    }
+
+    /// The moment of its source that its Freeze `effect` would hold to be held from timeline time
+    /// `t` on: what it shows at `t` without that hold.
+    pub fn moment_without(&self, effect: usize, t: f64) -> f64 {
+        let mut without = self.clone();
+        without.remove_effects(&[effect]);
+        without.source_time(t).clamp(self.source_in.min(self.source_out), self.source_out)
+    }
+
+    /// Holds the frame at the moment `at` of its source `seconds` longer: one it holds already, or a
+    /// new one.
+    fn add_freeze(&mut self, at: f64, seconds: f64) {
+        match self.freeze_at_mut(at) {
+            Some(freeze) => freeze.seconds += seconds,
+            None => self.effects.push(Effect::Freeze(Freeze { at, seconds })),
+        }
+    }
+
+    /// Its Freeze of the moment `at` of its source, if it holds that frame.
+    fn freeze_at_mut(&mut self, at: f64) -> Option<&mut Freeze> {
+        let held: Vec<usize> = self.freezes().filter(|(_, freeze)| (freeze.at - at).abs() < SAME_TIME).map(|(effect, _)| effect).collect();
+        let effect = *held.first()?;
+        match &mut self.effects[effect] {
+            Effect::Freeze(freeze) => Some(freeze),
+            _ => None,
+        }
+    }
+
+    /// Takes the effects at `indices` of its list off.
+    fn remove_effects(&mut self, indices: &[usize]) {
+        let mut index = 0;
+        self.effects.retain(|_| {
+            index += 1;
+            !indices.contains(&(index - 1))
+        });
+    }
+
+    /// Takes what of its holds is before timeline time `t` off: the ones that end by then go, and
+    /// one that goes on through it is held from `t` on only.
+    fn cut_holds_before(&mut self, t: f64) {
+        let mut gone = Vec::new();
+        for hold in self.holds() {
+            if hold.span.end <= t + SAME_TIME {
+                gone.push(hold.effect);
+            } else if let (true, Effect::Freeze(freeze)) = (hold.span.start < t, &mut self.effects[hold.effect]) {
+                freeze.seconds = hold.span.end - t;
+            }
+        }
+        self.remove_effects(&gone);
+    }
+
+    /// Takes what of its holds is after timeline time `t` off, see `cut_holds_before`.
+    fn cut_holds_after(&mut self, t: f64) {
+        let mut gone = Vec::new();
+        for hold in self.holds() {
+            if hold.span.start >= t - SAME_TIME {
+                gone.push(hold.effect);
+            } else if let (true, Effect::Freeze(freeze)) = (hold.span.end > t, &mut self.effects[hold.effect]) {
+                freeze.seconds = t - hold.span.start;
+            }
+        }
+        self.remove_effects(&gone);
     }
 
     /// Timeline time of the source's start.
@@ -580,7 +774,8 @@ impl Clip {
     }
 
     /// Moves the start edge to `t`, not before `lo`; the picture stays where it is on the timeline.
-    /// A still has no source to run out of: only `lo` stops it.
+    /// A frame held before `t` goes, and one held through it is held from `t` on. A still has no
+    /// source to run out of: only `lo` stops it.
     fn trim_start(&mut self, t: f64, lo: f64, min_len: f64) {
         if self.still.is_some() {
             let end = self.end();
@@ -588,22 +783,37 @@ impl Clip {
             self.source_in = 0.0;
             self.source_out = end - self.start;
         } else {
-            let (offset, speed) = (self.offset(), self.speed());
-            self.start = clamp(t, lo.max(offset), self.end() - min_len);
-            self.source_in = ((self.start - offset) * speed).max(0.0);
+            let start = clamp(t, lo.max(self.offset()), self.end() - min_len);
+            if start <= self.start {
+                self.source_in = (self.source_in - (self.start - start) * self.speed()).max(0.0);
+            } else {
+                let source_in = self.source_time(start);
+                self.cut_holds_before(start);
+                self.source_in = source_in;
+            }
+            self.start = start;
         }
         self.fit_fades();
     }
 
-    /// Moves the end edge to `t`, not after `hi`. A still goes as far as `hi`.
+    /// Moves the end edge to `t`, not after `hi`. A frame held after `t` goes, and one held through it
+    /// is held up to `t`. A still goes as far as `hi`.
     fn trim_end(&mut self, t: f64, hi: f64, min_len: f64) {
         if self.still.is_some() {
             let end = clamp(t, self.start + min_len, hi);
             self.source_out = self.source_in + (end - self.start);
         } else {
-            let (offset, speed) = (self.offset(), self.speed());
-            let end = clamp(t, self.start + min_len, hi.min(offset + self.source_duration / speed));
-            self.source_out = ((end - offset) * speed).min(self.source_duration);
+            let (old, speed) = (self.end(), self.speed());
+            // Where its source runs out.
+            let last = old + (self.source_duration - self.source_out) / speed;
+            let end = clamp(t, self.start + min_len, hi.min(last));
+            if end >= old {
+                self.source_out = (self.source_out + (end - old) * speed).min(self.source_duration);
+            } else {
+                let source_out = self.source_time(end);
+                self.cut_holds_after(end);
+                self.source_out = source_out;
+            }
         }
         self.fit_fades();
     }
@@ -993,7 +1203,13 @@ impl Sequence {
         if part.start < 0.0 || part.len() < SAME_TIME || part.end > clip.source_duration + SAME_TIME {
             return false;
         }
-        let delta = part.len() / clip.speed() - clip.span().len();
+        // The frames it holds stay held, those in the new part.
+        let mut changed = clip.clone();
+        changed.source_in = part.start;
+        changed.source_out = part.end.min(clip.source_duration);
+        changed.effects.retain(|effect| effect.as_freeze().is_none_or(|freeze| freeze.at >= part.start - SAME_TIME && freeze.at <= part.end + SAME_TIME));
+        changed.fit_fades();
+        let delta = changed.span().len() - clip.span().len();
         let fit = self.export_fits();
         let mut next = self.clone();
         let later = |sequence: &mut Sequence| sequence.ripple_shift(id.track, id.index + 1, delta);
@@ -1001,10 +1217,7 @@ impl Sequence {
         if delta > 0.0 && !later(&mut next) {
             return false;
         }
-        let clip = next.clip_mut(id);
-        clip.source_in = part.start;
-        clip.source_out = part.end.min(clip.source_duration);
-        clip.fit_fades();
+        *next.clip_mut(id) = changed;
         if delta <= 0.0 && !later(&mut next) {
             return false;
         }
@@ -1036,19 +1249,43 @@ impl Sequence {
 
     /// Makes `change` to clip `id`, which may make it longer or shorter. It keeps its start, its fades
     /// shorten to fit it, and the clips after it on its track move by as much as it got longer or
-    /// shorter, each with the clips chained to it, apart from `id` and what is chained to `id`: those
-    /// stay. Other tracks stay as they are. An export range that fitted the clips goes on fitting
-    /// them. False, with nothing changed, if what has to move can't go that far: a clip chained to
-    /// one of them has no room on its own track.
+    /// shorter, each with the clips chained to it, and so do the clips chained to `id` that start
+    /// where it ends or later. `id` and the rest of what is chained to it stay, and so do the other
+    /// tracks. An export range that fitted the clips goes on fitting them. False, with nothing
+    /// changed, if what has to move can't go that far: a clip chained to one of them has no room on
+    /// its own track.
     fn resize(&mut self, id: ClipId, change: impl FnOnce(&mut Clip)) -> bool {
         if !self.has(id) {
             return false;
         }
         let mut changed = self.clip(id).clone();
         change(&mut changed);
-        changed.fit_fades();
-        let delta = changed.span().len() - self.clip(id).span().len();
-        let moving = self.after(id);
+        let end = self.clip(id).end();
+        self.ripple(vec![(id, changed)], end)
+    }
+
+    /// Puts the `changed` clips in place of the clips they were, each of them as much longer or
+    /// shorter as the others, from timeline time `from` on: their fades shorten to fit them, the
+    /// clips after each of them on its track move by as much, each with the clips chained to it, and
+    /// so do the clips chained to them that start at `from` or later. The rest of what is chained to
+    /// them stays, and so do the other tracks. An export range that fitted the clips goes on fitting
+    /// them. False, with nothing changed, if they did not change by as much, or what has to move
+    /// can't go that far: a clip chained to one of them has no room on its own track.
+    fn ripple(&mut self, mut changed: Vec<(ClipId, Clip)>, from: f64) -> bool {
+        if changed.is_empty() || changed.iter().any(|(id, _)| !self.has(*id)) {
+            return false;
+        }
+        let mut deltas = Vec::new();
+        for (id, clip) in &mut changed {
+            clip.fit_fades();
+            deltas.push(clip.span().len() - self.clip(*id).span().len());
+        }
+        let delta = deltas[0];
+        if deltas.iter().any(|other| (other - delta).abs() > SAME_TIME) {
+            return false;
+        }
+        let ids: Vec<ClipId> = changed.iter().map(|(id, _)| *id).collect();
+        let moving = self.after(&ids, from);
         let fit = self.export_fits();
         let mut next = self.clone();
         let room = |sequence: &Sequence| (sequence.room_for(&moving, delta) - delta).abs() <= SAME_TIME;
@@ -1059,7 +1296,9 @@ impl Sequence {
             }
             next.shift(&moving, delta);
         }
-        *next.clip_mut(id) = changed;
+        for (id, clip) in changed {
+            *next.clip_mut(id) = clip;
+        }
         if delta <= 0.0 {
             if !room(&next) {
                 return false;
@@ -1073,20 +1312,160 @@ impl Sequence {
         true
     }
 
-    /// What moves when clip `id` gets longer or shorter: the clips after it on its track, each with
-    /// the clips chained to it, but not `id` or what is chained to it.
-    fn after(&self, id: ClipId) -> Vec<ClipId> {
-        let own = self.group_of(id);
-        let mut moving: Vec<ClipId> = Vec::new();
-        for index in id.index + 1..self.tracks[id.track].clips.len() {
-            let next = ClipId { track: id.track, index };
-            for member in self.group_of(next) {
-                if (member == next || !own.contains(&member)) && !moving.contains(&member) {
-                    moving.push(member);
+    /// What moves when clips `ids` get longer or shorter from timeline time `from` on: the clips after
+    /// each of them on its track, each with the clips chained to it, and of the clips chained to
+    /// them, those that start at `from` or later. Not `ids`, nor what is chained to them and starts
+    /// before `from`.
+    fn after(&self, ids: &[ClipId], from: f64) -> Vec<ClipId> {
+        let mut own: Vec<ClipId> = Vec::new();
+        for &id in ids {
+            for member in self.group_of(id) {
+                if !own.contains(&member) {
+                    own.push(member);
+                }
+            }
+        }
+        let mut moving: Vec<ClipId> = own.iter().copied().filter(|member| !ids.contains(member) && self.clip(*member).start >= from - SAME_TIME).collect();
+        for &id in ids {
+            for index in id.index + 1..self.tracks[id.track].clips.len() {
+                let next = ClipId { track: id.track, index };
+                for member in self.group_of(next) {
+                    if (member == next || !own.contains(&member)) && !ids.contains(&member) && !moving.contains(&member) {
+                        moving.push(member);
+                    }
                 }
             }
         }
         moving
+    }
+
+    /// The other clips chained to `id` that show the moment `at` of its source when it does, at its
+    /// speed: the sound detached from it, say. A frame it holds, they hold too.
+    fn partners(&self, id: ClipId, at: f64) -> Vec<ClipId> {
+        let clip = self.clip(id);
+        let when = clip.time_of(at);
+        let same = |other: &Clip| {
+            other.source == clip.source
+                && other.still.is_none()
+                && (other.speed() - clip.speed()).abs() < SAME_TIME
+                && at >= other.source_in - SAME_TIME
+                && at <= other.source_out + SAME_TIME
+                && (other.time_of(at) - when).abs() < SAME_TIME
+        };
+        self.group_of(id).into_iter().filter(|&other| other != id && same(self.clip(other))).collect()
+    }
+
+    /// Clip `id` and its partners that hold the frame its Freeze `effect` holds, each changed by
+    /// `change` with the moment of that frame; and where that hold ends. None if it has no such
+    /// Freeze.
+    fn changed_holds(&self, id: ClipId, effect: usize, change: impl Fn(&mut Clip, f64)) -> Option<(Vec<(ClipId, Clip)>, Span)> {
+        let hold = self.clip(id).holds().into_iter().find(|hold| hold.effect == effect)?;
+        let mut changed = Vec::new();
+        for member in std::iter::once(id).chain(self.partners(id, hold.at)) {
+            let mut clip = self.clip(member).clone();
+            if member != id && clip.freeze_at_mut(hold.at).is_none() {
+                continue;
+            }
+            change(&mut clip, hold.at);
+            changed.push((member, clip));
+        }
+        Some((changed, hold.span))
+    }
+
+    /// Holds the frame clip `id` shows at `t` for `length` seconds: when the clip gets to that moment
+    /// of its source, it stays there, without sound, and then plays on from there. A frame it holds
+    /// already is held that much longer. The other clips chained to it that show the same moment at
+    /// the same time, like the sound detached from it, hold it too, in silence. They get longer, the
+    /// clips after them on their tracks move later, each with the clips chained to it, and so do the
+    /// clips chained to them from the hold on: see `ripple`. False, with nothing changed, if the clip
+    /// is a still, is not there at `t`, or what has to move can't go that far.
+    pub fn freeze(&mut self, id: ClipId, t: f64, length: f64) -> bool {
+        if !(self.has(id) && length.is_finite() && length > 0.0) {
+            return false;
+        }
+        let clip = self.clip(id);
+        if clip.still.is_some() || !clip.span().contains(t) {
+            return false;
+        }
+        let at = clip.source_time(t);
+        // A frame held already is held longer from where it was held up to.
+        let from = clip.holds().into_iter().find(|hold| (hold.at - at).abs() < SAME_TIME).map_or_else(|| clip.time_of(at), |hold| hold.span.end);
+        let changed = std::iter::once(id)
+            .chain(self.partners(id, at))
+            .map(|member| {
+                let mut clip = self.clip(member).clone();
+                clip.add_freeze(at, length);
+                (member, clip)
+            })
+            .collect();
+        self.ripple(changed, from)
+    }
+
+    /// Makes clip `id`'s Freeze `effect` hold `seconds`, and the same hold of its partners as much
+    /// longer or shorter: see `freeze`. False, with nothing changed, if it has no such Freeze,
+    /// `seconds` is no length, or what has to move can't go that far.
+    pub fn set_freeze_length(&mut self, id: ClipId, effect: usize, seconds: f64) -> bool {
+        let Some(held) = self.clip(id).effects.get(effect).and_then(Effect::as_freeze).map(|freeze| freeze.seconds) else {
+            return false;
+        };
+        if !(seconds.is_finite() && seconds > 0.0) {
+            return false;
+        }
+        let delta = seconds - held;
+        let longer = |clip: &mut Clip, at: f64| {
+            if let Some(freeze) = clip.freeze_at_mut(at) {
+                freeze.seconds = (freeze.seconds + delta).max(SAME_TIME);
+            }
+        };
+        let Some((changed, hold)) = self.changed_holds(id, effect, longer) else {
+            return false;
+        };
+        self.ripple(changed, hold.end)
+    }
+
+    /// Takes clip `id`'s Freeze `effect` off, and the same hold of its partners: they get shorter,
+    /// see `freeze`. False, with nothing changed, if it has no such Freeze, or what has to move can't
+    /// go that far.
+    pub fn remove_freeze(&mut self, id: ClipId, effect: usize) -> bool {
+        let gone = |clip: &mut Clip, at: f64| {
+            let held: Vec<usize> = clip.freezes().filter(|(_, freeze)| (freeze.at - at).abs() < SAME_TIME).map(|(effect, _)| effect).take(1).collect();
+            clip.remove_effects(&held);
+        };
+        match self.changed_holds(id, effect, gone) {
+            Some((changed, hold)) => self.ripple(changed, hold.end),
+            // One that holds nothing just goes.
+            None if self.clip(id).effects.get(effect).is_some_and(|effect| effect.as_freeze().is_some()) => {
+                self.clip_mut(id).remove_effects(&[effect]);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Makes clip `id`'s Freeze `effect` hold the frame of the moment `at` of its source instead, as
+    /// long as before, and the same hold of its partners: the hold moves to where the clip gets to
+    /// that moment. `at` stays within what all of them play. Nothing else moves: the clip is as long
+    /// as it was. False if it has no such Freeze.
+    pub fn move_freeze(&mut self, id: ClipId, effect: usize, at: f64) -> bool {
+        let Some(hold) = self.clip(id).holds().into_iter().find(|hold| hold.effect == effect) else {
+            return false;
+        };
+        let mut members = vec![(id, effect)];
+        for member in self.partners(id, hold.at) {
+            let clip = self.clip(member);
+            if let Some((index, _)) = clip.freezes().find(|(_, freeze)| (freeze.at - hold.at).abs() < SAME_TIME) {
+                members.push((member, index));
+            }
+        }
+        let lo = members.iter().map(|(member, _)| self.clip(*member).source_in).fold(f64::NEG_INFINITY, f64::max);
+        let hi = members.iter().map(|(member, _)| self.clip(*member).source_out).fold(f64::INFINITY, f64::min);
+        let at = clamp(at, lo, hi);
+        for (member, index) in members {
+            if let Effect::Freeze(freeze) = &mut self.clip_mut(member).effects[index] {
+                freeze.at = at;
+            }
+        }
+        true
     }
 
     /// Removes a clip. Its track stays, even when it is left empty.
@@ -1246,9 +1625,9 @@ impl Sequence {
 
     /// Makes the sound of a clip on a video track a clip of its own, on an audio track right under
     /// it: the one there if it is free at that time, else a new one. The two are chained. The sound's
-    /// part of the fades goes with the sound; the colour stays with the picture; both keep the speed,
-    /// so that they stay together. Returns where the picture and the sound are now, or None if the
-    /// clip has no sound of its own to detach, like a still.
+    /// part of the fades goes with the sound; the colour stays with the picture; both keep the speed
+    /// and the frames held, so that they stay together. Returns where the picture and the sound are
+    /// now, or None if the clip has no sound of its own to detach, like a still.
     pub fn detach_sound(&mut self, id: ClipId) -> Option<(ClipId, ClipId)> {
         if self.tracks[id.track].kind != TrackKind::Video || self.clip(id).sound_detached || self.clip(id).still.is_some() {
             return None;
@@ -1266,6 +1645,8 @@ impl Sequence {
             .filter_map(|effect| match effect {
                 Effect::Fade(fade) if fade.sound => Some(Effect::Fade(Fade { picture: false, ..*fade })),
                 Effect::Speed(speed) => Some(Effect::Speed(*speed)),
+                // Silent while the picture holds a frame.
+                Effect::Freeze(freeze) => Some(Effect::Freeze(*freeze)),
                 _ => None,
             })
             .collect();
@@ -1378,8 +1759,9 @@ impl Sequence {
     }
 
     /// Cuts a clip in two at `t`. It keeps what is before the cut; a new clip right after it plays
-    /// the rest, with the same framing and sound. From then on they are two clips like any others.
-    /// None if `t` is closer than `min_len` to an edge. Returns the part after the cut.
+    /// the rest, with the same framing and sound. A frame held through the cut is held in both, each
+    /// for its part of the time. From then on they are two clips like any others. None if `t` is
+    /// closer than `min_len` to an edge. Returns the part after the cut.
     pub fn split(&mut self, id: ClipId, t: f64, min_len: f64) -> Option<ClipId> {
         let clip = self.clip(id);
         if t - clip.start < min_len - SAME_TIME || clip.end() - t < min_len - SAME_TIME {
@@ -1388,11 +1770,14 @@ impl Sequence {
         let cut = clip.source_time(t);
         // The fade in stays with the part before the cut, the fade out goes with the part after it.
         // Both keep the colour.
-        let mut after = Clip { start: t, source_in: cut, ..clip.clone() };
+        let mut after = clip.clone();
+        after.cut_holds_before(t);
+        (after.start, after.source_in) = (t, cut);
         after.settle_still();
         after.effects.retain(|effect| !effect.is_fade_at(Edge::In));
         after.fit_fades();
         let before = self.clip_mut(id);
+        before.cut_holds_after(t);
         before.source_out = cut;
         before.effects.retain(|effect| !effect.is_fade_at(Edge::Out));
         before.fit_fades();
@@ -2554,6 +2939,233 @@ mod tests {
         assert!(!sequence.set_length(first, f64::NAN));
         assert!(!sequence.set_length(ClipId { track: 0, index: 2 }, 3.0), "a recording is trimmed instead");
         assert_eq!(sequence, before);
+    }
+
+    /// The Freeze effects of a clip.
+    fn freezes_of(clip: &Clip) -> Vec<Freeze> {
+        clip.effects.iter().filter_map(Effect::as_freeze).copied().collect()
+    }
+
+    fn hold_spans(clip: &Clip) -> Vec<Span> {
+        clip.holds().iter().map(|hold| hold.span).collect()
+    }
+
+    #[test]
+    fn a_freeze_holds_the_frame_at_its_time_and_the_clip_plays_on_from_it_later() {
+        // a 0..10, b 10..14 and c 14..20 on one track; another track's clip stays where it is.
+        let mut sequence = three_in_a_row();
+        sequence.tracks.push(track_of(vec![Clip { start: 12.0, ..Clip::of(3, "d".into(), 2.0) }]));
+        let a = ClipId { track: 0, index: 0 };
+        let clip = sequence.clip_mut(a);
+        clip.add_fade(Edge::In);
+        clip.add_fade(Edge::Out);
+        clip.add_color();
+        assert!(sequence.freeze(a, 4.0, FREEZE_LENGTH));
+        assert_eq!(names_and_starts(&sequence, 0), [("a", 0.0), ("b", 12.0), ("c", 16.0)], "one clip, 2 s longer");
+        let clip = sequence.clip(a);
+        assert_eq!(clip.span(), span(0.0, 12.0));
+        assert_eq!((clip.source_in, clip.source_out), (0.0, 10.0), "it plays the same part of its source");
+        assert_eq!(freezes_of(clip), [Freeze { at: 4.0, seconds: 2.0 }]);
+        assert_eq!(hold_spans(clip), [span(4.0, 6.0)]);
+        let times: Vec<f64> = [3.0, 4.0, 5.9, 6.0, 7.5, 12.0].map(|t| clip.source_time(t)).to_vec();
+        assert_eq!(times, [3.0, 4.0, 4.0, 4.0, 5.5, 10.0], "up to it, held, then on from it");
+        assert_eq!((clip.picture_time(5.0), clip.time_of(4.0), clip.time_of(5.0)), (4.0, 4.0, 7.0));
+        let runs = clip.runs();
+        assert_eq!(
+            runs.iter().map(|run| (run.span, run.source, run.rate)).collect::<Vec<_>>(),
+            [(span(0.0, 4.0), 0.0, 1.0), (span(4.0, 6.0), 4.0, 0.0), (span(6.0, 12.0), 4.0, 1.0)]
+        );
+        assert_eq!(clip.hold_at(5.0).map(|hold| hold.at), Some(4.0));
+        assert_eq!(clip.hold_at(6.0), None);
+        // The fades are where they were, in the clip's own time; the colour is as it was.
+        assert_eq!(clip.fade_lengths(), (1.0, 1.0));
+        assert!(clip.opacity(11.5) < 1.0 && clip.opacity(10.5) == 1.0 && clip.color().is_some());
+        assert_eq!(clip.source_span(), span(0.0, 32.0), "its whole source, with the frame held");
+        assert_eq!(sequence.tracks[1].clips[0].start, 12.0, "other tracks stay");
+        assert_eq!(sequence.export, span(0.0, 22.0), "a fitted export range goes on fitting");
+
+        // Longer: what comes after it moves later.
+        let effect = sequence.clip(a).holds()[0].effect;
+        assert!(sequence.set_freeze_length(a, effect, 3.0));
+        assert_eq!(names_and_starts(&sequence, 0), [("a", 0.0), ("b", 13.0), ("c", 17.0)]);
+        // Again on the frame held: held that much longer, still one hold.
+        assert!(sequence.freeze(a, 5.0, FREEZE_LENGTH));
+        assert_eq!(freezes_of(sequence.clip(a)), [Freeze { at: 4.0, seconds: 5.0 }]);
+        assert_eq!(names_and_starts(&sequence, 0), [("a", 0.0), ("b", 15.0), ("c", 19.0)]);
+        // Another frame, as long: the hold moves to where the clip gets to it, nothing else moves.
+        assert!(sequence.move_freeze(a, effect, 8.0));
+        let clip = sequence.clip(a);
+        assert_eq!((hold_spans(clip), clip.span(), clip.source_time(14.0)), (vec![span(8.0, 13.0)], span(0.0, 15.0), 9.0));
+        assert_eq!(names_and_starts(&sequence, 0), [("a", 0.0), ("b", 15.0), ("c", 19.0)]);
+        assert!(sequence.move_freeze(a, effect, 40.0));
+        assert_eq!(freezes_of(sequence.clip(a))[0].at, 10.0, "not past what it plays");
+        // Off: all as it was.
+        assert!(sequence.remove_freeze(a, effect));
+        assert_eq!(names_and_starts(&sequence, 0), [("a", 0.0), ("b", 10.0), ("c", 14.0)]);
+        assert!(sequence.clip(a).holds().is_empty() && sequence.clip(a).color().is_some());
+
+        // Faster: 1 s into it at ×2 is 2 s into its source.
+        let mut fast = three_in_a_row();
+        assert!(fast.set_speed(a, 2.0));
+        assert!(fast.freeze(a, 1.0, FREEZE_LENGTH));
+        let clip = fast.clip(a);
+        assert_eq!((clip.span(), hold_spans(clip), clip.source_time(4.0)), (span(0.0, 7.0), vec![span(1.0, 3.0)], 4.0));
+        // A new speed: the frame is held as long, and the clip plays at the new speed around it.
+        assert!(fast.set_speed(a, 1.0));
+        let clip = fast.clip(a);
+        assert_eq!((clip.span(), hold_spans(clip)), (span(0.0, 12.0), vec![span(2.0, 4.0)]));
+
+        // What holds no frame, or not then: nothing changes.
+        let before = sequence.clone();
+        assert!(!sequence.freeze(a, 10.5, FREEZE_LENGTH), "not there then");
+        assert!(!sequence.freeze(a, 5.0, 0.0), "no length");
+        assert!(!sequence.set_freeze_length(a, effect, 1.0), "it has no such hold");
+        assert!(!sequence.move_freeze(a, 0, 1.0), "a fade is no hold");
+        assert!(!sequence.remove_freeze(a, 0));
+        assert_eq!(sequence, before);
+        let logo = sequence.paste(Clip::image(1, "logo".into()), 30.0, Some(0), TrackKind::Video);
+        let with_logo = sequence.clone();
+        assert!(!sequence.freeze(logo, 31.0, FREEZE_LENGTH), "a still holds its one frame anyway");
+        assert_eq!(sequence, with_logo);
+    }
+
+    #[test]
+    fn trimming_and_cutting_a_clip_take_what_it_holds_with_the_time() {
+        // A 30 s source, 0..10 of it from 0, holding its frame at 4 s for 2 s: 0..12.
+        let held = || {
+            let mut sequence = Sequence::new(Clip { source_out: 10.0, ..Clip::new("a".into(), 30.0) });
+            assert!(sequence.freeze(ClipId { track: 0, index: 0 }, 4.0, FREEZE_LENGTH));
+            sequence
+        };
+        let a = ClipId { track: 0, index: 0 };
+        // The start into the hold: the rest of it is held, the picture stays where it was.
+        let mut sequence = held();
+        sequence.trim_start(a, 5.0, MIN);
+        let clip = sequence.clip(a);
+        assert_eq!((clip.span(), clip.source_in, hold_spans(clip)), (span(5.0, 12.0), 4.0, vec![span(5.0, 6.0)]));
+        assert_eq!((clip.source_time(5.5), clip.source_time(6.5)), (4.0, 4.5));
+        // Past it: it goes.
+        sequence.trim_start(a, 7.0, MIN);
+        let clip = sequence.clip(a);
+        assert_eq!((clip.span(), clip.source_in, clip.effects.len()), (span(7.0, 12.0), 5.0, 0));
+        // Back out: what comes back is the recording.
+        sequence.trim_start(a, 2.0, MIN);
+        assert_eq!((sequence.clip(a).span(), sequence.clip(a).source_in), (span(2.0, 12.0), 0.0));
+
+        // The end into the hold, past it, and out again.
+        let mut sequence = held();
+        sequence.trim_end(a, 5.0, MIN);
+        let clip = sequence.clip(a);
+        assert_eq!((clip.span(), clip.source_out, hold_spans(clip)), (span(0.0, 5.0), 4.0, vec![span(4.0, 5.0)]));
+        sequence.trim_end(a, 8.0, MIN);
+        let clip = sequence.clip(a);
+        assert_eq!((clip.span(), clip.source_out, hold_spans(clip)), (span(0.0, 8.0), 7.0, vec![span(4.0, 5.0)]));
+        sequence.trim_end(a, 3.5, MIN);
+        let clip = sequence.clip(a);
+        assert_eq!((clip.span(), clip.source_out, clip.effects.len()), (span(0.0, 3.5), 3.5, 0));
+        // Out as far as the source goes: the hold makes the clip that much longer.
+        let mut sequence = held();
+        sequence.trim_end(a, 100.0, MIN);
+        assert_eq!((sequence.clip(a).span(), sequence.clip(a).source_out), (span(0.0, 32.0), 30.0));
+
+        // A cut in the hold: each part holds the frame for its part of the time.
+        let mut sequence = held();
+        let after = sequence.split(a, 5.0, MIN).unwrap();
+        let (first, second) = (sequence.clip(a), sequence.clip(after));
+        assert_eq!((first.span(), first.source_out, hold_spans(first)), (span(0.0, 5.0), 4.0, vec![span(4.0, 5.0)]));
+        assert_eq!((second.span(), second.source_in, hold_spans(second)), (span(5.0, 12.0), 4.0, vec![span(5.0, 6.0)]));
+        assert_eq!((second.source_time(5.5), second.source_time(7.0)), (4.0, 5.0));
+        // After it, and where it starts: the hold goes with the part it is in.
+        for (t, first_holds, second_holds) in [(8.0, vec![span(4.0, 6.0)], vec![]), (4.0, vec![], vec![span(4.0, 6.0)])] {
+            let mut sequence = held();
+            let after = sequence.split(a, t, MIN).unwrap();
+            assert_eq!((hold_spans(sequence.clip(a)), hold_spans(sequence.clip(after))), (first_holds, second_holds), "a cut at {t}");
+            assert_eq!(sequence.clip(after).span(), span(t, 12.0));
+        }
+
+        // Another part of its source: what it holds of it stays held.
+        let mut sequence = held();
+        assert!(sequence.ripple_retime(a, span(3.0, 8.0)));
+        assert_eq!((sequence.clip(a).span(), hold_spans(sequence.clip(a))), (span(0.0, 7.0), vec![span(1.0, 3.0)]));
+        assert!(sequence.ripple_retime(a, span(5.0, 8.0)));
+        assert_eq!((sequence.clip(a).span(), sequence.clip(a).effects.len()), (span(0.0, 3.0), 0));
+        // Its file turned out shorter than the moment held: the hold goes.
+        let mut sequence = held();
+        sequence.refit_source(0, 3.0);
+        assert!(sequence.clip(a).effects.is_empty());
+    }
+
+    #[test]
+    fn the_sound_detached_from_a_clip_holds_its_frames_with_it_in_silence() {
+        // The picture 10..20 on the video track, its sound 10..20 on the audio track under it, both
+        // from 2 s of their source.
+        let (mut sequence, picture, sound) = detached();
+        assert!(sequence.freeze(picture, 14.0, FREEZE_LENGTH));
+        for id in [picture, sound] {
+            let clip = sequence.clip(id);
+            assert_eq!((clip.span(), hold_spans(clip), freezes_of(clip)), (span(10.0, 22.0), vec![span(14.0, 16.0)], vec![Freeze { at: 6.0, seconds: 2.0 }]));
+        }
+        // Longer from either of them, another frame, off: both alike.
+        let effect = sequence.clip(sound).holds()[0].effect;
+        assert!(sequence.set_freeze_length(sound, effect, 3.0));
+        assert_eq!((sequence.clip(picture).span(), sequence.clip(sound).span()), (span(10.0, 23.0), span(10.0, 23.0)));
+        let effect = sequence.clip(picture).holds()[0].effect;
+        assert!(sequence.move_freeze(picture, effect, 3.0));
+        assert_eq!((hold_spans(sequence.clip(picture)), hold_spans(sequence.clip(sound))), (vec![span(11.0, 14.0)], vec![span(11.0, 14.0)]));
+        assert!(sequence.remove_freeze(picture, effect));
+        assert_eq!((sequence.clip(picture).span(), sequence.clip(sound).span()), (span(10.0, 20.0), span(10.0, 20.0)));
+        assert!(sequence.clip(sound).effects.iter().all(|effect| effect.as_freeze().is_none()));
+
+        // Detached after: the sound holds the frames the picture holds.
+        let mut clip = placed_clip();
+        clip.add_freeze(6.0, 2.0);
+        let mut sequence = Sequence::new(clip);
+        let (picture, sound) = sequence.detach_sound(ClipId { track: 0, index: 0 }).unwrap();
+        assert_eq!(hold_spans(sequence.clip(sound)), [span(14.0, 16.0)]);
+        assert_eq!(hold_spans(sequence.clip(picture)), [span(14.0, 16.0)]);
+
+        // Cut in parts, all of them chained, as the editor leaves them: the parts the frame is in hold
+        // it, the parts after them move later, those before stay. What is chained to them from the
+        // hold on moves too; what starts before it stays.
+        let (mut sequence, picture, sound) = detached();
+        assert_eq!(sequence.split_all(15.0, MIN).len(), 2);
+        let early = sequence.paste(Clip::image(1, "early".into()), 11.0, None, TrackKind::Video);
+        let late = sequence.paste(Clip { source_out: 1.0, ..Clip::image(1, "late".into()) }, 17.0, Some(early.track), TrackKind::Video);
+        assert_eq!(late.track, early.track);
+        sequence.chain(early, picture);
+        sequence.chain(late, picture);
+        assert_eq!(sequence.group_of(picture).len(), 6);
+        assert!(sequence.freeze(picture, 12.0, FREEZE_LENGTH));
+        let spans = |sequence: &Sequence, track: usize| sequence.tracks[track].clips.iter().map(Clip::span).collect::<Vec<_>>();
+        assert_eq!(spans(&sequence, picture.track), [span(10.0, 17.0), span(17.0, 22.0)]);
+        assert_eq!(spans(&sequence, sound.track), [span(10.0, 17.0), span(17.0, 22.0)]);
+        assert_eq!(spans(&sequence, early.track), [span(11.0, 16.0), span(19.0, 20.0)]);
+        assert_eq!(hold_spans(sequence.clip(sound)), [span(12.0, 14.0)]);
+        assert!(sequence.clip(ClipId { track: sound.track, index: 1 }).holds().is_empty());
+
+        // Something in the way of what has to move: nothing changes.
+        let (mut blocked, picture, sound) = detached();
+        let music = blocked.place_clip(Some(sound.track), Clip { start: 21.0, ..Clip::of(2, "music".into(), 3.0) }).unwrap();
+        let wall = blocked.add_track(blocked.tracks.len(), TrackKind::Video);
+        let tied = blocked.place_clip(Some(wall), Clip { start: 30.0, ..Clip::of(3, "tied".into(), 1.0) }).unwrap();
+        blocked.place_clip(Some(wall), Clip { start: 31.0, ..Clip::of(3, "wall".into(), 1.0) }).unwrap();
+        blocked.chain(tied, music);
+        let before = blocked.clone();
+        assert!(!blocked.freeze(picture, 14.0, FREEZE_LENGTH));
+        assert_eq!(blocked, before);
+        // Without the wall, the music after the sound moves later with what is chained to it.
+        blocked.remove_clip(ClipId { track: wall, index: 1 });
+        assert!(blocked.freeze(picture, 14.0, FREEZE_LENGTH));
+        assert_eq!((blocked.clip(music).start, blocked.clip(tied).start), (23.0, 32.0));
+    }
+
+    #[test]
+    fn a_freeze_is_saved_as_an_effect() {
+        let mut clip = Clip::new("a".into(), 30.0);
+        clip.add_freeze(4.5, 2.0);
+        let text = serde_json::to_string(&clip.effects).unwrap();
+        assert_eq!(text, r#"[{"kind":"Freeze","at":4.5,"seconds":2.0}]"#);
+        assert_eq!(serde_json::from_str::<Vec<Effect>>(&text).unwrap(), clip.effects);
     }
 
     #[test]

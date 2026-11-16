@@ -13,9 +13,9 @@ pub const PROJECT_FILE: &str = "project.json";
 pub const RENDERS_FOLDER: &str = "renders";
 /// 2: several tracks, each with an id of its own. 3: effects on clips. 4: curves of fades. 5: colour.
 /// 6: audio tracks, detached sound and chained clips. 7: the speed of a clip. 8: images, clips that
-/// hold one picture. An editor that knows less can't open such a file, and so can't lose what it
-/// does not know by saving it.
-pub const VERSION: u32 = 8;
+/// hold one picture. 9: frames held inside a clip, the Freeze effect. An editor that knows less
+/// can't open such a file, and so can't lose what it does not know by saving it.
+pub const VERSION: u32 = 9;
 
 /// A video the project uses. It is not copied: the project remembers where it is.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

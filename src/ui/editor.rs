@@ -4,7 +4,7 @@
 //! selected at a time: the middle shows its source with its frame, the side panel its transform and
 //! sound. The output preview shows what goes into the file: the clip seen at the playhead.
 
-use crate::core::edit::{speed_text, Clip, ClipId, Color, Curve, Edge, Effect, Sequence, SourceId, Span, Speed, TrackKind};
+use crate::core::edit::{speed_text, Clip, ClipId, Color, Curve, Edge, Effect, Sequence, SourceId, Span, Speed, TrackKind, FREEZE_LENGTH};
 use crate::core::history::History;
 use crate::core::lock::EditorLock;
 use crate::core::plugins::Plugin;
@@ -143,11 +143,13 @@ pub struct Editor {
     /// The clip Ctrl+C copied, and what it put into the system's clipboard to say so: Ctrl+V pastes
     /// the clip only while that text is still there.
     clipboard: Option<(Clip, TrackKind, String)>,
-    /// The clip whose speed could not change last time it was asked to: the clips after it could not
-    /// move that far. Its Speed block says so.
-    speed_refused: Option<ClipId>,
+    /// The clip whose effect could not change last time it was asked to, and which effect: the clips
+    /// after it could not move that far. That effect's block says so.
+    effect_refused: Option<(ClipId, usize)>,
     /// The still whose length could not change last time, for the same reason. Its Timing says so.
     length_refused: Option<ClipId>,
+    /// The clip whose frame could not be held last time, for the same reason. Its Timing says so.
+    freeze_refused: Option<ClipId>,
     /// The sound of the clips that play faster or slower, for playing them.
     stretcher: Stretcher,
     /// Keeps ds-tool from changing the project while it is open here. Last, so that it goes last.
@@ -210,8 +212,9 @@ impl Editor {
             flash: None,
             scroll_to: None,
             clipboard: None,
-            speed_refused: None,
+            effect_refused: None,
             length_refused: None,
+            freeze_refused: None,
             stretcher: Stretcher::new(notify.clone()),
             _lock: lock,
         }
@@ -340,11 +343,14 @@ impl Editor {
             self.selected = None;
         }
         // What was refused is said about that clip only, while it stays selected.
-        if self.speed_refused != self.selected {
-            self.speed_refused = None;
+        if self.effect_refused.map(|(id, _)| id) != self.selected {
+            self.effect_refused = None;
         }
         if self.length_refused != self.selected {
             self.length_refused = None;
+        }
+        if self.freeze_refused != self.selected {
+            self.freeze_refused = None;
         }
     }
 
@@ -430,31 +436,29 @@ impl Editor {
     }
 
     fn play_range(&self, mode: PlayMode) -> PlayRange {
-        let sounds: Vec<Sound> = self
-            .sequence
-            .clips()
-            .filter(|(id, _)| self.sequence.sounds(*id))
-            .filter_map(|(_, clip)| {
-                let (fade_in, fade_out) = clip.fade_lengths();
-                let sounds = |edge| clip.fade(edge).is_some_and(|fade| fade.sound);
-                // At another speed, its sound is made for it: that sound starts where the clip does.
-                let (pcm, source_start) = if clip.speed() == 1.0 {
-                    (self.library.cache(clip.source)?.audio.clone(), clip.source_in)
-                } else {
-                    self.stretcher.sound(&stretched(clip))?
-                };
+        let mut sounds: Vec<Sound> = Vec::new();
+        for (_, clip) in self.sequence.clips().filter(|(id, _)| self.sequence.sounds(*id)) {
+            let (fade_in, fade_out) = clip.fade_lengths();
+            let fades = |edge| clip.fade(edge).is_some_and(|fade| fade.sound);
+            // At another speed, its sound is made for it: that sound starts where the clip does.
+            let speed = clip.speed();
+            let found = if speed == 1.0 { self.library.cache(clip.source).map(|cache| (cache.audio.clone(), clip.source_in)) } else { self.stretcher.sound(&stretched(clip)) };
+            let Some((pcm, source_start)) = found else { continue };
+            // Where the clip plays its source, not where it holds a frame: silent then.
+            for run in clip.runs().into_iter().filter(|run| !run.is_held()) {
                 let segment = Segment {
-                    start: clip.start,
-                    end: clip.end(),
-                    source_start,
+                    start: run.span.start,
+                    end: run.span.end,
+                    source_start: source_start + (run.source - clip.source_in) / speed,
                     gain: clip.gain() as f32,
-                    fade_in: if sounds(Edge::In) { fade_in } else { 0.0 },
-                    fade_out: if sounds(Edge::Out) { fade_out } else { 0.0 },
+                    fade_in: if fades(Edge::In) { fade_in } else { 0.0 },
+                    fade_out: if fades(Edge::Out) { fade_out } else { 0.0 },
                     curves: (clip.fade_curve(Edge::In), clip.fade_curve(Edge::Out)),
+                    edges: Some((clip.start, clip.end())),
                 };
-                Some(Sound { segment, pcm })
-            })
-            .collect();
+                sounds.push(Sound { segment, pcm: pcm.clone() });
+            }
+        }
         let sounds: Arc<[Sound]> = sounds.into();
         match mode {
             PlayMode::Timeline => {
@@ -548,6 +552,31 @@ impl Editor {
         if let Some(part) = target.and_then(|id| self.sequence.split(id, t, self.frame())) {
             self.pause();
             self.selected = Some(part);
+        }
+    }
+
+    /// Holds the frame seen at the playhead for `FREEZE_LENGTH`: the selected clip's if it is there
+    /// and plays a recording, else the one of the clip seen there.
+    fn freeze_at_playhead(&mut self) {
+        let t = self.frame_start(self.position);
+        let moving = |id: &ClipId| {
+            let clip = self.sequence.clip(*id);
+            self.sequence.tracks[id.track].kind == TrackKind::Video && clip.still.is_none() && clip.span().contains(t)
+        };
+        let target = self.selected.filter(&moving).or_else(|| self.sequence.shown_at(t).filter(&moving));
+        if let Some(id) = target {
+            self.freeze(id);
+        }
+    }
+
+    /// Holds the frame of clip `id` at the playhead for `FREEZE_LENGTH`: the clip is selected. When
+    /// the clips after it can't move later, its Timing says why.
+    fn freeze(&mut self, id: ClipId) {
+        let t = self.frame_start(self.position);
+        self.pause();
+        self.selected = Some(id);
+        if !self.sequence.freeze(id, t, FREEZE_LENGTH) {
+            self.freeze_refused = Some(id);
         }
     }
 
@@ -816,6 +845,9 @@ impl Editor {
         } else if pressed(none, Key::B) {
             self.timeline.tool = Tool::Blade;
         }
+        if pressed(none, Key::F) {
+            self.freeze_at_playhead();
+        }
         if pressed(none, Key::V) || pressed(none, Key::Escape) {
             self.timeline.tool = Tool::Select;
             self.timeline.cancel_chaining();
@@ -900,6 +932,13 @@ impl Editor {
                     if ui.button("Split (Ctrl+B)").on_hover_text("Cut the selected clip at the playhead, or the clip seen there").clicked() {
                         self.split_at_playhead();
                     }
+                    let freeze = ui.button("Freeze frame (F)").on_hover_text(format!(
+                        "Hold the frame at the playhead for {FREEZE_LENGTH} s, of the selected clip or the one seen there: \
+                         the clip is cut there, and the rest of it and the clips after it on its track move later"
+                    ));
+                    if freeze.clicked() {
+                        self.freeze_at_playhead();
+                    }
                 });
 
                 let at_playhead = self.frame_start(self.position);
@@ -936,7 +975,10 @@ impl Editor {
                 }
                 self.peek = response.peek;
                 if response.refused.is_some() {
-                    self.speed_refused = response.refused;
+                    self.effect_refused = response.refused;
+                }
+                if let Some(id) = response.freeze {
+                    self.freeze(id);
                 }
                 if let Some(section) = response.open {
                     self.flash = Some((section, ui.input(|i| i.time)));
@@ -1094,6 +1136,7 @@ impl Editor {
         let (fps, at_playhead) = (self.fps, self.frame_start(self.position));
         let clip = self.sequence.clip(id);
         let (span, source_in, source_out, name, speed, still) = (clip.span(), clip.source_in, clip.source_out, clip.name.clone(), clip.speed(), clip.still);
+        let holds = clip.holds();
         let image = clip.is_image();
         let track = track_name(&self.sequence, id.track);
         let kind = self.sequence.tracks[id.track].kind;
@@ -1140,13 +1183,24 @@ impl Editor {
             Some(_) if image => "Its image all along, as long as you make it. Delete removes the clip.".to_owned(),
             Some(at) => format!("The frame of its source at {} all along. Delete removes the clip.", timecode::format(at)),
             None => {
-                let at = if speed == 1.0 { String::new() } else { format!(", at {}", speed_text(speed)) };
+                let mut at = if speed == 1.0 { String::new() } else { format!(", at {}", speed_text(speed)) };
+                // Its frames held make it longer than that part.
+                let held: f64 = holds.iter().map(|hold| hold.span.len()).sum();
+                match holds.len() {
+                    0 => {}
+                    1 => at += &format!(", a frame of it held {}", timecode::format(held)),
+                    count => at += &format!(", {count} frames of it held {} in all", timecode::format(held)),
+                }
                 format!("From its source {} to {}{at}. Delete removes the clip.", timecode::format(source_in), timecode::format(source_out))
             }
         };
         ui.label(RichText::new(from).weak().small());
         if self.length_refused == Some(id) {
             ui.label(RichText::new("The clips after it can't move that far: one chained to them has no room.").color(ERROR).small());
+        }
+        if self.freeze_refused == Some(id) {
+            let why = format!("No freeze frame: the clips after the playhead can't move {FREEZE_LENGTH} s later, one chained to them has no room.");
+            ui.label(RichText::new(why).color(ERROR).small());
         }
         ui.separator();
 
@@ -1250,18 +1304,23 @@ impl Editor {
             ui.separator();
         }
 
-        let refused = self.speed_refused == Some(id);
+        let refused = self.effect_refused.filter(|(clip, _)| *clip == id).map(|(_, effect)| effect);
+        let frame = self.frame();
         let clip = self.sequence.clip_mut(id);
         // A still has no sound to fade.
         let (picture, sound) = (kind == TrackKind::Video, (kind == TrackKind::Audio || !detached) && still.is_none());
-        let effects_section = flash::frame(ui, effects_flash, false).show(ui, |ui| effects_editor(ui, clip, picture, sound, refused));
-        // A new speed makes the clip longer or shorter, and the clips after it move along.
-        if let Some(change) = effects_section.inner {
+        let effects_section = flash::frame(ui, effects_flash, false).show(ui, |ui| effects_editor(ui, clip, picture, sound, refused, fps, frame));
+        // A new speed or hold makes the clip longer or shorter, and the clips after it move along;
+        // what is chained to it and holds the same frame changes with it.
+        if let Some((effect, change)) = effects_section.inner {
             let done = match change {
-                SpeedChange::To(factor) => self.sequence.set_speed(id, factor),
-                SpeedChange::Off => self.sequence.remove_speed(id),
+                EffectChange::Speed(factor) => self.sequence.set_speed(id, factor),
+                EffectChange::SpeedOff => self.sequence.remove_speed(id),
+                EffectChange::FreezeFrame(at) => self.sequence.move_freeze(id, effect, at),
+                EffectChange::FreezeLength(seconds) => self.sequence.set_freeze_length(id, effect, seconds),
+                EffectChange::FreezeOff => self.sequence.remove_freeze(id, effect),
             };
-            self.speed_refused = (!done).then_some(id);
+            self.effect_refused = (!done).then_some((id, effect));
         }
         if self.scroll_to == Some(Section::Effects) {
             effects_section.response.scroll_to_me(Some(egui::Align::Center));
@@ -1389,21 +1448,28 @@ fn stretched(clip: &Clip) -> Part {
     Part::new(clip.source, clip.source_in, clip.source_out, clip.speed())
 }
 
-/// What the Speed block asks for. The clip gets longer or shorter with it, and the clips after it
-/// move along: the sequence does that.
-enum SpeedChange {
-    To(f64),
-    Off,
+/// What a block of the Effects asks for, of the effect it is about. The clip gets longer or shorter
+/// with it, and the clips after it move along: the sequence does that.
+enum EffectChange {
+    Speed(f64),
+    SpeedOff,
+    /// The frame of this moment of the source is to be held instead.
+    FreezeFrame(f64),
+    FreezeLength(f64),
+    FreezeOff,
 }
 
 /// The effects of a clip, in order, each with its settings, and a way to add more. `refused`: the
-/// last change of its speed could not be made.
-fn effects_editor(ui: &mut egui::Ui, clip: &mut Clip, picture: bool, sound: bool, refused: bool) -> Option<SpeedChange> {
+/// last change of that effect could not be made. Times are typed and shown at `fps`; a frame is
+/// held a `frame` long at least.
+fn effects_editor(ui: &mut egui::Ui, clip: &mut Clip, picture: bool, sound: bool, refused: Option<usize>, fps: f64, frame: f64) -> Option<(usize, EffectChange)> {
     ui.heading("Effects");
     let len = clip.span().len();
     let (fade_in, fade_out) = clip.fade_lengths();
+    let (source_in, source_out) = (clip.source_in, clip.source_out);
     let mut remove = None;
-    let mut speed_change = None;
+    let mut change = None;
+    let no_room = || RichText::new("The clips after it can't move that far: one chained to them has no room.").color(ERROR);
     for (i, effect) in clip.effects.iter_mut().enumerate() {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1479,29 +1545,56 @@ fn effects_editor(ui: &mut egui::Ui, clip: &mut Clip, picture: bool, sound: bool
                         ui.label(RichText::new("Speed").strong());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("Remove").clicked() {
-                                speed_change = Some(SpeedChange::Off);
+                                change = Some((i, EffectChange::SpeedOff));
                             }
                             if ui.add_enabled(factor != 1.0, egui::Button::new("Reset").small()).clicked() {
-                                speed_change = Some(SpeedChange::To(1.0));
+                                change = Some((i, EffectChange::Speed(1.0)));
                             }
                         });
                     });
                     let mut wanted = factor;
                     let slider = egui::Slider::new(&mut wanted, Speed::MIN..=Speed::MAX).logarithmic(true).fixed_decimals(2).prefix("×");
                     if ui.add(slider).on_hover_text("2 is twice as fast and half as long; 0.5 half as fast. The sound keeps its pitch").changed() {
-                        speed_change = Some(SpeedChange::To(wanted));
+                        change = Some((i, EffectChange::Speed(wanted)));
                     }
                     ui.horizontal(|ui| {
                         for preset in [0.5, 2.0, 4.0] {
                             if ui.add(egui::Button::new(speed_text(preset)).selected(factor == preset)).clicked() {
-                                speed_change = Some(SpeedChange::To(preset));
+                                change = Some((i, EffectChange::Speed(preset)));
                             }
                         }
                     });
-                    let note = if refused {
-                        RichText::new("The clips after it can't move that far: one chained to them has no room.").color(ERROR)
+                    let note = if refused == Some(i) { no_room() } else { RichText::new("Its length changes with it, and the clips after it on its track move along.").weak() };
+                    ui.label(note.small());
+                }
+                Effect::Freeze(freeze) => {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Freeze").strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Remove").clicked() {
+                                change = Some((i, EffectChange::FreezeOff));
+                            }
+                        });
+                    });
+                    egui::Grid::new(("freeze", i)).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                        ui.label("Frame");
+                        let mut at = freeze.at;
+                        let field = ui.add(time_value(&mut at, fps)).on_hover_text("The moment of its source whose frame is held");
+                        if field.changed() {
+                            change = Some((i, EffectChange::FreezeFrame(at.clamp(source_in, source_out.max(source_in)))));
+                        }
+                        ui.end_row();
+                        ui.label("Length");
+                        let mut seconds = freeze.seconds;
+                        if ui.add(time_value(&mut seconds, fps)).on_hover_text("How long the frame is held").changed() {
+                            change = Some((i, EffectChange::FreezeLength(seconds.max(frame))));
+                        }
+                        ui.end_row();
+                    });
+                    let note = if refused == Some(i) {
+                        no_room()
                     } else {
-                        RichText::new("Its length changes with it, and the clips after it on its track move along.").weak()
+                        RichText::new("Held without sound. The rest of the clip and the clips after it on its track move along, and so does its detached sound.").weak()
                     };
                     ui.label(note.small());
                 }
@@ -1539,7 +1632,7 @@ fn effects_editor(ui: &mut egui::Ui, clip: &mut Clip, picture: bool, sound: bool
             }
         }
     });
-    speed_change
+    change
 }
 
 /// A time field: drag to change, click to type `mm:ss.cc`, `mm:ss:ff` or seconds.

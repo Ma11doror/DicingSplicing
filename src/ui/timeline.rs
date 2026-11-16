@@ -15,11 +15,15 @@
 //! on a clip opens its menu: fades and their curves, a cut there, delete. The selected clip's fades are dragged by
 //! the dots on its top edge.
 //!
+//! A frame a clip holds is a tinted part of it with a snowflake and its length; narrower than the
+//! snowflake, the snowflake alone, as wide whatever the zoom. On the selected clip, the dots on its
+//! bottom edge drag it: the left ones to another frame, the right ones longer or shorter.
+//!
 //! A row is a header and lanes: a lane for each thing its clips show. Folded, there is the picture;
 //! unfolded, also the effects of each clip and its sound as a graph. A clip covers all the lanes of
 //! its row, and is grabbed, cut and trimmed by any of them.
 
-use crate::core::edit::{speed_text, Clip, ClipId, Curve, Edge, Effect, SourceId, Sequence, Span, Track, TrackId, TrackKind};
+use crate::core::edit::{speed_text, Clip, ClipId, Curve, Edge, Effect, Hold, SourceId, Sequence, Span, Track, TrackId, TrackKind, FREEZE_LENGTH};
 use crate::media::geometry::Transform;
 use crate::media::timecode;
 use crate::media::waveform::Peaks;
@@ -92,6 +96,12 @@ const FADE_SHADE: Color32 = Color32::from_black_alpha(90);
 /// The handle a fade's length is dragged by, on the clip's top edge.
 const FADE_HANDLE_SIZE: [f32; 2] = [18.0, 10.0];
 const CHIP_COLOR: Color32 = Color32::from_rgb(96, 80, 150);
+/// A frame held: the part of the clip that holds it, its edges, and the plaque with its snowflake.
+const HOLD_TINT: Color32 = Color32::from_rgba_premultiplied(40, 80, 110, 90);
+const HOLD_LINE: Color32 = Color32::from_rgb(150, 215, 255);
+const HOLD_PLAQUE: Color32 = Color32::from_rgb(46, 110, 160);
+/// How big the plaque of a frame held is when it shows the snowflake alone.
+const HOLD_ICON_SIZE: f32 = 16.0;
 const WAVE_COLOR: Color32 = Color32::from_rgb(90, 200, 160);
 /// Under the effects and the sound of a clip, darker than its picture lane.
 const LANE_SHADE: Color32 = Color32::from_black_alpha(70);
@@ -269,13 +279,17 @@ enum Drag {
     ClipMove(ClipId),
     /// The length of a clip's fade, by its handle.
     Fade(ClipId, Edge),
+    /// Which frame a clip's Freeze, the effect with this number, holds: by its left handle.
+    HoldFrame(ClipId, usize),
+    /// How long it holds it: by its right handle.
+    HoldLength(ClipId, usize),
 }
 
 impl Drag {
     /// The clip this drag is about.
     fn clip(self) -> Option<ClipId> {
         match self {
-            Drag::ClipStart(id) | Drag::ClipEnd(id) | Drag::ClipMove(id) | Drag::Fade(id, _) => Some(id),
+            Drag::ClipStart(id) | Drag::ClipEnd(id) | Drag::ClipMove(id) | Drag::Fade(id, _) | Drag::HoldFrame(id, _) | Drag::HoldLength(id, _) => Some(id),
             _ => None,
         }
     }
@@ -291,8 +305,11 @@ pub struct TimelineResponse {
     pub peek: Option<f64>,
     /// A plaque of an effect was clicked: the part of the Output tab it stands for.
     pub open: Option<Section>,
-    /// The speed of this clip could not be taken off: the clips after it could not move that far.
-    pub refused: Option<ClipId>,
+    /// This effect of this clip could not be taken off, its speed or a frame held: the clips after it
+    /// could not move that far.
+    pub refused: Option<(ClipId, usize)>,
+    /// Freeze frame was picked in this clip's menu: its frame at the playhead is to be held.
+    pub freeze: Option<ClipId>,
 }
 
 /// What the timeline needs to know besides the edit.
@@ -426,6 +443,7 @@ fn effects_of(clip: &Clip) -> Vec<Chip> {
             }
             Effect::Color(_) => chips.push(chip("Color".to_owned(), Section::Effects)),
             Effect::Speed(speed) => chips.push(chip(format!("Speed {}", speed_text(speed.played())), Section::Effects)),
+            Effect::Freeze(freeze) => chips.push(chip(format!("Freeze {}", seconds_text(freeze.seconds)), Section::Effects)),
         }
     }
     if (t.cx, t.cy, t.zoom, t.angle_deg) != (plain.cx, plain.cy, plain.zoom, plain.angle_deg) {
@@ -840,8 +858,12 @@ impl Timeline {
             let mut changed = false;
             // An effect added here is set up in the Clip tab: it is shown there.
             let mut added = false;
-            // Without its speed the clip gets longer or shorter, which moves the clips after it.
+            // Without its speed the clip gets longer or shorter, which moves the clips after it, and
+            // so does a frame it holds no more.
             let mut unspeed = false;
+            let mut unfreeze = None;
+            // Opened on a frame held: that frame's menu first.
+            let hold = sequence.clip(id).hold_at(at);
             // In this egui it gives something back only as the menu closes: whether it is still
             // open is asked separately.
             let kind = sequence.tracks[id.track].kind;
@@ -850,6 +872,15 @@ impl Timeline {
             let has_sound = matches!(env.sounds.get(&sequence.clip(id).source), Some(SourceSound::Graph(_))) && !still;
             let chained = sequence.is_chained(id);
             response.context_menu(|ui| {
+                if let Some(hold) = hold {
+                    let text = "The clip plays on through that moment: it, and the clips after it on its track, get as much shorter";
+                    if ui.button(format!("Remove freeze ({})", seconds_text(hold.span.len()))).on_hover_text(text).clicked() {
+                        unfreeze = Some(hold.effect);
+                        changed = true;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                }
                 // Its sound, and what it is chained to.
                 if kind == TrackKind::Video && has_sound && !sequence.clip(id).sound_detached {
                     let detach = ui.button("Detach sound").on_hover_text("Its sound becomes a clip of its own on an audio track under it, chained to it");
@@ -930,6 +961,19 @@ impl Timeline {
                     changed = true;
                     ui.close_menu();
                 }
+                // The frame at the playhead, which the pictures show: the one held.
+                if kind == TrackKind::Video && !still {
+                    let playhead = timecode::frame_index(pos, env.fps) as f64 / env.fps;
+                    let hold = format!("Hold its frame at the playhead for {FREEZE_LENGTH} s: the rest of it and the clips after it move later (F)");
+                    let freeze = ui
+                        .add_enabled(sequence.clip(id).span().contains(playhead), egui::Button::new("Freeze frame"))
+                        .on_hover_text(hold)
+                        .on_disabled_hover_text("It holds its frame at the playhead, which is not on this clip");
+                    if freeze.clicked() {
+                        out.freeze = Some(id);
+                        ui.close_menu();
+                    }
+                }
                 if ui.button("Duplicate").on_hover_text("A copy right after it (Ctrl+D)").clicked() {
                     *selected = Some(sequence.duplicate(id));
                     changed = true;
@@ -949,9 +993,9 @@ impl Timeline {
                     ui.close_menu();
                 }
             });
-            // When it can't be done, the Speed block in the Clip tab says why.
-            if unspeed && !sequence.remove_speed(id) {
-                out.refused = Some(id);
+            // When it can't be done, the effect's block in the Clip tab says why.
+            if let Some(effect) = take_off(sequence, id, unspeed, unfreeze) {
+                out.refused = Some((id, effect));
                 out.open = Some(Section::Effects);
             }
             if !response.context_menu_opened() {
@@ -1031,6 +1075,8 @@ impl Timeline {
             Some(Drag::ExportEnd) => Some(sequence.export.end - frame),
             Some(Drag::ClipStart(id)) => Some(sequence.clip(id).start),
             Some(Drag::ClipEnd(id)) => Some(sequence.clip(id).end() - frame),
+            // The frame it is to hold.
+            Some(drag @ Drag::HoldFrame(..)) => edge_time(sequence, drag),
             _ => None,
         };
         *position = pos;
@@ -1298,6 +1344,15 @@ impl Timeline {
             let fill = if track.hidden { color.gamma_multiply(0.45) } else { color };
             rows_painter.rect_filled(block, 4.0, fill);
             let inside = rows_painter.with_clip_rect(block.shrink(2.0).intersect(layout.rows_area).intersect(body));
+            // Where it holds a frame: tinted, between two lines.
+            let holds = clip.holds();
+            for hold in &holds {
+                let region = Rect::from_x_y_ranges(view.x(hold.span.start)..=view.x(hold.span.end), block.y_range());
+                inside.rect_filled(region, 0.0, HOLD_TINT);
+                for x in [region.left(), region.right()] {
+                    inside.line_segment([pos2(x, block.top()), pos2(x, block.bottom())], Stroke::new(1.0, HOLD_LINE.gamma_multiply(0.7)));
+                }
+            }
             let text_x = block.left().max(body.left()) + if is_selected { HANDLE_WIDTH + 6.0 } else { 6.0 };
             let weak = Color32::from_white_alpha(110);
             for &(lane, lane_rect) in &row.lanes {
@@ -1404,6 +1459,28 @@ impl Timeline {
                 inside.add(shade);
                 inside.add(Shape::line(points, Stroke::new(1.5, FADE_LINE)));
             }
+            // Each frame held says so on a plaque in the middle of its first lane: a snowflake and how
+            // long, as much as fits; narrower than the snowflake, the snowflake alone, as big as ever.
+            if let Some(&(_, lane)) = row.lanes.first() {
+                let y = lane.center().y;
+                for hold in &holds {
+                    let region = Rect::from_x_y_ranges(view.x(hold.span.start)..=view.x(hold.span.end), block.y_range());
+                    if region.width() >= HOLD_ICON_SIZE + 4.0 {
+                        let label = format!("Freeze {}", seconds_text(hold.span.len()));
+                        let width = ui.fonts(|fonts| fonts.layout_no_wrap(label.clone(), FontId::proportional(11.0), Color32::WHITE).size().x);
+                        let plaque = Rect::from_min_size(pos2(region.left() + 2.0, y - 8.0), vec2((HOLD_ICON_SIZE + width + 8.0).min(region.width() - 4.0), 16.0));
+                        let painter = inside.with_clip_rect(inside.clip_rect().intersect(region.shrink2(vec2(1.0, 0.0))));
+                        painter.rect_filled(plaque, 4.0, HOLD_PLAQUE);
+                        paint_snowflake(&painter, pos2(plaque.left() + HOLD_ICON_SIZE / 2.0, y), 5.0, Color32::WHITE);
+                        painter.text(pos2(plaque.left() + HOLD_ICON_SIZE + 2.0, y), Align2::LEFT_CENTER, label, FontId::proportional(11.0), Color32::WHITE);
+                    } else {
+                        let icon = Rect::from_center_size(pos2(region.center().x, y), vec2(HOLD_ICON_SIZE, HOLD_ICON_SIZE));
+                        rows_painter.rect_filled(icon, 4.0, HOLD_PLAQUE);
+                        rows_painter.rect_stroke(icon, 4.0, Stroke::new(1.0, HOLD_LINE));
+                        paint_snowflake(&rows_painter, icon.center(), 5.0, Color32::WHITE);
+                    }
+                }
+            }
             if missing {
                 rows_painter.rect_stroke(block.shrink(1.0), 4.0, Stroke::new(2.0, MISSING_COLOR));
             }
@@ -1436,6 +1513,14 @@ impl Timeline {
                 for edge in [Edge::In, Edge::Out] {
                     if let Some(handle) = fade_handle(block, clip, edge, view) {
                         let color = if active == Some(Drag::Fade(id, edge)) { Color32::WHITE } else { HANDLE_COLOR };
+                        rows_painter.rect_filled(handle, 3.0, color);
+                        grip_dots(&rows_painter, handle.center(), 3, 1, Color32::from_black_alpha(150));
+                    }
+                }
+                // And the frames it holds by these, on its bottom edge.
+                for (effect, frame_handle, length_handle) in hold_handles(block, &holds, view) {
+                    for (handle, drag) in [(frame_handle, Drag::HoldFrame(id, effect)), (length_handle, Drag::HoldLength(id, effect))] {
+                        let color = if active == Some(drag) { Color32::WHITE } else { HANDLE_COLOR };
                         rows_painter.rect_filled(handle, 3.0, color);
                         grip_dots(&rows_painter, handle.center(), 3, 1, Color32::from_black_alpha(150));
                     }
@@ -1591,9 +1676,17 @@ fn hit(p: Pos2, layout: &Layout, view: View, sequence: &Sequence, selected: Opti
     if !layout.rows_area.contains(p) || p.x < layout.body.left() {
         return None;
     }
-    // Edges and fades only on the selected clip: the others show no handles to grab.
+    // Edges, fades and frames held only on the selected clip: the others show no handles to grab.
     if let Some(id) = selected.filter(|&id| sequence.has(id)) {
         let block = layout.block(id, sequence.clip(id).span(), view);
+        for (effect, frame_handle, length_handle) in hold_handles(block, &sequence.clip(id).holds(), view) {
+            if frame_handle.expand(2.0).contains(p) {
+                return Some(Drag::HoldFrame(id, effect));
+            }
+            if length_handle.expand(2.0).contains(p) {
+                return Some(Drag::HoldLength(id, effect));
+            }
+        }
         for edge in [Edge::In, Edge::Out] {
             if fade_handle(block, sequence.clip(id), edge, view).is_some_and(|handle| handle.expand(2.0).contains(p)) {
                 return Some(Drag::Fade(id, edge));
@@ -1627,15 +1720,80 @@ fn fade_handle(block: Rect, clip: &Clip, edge: Edge, view: View) -> Option<Rect>
     Some(Rect::from_center_size(pos2(x, block.top() + FADE_HANDLE_SIZE[1] / 2.0 + 1.0), FADE_HANDLE_SIZE.into()))
 }
 
+/// Takes clip `id`'s speed off when `unspeed`, or its Freeze `unfreeze`, as its menu asked. Returns
+/// the effect that could not be taken off, if so: the clips after it could not move that far. The
+/// menu may have removed the clip instead, or moved it to another track: then it asked for neither,
+/// and nothing is asked of the clip.
+fn take_off(sequence: &mut Sequence, id: ClipId, unspeed: bool, unfreeze: Option<usize>) -> Option<usize> {
+    if unspeed {
+        let speed = sequence.clip(id).effects.iter().position(|effect| matches!(effect, Effect::Speed(_)));
+        if !sequence.remove_speed(id) {
+            return speed;
+        }
+    }
+    let effect = unfreeze?;
+    (!sequence.remove_freeze(id, effect)).then_some(effect)
+}
+
+/// The handles of the frames a clip drawn as `block` holds, on its bottom edge: of each, which of
+/// its effects it is, and the handles of the frame held and of the length, where the hold starts and
+/// where it ends. Kept off the corners, where the edges are trimmed, and apart from each other. A
+/// clip too narrow for that on screen has none: they are set in the Clip tab, or after zooming in.
+fn hold_handles(block: Rect, holds: &[Hold], view: View) -> Vec<(usize, Rect, Rect)> {
+    let half = FADE_HANDLE_SIZE[0] / 2.0;
+    let (lo, hi) = (block.left() + HANDLE_WIDTH + half, block.right() - HANDLE_WIDTH - half);
+    if hi - lo < FADE_HANDLE_SIZE[0] + 2.0 {
+        return Vec::new();
+    }
+    let y = block.bottom() - FADE_HANDLE_SIZE[1] / 2.0 - 1.0;
+    let handle = |x: f32| Rect::from_center_size(pos2(x, y), FADE_HANDLE_SIZE.into());
+    holds
+        .iter()
+        .map(|hold| {
+            let (start, end) = (view.x(hold.span.start), view.x(hold.span.end));
+            let middle = ((start + end) / 2.0).clamp(lo + half + 1.0, hi - half - 1.0);
+            let left = start.min(middle - half - 1.0).clamp(lo, hi);
+            let right = end.max(middle + half + 1.0).clamp(lo, hi);
+            (hold.effect, handle(left), handle(right))
+        })
+        .collect()
+}
+
+/// The mark of a frame held: a snowflake of radius `r` around `center`.
+fn paint_snowflake(painter: &egui::Painter, center: Pos2, r: f32, color: Color32) {
+    let stroke = Stroke::new(1.3, color);
+    for k in 0..6 {
+        let angle = std::f32::consts::FRAC_PI_3 * k as f32 + std::f32::consts::FRAC_PI_2;
+        let arm = vec2(angle.cos(), angle.sin());
+        painter.line_segment([center, center + arm * r], stroke);
+        // A little branch on each side, two thirds of the way out.
+        let at = center + arm * r * 0.6;
+        for turn in [-0.8f32, 0.8] {
+            let (sin, cos) = turn.sin_cos();
+            let branch = vec2(arm.x * cos - arm.y * sin, arm.x * sin + arm.y * cos);
+            painter.line_segment([at, at + branch * r * 0.4], stroke);
+        }
+    }
+}
+
+/// Seconds as they are written for people: 2 s, 1.5 s, 0.04 s.
+fn seconds_text(seconds: f64) -> String {
+    let digits = format!("{seconds:.2}");
+    format!("{} s", digits.trim_end_matches('0').trim_end_matches('.'))
+}
+
 /// A clip's sound as a graph in `area`: for each pixel, the loudest the source gets in the time it
-/// stands for, times the clip's volume and its fades. Pale when the clip or its track is muted.
+/// stands for, times the clip's volume and its fades; flat where it holds a frame. Pale when the
+/// clip or its track is muted.
 fn paint_sound(painter: &egui::Painter, area: Rect, clip: &Clip, view: View, peaks: &Peaks, muted: bool) {
     let color = if muted { WAVE_COLOR.gamma_multiply(0.35) } else { WAVE_COLOR };
     let (middle, half) = (area.center().y, area.height() / 2.0 - 3.0);
+    let holds = clip.holds();
     let mut x = area.left().floor();
     while x < area.right() {
         let (from, to) = (clip.source_time(view.t(x)), clip.source_time(view.t(x + 1.0)));
-        let fade = clip.sound_fade(view.t(x + 0.5)) as f32;
+        let held = holds.iter().any(|hold| hold.span.contains(view.t(x + 0.5)));
+        let fade = if held { 0.0 } else { clip.sound_fade(view.t(x + 0.5)) as f32 };
         let level = (peaks.level(from, to) * clip.volume as f32 * fade).min(1.0);
         let height = (level * half).max(0.5);
         painter.line_segment([pos2(x + 0.5, middle - height), pos2(x + 0.5, middle + height)], Stroke::new(1.0, color));
@@ -1755,7 +1913,9 @@ fn cursor(target: Option<Drag>) -> CursorIcon {
         None => CursorIcon::Grab,
         Some(Drag::Scrub { .. }) => CursorIcon::Grabbing,
         Some(Drag::ClipMove(_) | Drag::ExportMove) => CursorIcon::Move,
-        Some(Drag::ClipStart(_) | Drag::ClipEnd(_) | Drag::ExportStart | Drag::ExportEnd | Drag::Fade(..)) => CursorIcon::ResizeHorizontal,
+        Some(Drag::ClipStart(_) | Drag::ClipEnd(_) | Drag::ExportStart | Drag::ExportEnd | Drag::Fade(..) | Drag::HoldFrame(..) | Drag::HoldLength(..)) => {
+            CursorIcon::ResizeHorizontal
+        }
     }
 }
 
@@ -1792,7 +1952,14 @@ fn edge_time(sequence: &Sequence, drag: Drag) -> Option<f64> {
             let (fade_in, fade_out) = clip.fade_lengths();
             Some(if edge == Edge::In { clip.start + fade_in } else { clip.end() - fade_out })
         }
+        Drag::HoldFrame(id, effect) => hold_of(sequence, id, effect).map(|hold| hold.span.start),
+        Drag::HoldLength(id, effect) => hold_of(sequence, id, effect).map(|hold| hold.span.end),
     }
+}
+
+/// Clip `id`'s Freeze `effect` where it holds its frame, if it is there.
+fn hold_of(sequence: &Sequence, id: ClipId, effect: usize) -> Option<Hold> {
+    sequence.has(id).then(|| sequence.clip(id).holds().into_iter().find(|hold| hold.effect == effect)).flatten()
 }
 
 /// Moves an edge (or the start of what is moved whole) to `t`. Returns the snap target used.
@@ -1852,6 +2019,22 @@ fn edit(sequence: &mut Sequence, drag: Drag, t: f64, playhead: f64, snap_range: 
             clip.set_fade_length(edge, seconds);
             snapped
         }
+        // The frame the clip shows there without the hold is the one it holds: the hold starts
+        // there, and is as long.
+        Drag::HoldFrame(id, effect) => {
+            let (t, snapped) = place(t);
+            let at = sequence.clip(id).moment_without(effect, t);
+            sequence.move_freeze(id, effect, at);
+            snapped
+        }
+        // A frame long at least. What comes after the hold moves along; with no room for it, the
+        // hold stays as it is.
+        Drag::HoldLength(id, effect) => {
+            let (t, snapped) = place(t);
+            let hold = hold_of(sequence, id, effect)?;
+            sequence.set_freeze_length(id, effect, (t - hold.span.start).max(frame));
+            snapped
+        }
     }
 }
 
@@ -1861,8 +2044,19 @@ fn snap_targets(sequence: &Sequence, drag: Drag, playhead: f64) -> Vec<f64> {
     let mut targets = vec![playhead];
     let moving: Vec<ClipId> = match drag {
         Drag::ClipMove(id) => sequence.group_of(id),
+        // A frame held moves the clip's own picture, and a longer one the clips after it, each with
+        // what is chained to it: the clips of other tracks that stay are what it sticks to.
+        Drag::HoldFrame(id, _) | Drag::HoldLength(id, _) => {
+            let group = sequence.group_of(id);
+            sequence.clips().filter(|(other, _)| other.track == id.track || group.contains(other)).map(|(other, _)| other).collect()
+        }
         _ => Vec::new(),
     };
+    if matches!(drag, Drag::HoldFrame(..) | Drag::HoldLength(..)) {
+        let staying = sequence.clips().filter(|(other, _)| !moving.contains(other)).flat_map(|(_, clip)| [clip.start, clip.end()]);
+        targets.extend(staying);
+        return targets;
+    }
     for (id, clip) in sequence.clips().filter(|(id, _)| !moving.contains(id)) {
         if drag != Drag::ClipStart(id) {
             targets.push(clip.start);
@@ -2267,6 +2461,81 @@ mod tests {
         edit(&mut sequence, Drag::Fade(CLIP, Edge::Out), 45.0, 100.0, 0.0, 0.04);
         assert!((sequence.clip(CLIP).fade_lengths().1 - 1.0).abs() < 1e-9, "no room left for more");
         assert_eq!(cursor(Some(Drag::Fade(CLIP, Edge::Out))), CursorIcon::ResizeHorizontal);
+    }
+
+    #[test]
+    fn a_frame_held_is_dragged_by_its_handles() {
+        // A clip 30..50 s (x = 400..600), selected, of a 60 s source, holding its frame at 5 s of
+        // its source for 2 s: 35..37 s, x = 450..470. The clip ends at 52 s then.
+        let mut sequence = Sequence::new(Clip { start: 30.0, source_out: 20.0, ..Clip::new("a".into(), 60.0) });
+        assert!(sequence.freeze(CLIP, 35.0, 2.0));
+        let layout = layout(&sequence, 102.0);
+        let block = layout.block(CLIP, sequence.clip(CLIP).span(), view());
+        let holds = sequence.clip(CLIP).holds();
+        let [(effect, frame_handle, length_handle)] = hold_handles(block, &holds, view())[..] else { panic!("one hold") };
+        // On the bottom edge, where it starts and ends, apart from each other.
+        assert_eq!((frame_handle.center().x, length_handle.center().x), (450.0, 470.0));
+        assert_eq!(frame_handle.bottom(), block.bottom() - 1.0);
+        assert!(matches!(hit(frame_handle.center(), &layout, view(), &sequence, Some(CLIP)), Some(Drag::HoldFrame(CLIP, e)) if e == effect));
+        assert!(matches!(hit(length_handle.center(), &layout, view(), &sequence, Some(CLIP)), Some(Drag::HoldLength(CLIP, e)) if e == effect));
+        assert!(matches!(hit(length_handle.center(), &layout, view(), &sequence, None), Some(Drag::ClipMove(CLIP))), "only on the selected clip");
+        assert_eq!(cursor(Some(Drag::HoldLength(CLIP, effect))), CursorIcon::ResizeHorizontal);
+        // A hold too narrow for both: they go apart around its middle.
+        let short = [Hold { span: Span { start: 35.0, end: 35.2 }, ..holds[0] }];
+        let [(_, left, right)] = hold_handles(block, &short, view())[..] else { panic!("one hold") };
+        assert!(left.right() < right.left() && left.center().x < 451.0 && right.center().x > 451.0);
+
+        // Longer to 39.01 s: 4 s, on the frame; the clip with it.
+        assert_eq!(edge_time(&sequence, Drag::HoldLength(CLIP, effect)), Some(37.0));
+        edit(&mut sequence, Drag::HoldLength(CLIP, effect), 39.01, 100.0, 0.0, 0.04);
+        assert!((sequence.clip(CLIP).holds()[0].span.len() - 4.0).abs() < 1e-9);
+        assert!((sequence.clip(CLIP).end() - 54.0).abs() < 1e-9);
+        // Not shorter than a frame.
+        edit(&mut sequence, Drag::HoldLength(CLIP, effect), 30.0, 100.0, 0.0, 0.04);
+        assert!((sequence.clip(CLIP).holds()[0].span.len() - 0.04).abs() < 1e-9);
+        // The frame: dragged to 40 s, it holds what the clip shows there without it, 10 s of its source.
+        edit(&mut sequence, Drag::HoldFrame(CLIP, effect), 40.0, 100.0, 0.0, 0.04);
+        let hold = sequence.clip(CLIP).holds()[0];
+        assert!((hold.at - 10.0).abs() < 1e-9 && (hold.span.start - 40.0).abs() < 1e-9, "{hold:?}");
+        // It sticks to the playhead.
+        edit(&mut sequence, Drag::HoldFrame(CLIP, effect), 41.1, 41.0, 0.2, 0.04);
+        assert!((sequence.clip(CLIP).holds()[0].span.start - 41.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn what_the_menu_takes_off_asks_nothing_of_a_clip_it_removed() {
+        // a 0..10, b 10..14 and c 14..20 on one track.
+        let mut sequence = Sequence::new(Clip { source_out: 10.0, ..Clip::new("a".into(), 30.0) });
+        sequence.tracks[0].clips.push(Clip { start: 10.0, ..Clip::new("b".into(), 4.0) });
+        sequence.tracks[0].clips.push(Clip { start: 14.0, ..Clip::new("c".into(), 6.0) });
+        // Delete in the menu of the last one: the clip is gone, and so is its place on the track.
+        let last = ClipId { track: 0, index: 2 };
+        sequence.remove_clip(last);
+        assert_eq!(take_off(&mut sequence, last, false, None), None);
+        // Remove speed and Remove freeze take them off, and the clips after it move along.
+        let a = ClipId { track: 0, index: 0 };
+        assert!(sequence.set_speed(a, 2.0) && sequence.freeze(a, 1.0, 2.0));
+        assert_eq!(sequence.clip(a).span().len(), 7.0);
+        let freeze = sequence.clip(a).holds()[0].effect;
+        assert_eq!(take_off(&mut sequence, a, false, Some(freeze)), None);
+        assert_eq!(take_off(&mut sequence, a, true, None), None);
+        assert_eq!((sequence.clip(a).span().len(), sequence.clip(a).effects.len()), (10.0, 0));
+        assert_eq!(sequence.tracks[0].clips[1].start, 10.0);
+        // No room for a slower clip: the speed stays, and its block says so.
+        let mut tight = Sequence::new(Clip { source_out: 10.0, ..Clip::new("a".into(), 30.0) });
+        assert!(tight.set_speed(a, 2.0));
+        let wall = tight.add_track(1, TrackKind::Video);
+        let chained = tight.place_clip(Some(0), Clip { start: 5.0, ..Clip::new("b".into(), 4.0) }).unwrap();
+        let blocker = tight.place_clip(Some(wall), Clip { start: 5.0, ..Clip::new("w".into(), 1.0) }).unwrap();
+        tight.place_clip(Some(wall), Clip { start: 6.0, ..Clip::new("x".into(), 1.0) }).unwrap();
+        tight.chain(chained, blocker);
+        assert_eq!(take_off(&mut tight, a, true, None), Some(0));
+        assert_eq!(tight.clip(a).speed(), 2.0);
+    }
+
+    #[test]
+    fn seconds_are_written_short() {
+        assert_eq!([2.0, 1.5, 0.04, 0.126, 12.0].map(seconds_text), ["2 s", "1.5 s", "0.04 s", "0.13 s", "12 s"]);
     }
 
     #[test]
