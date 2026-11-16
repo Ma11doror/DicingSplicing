@@ -283,7 +283,10 @@ impl FadeAt {
 /// The fades of `clip` that reach into its source time `start..end`, for `sound` or the picture, and
 /// the latest a seek may land so that their timestamps are not before the input's start.
 fn fade_filters_of(clip: &Clip, start: f64, end: f64, sound: bool) -> (Vec<FadeAt>, f64) {
+    // In source seconds: a clip that plays twice as fast goes through twice as much of its source
+    // while it fades.
     let (fade_in, fade_out) = clip.fade_lengths();
+    let (fade_in, fade_out) = (fade_in * clip.speed(), fade_out * clip.speed());
     let applies = |edge| clip.fade(edge).is_some_and(|fade| if sound { fade.sound } else { fade.picture });
     let mut fades = Vec::new();
     let mut latest = f64::INFINITY;
@@ -320,8 +323,10 @@ fn clip_frames(frames: &Frames, args: &mut Vec<OsString>, inputs: &mut usize, id
     let file = file_of(frames.files, clip)?;
     // The source's moment at the first frame. Frames before it stay until `fps`, which needs them to
     // know what is on screen at that moment; a source that ends a frame early has its last frame held.
+    // The clip goes through its source at its speed.
+    let speed = clip.speed();
     let start = clip.source_time(sequence.export.start + first as f64 / rate);
-    let end = start + count as f64 / rate;
+    let end = start + count as f64 / rate * speed;
     let (fades, latest) = fade_filters_of(clip, start, end, false);
     let (input, seek) = add_input(args, inputs, &file.path, start, end, latest);
     let (from, to) = (start - seek, end - seek);
@@ -352,10 +357,11 @@ fn clip_frames(frames: &Frames, args: &mut Vec<OsString>, inputs: &mut usize, id
     let out = if over_black { format!("[{name}o]") } else { label.to_owned() };
     // The colour comes first: a fade into black ends in black whatever the contrast.
     let colored = clip.graded().map_or_else(String::new, |grade| color::filters(&grade));
+    // From the source's moment `start` on, as fast as the clip plays.
+    let timed = if speed == 1.0 { format!("PTS{:+.6}/TB", -from) } else { format!("(PTS{:+.6}/TB)/{speed:.6}", -from) };
     let mut filters = format!(
-        "[{input}:V:0]trim=end={to:.6}{colored}{fade},setpts=PTS{:+.6}/TB,fps={fps}:start_time=0,{frame},\
-         tpad=stop=-1:stop_mode=clone,trim=end_frame={count},format={format}{out}",
-        -from
+        "[{input}:V:0]trim=end={to:.6}{colored}{fade},setpts={timed},fps={fps}:start_time=0,{frame},\
+         tpad=stop=-1:stop_mode=clone,trim=end_frame={count},format={format}{out}"
     );
     if over_black {
         let [px, py] = frames.pixels;
@@ -433,12 +439,24 @@ pub fn plan(files: &SourceFiles, sequence: &Sequence, output: &Path) -> Result<R
             let lead = span.start - export.start;
             // The clip's own fades, by the input's timestamps, which `atrim` leaves as they are.
             let fade: String = clip_fades.iter().map(|fade| fade.sound_filter(seek)).collect();
+            // At the clip's speed, its pitch kept. `atempo` gives what it hears ahead of time by as
+            // much as it holds back, so it hears that much of the source before the part: where the
+            // source has less, the rest is made up by placing the sound later.
+            let speed = clip.speed();
+            let (begin, timed) = if speed == 1.0 {
+                (from, format!("asetpts=PTS-{from:.6}/TB+{lead:.6}/TB"))
+            } else {
+                let (filters, held) = tempo(speed);
+                let before = held.min(from).max(0.0);
+                let placed = lead + (held - before) / speed;
+                (from - before, format!("asetpts=PTS-{:.6}/TB,aresample=48000,{filters},asetpts=PTS+{placed:.6}/TB", from - before))
+            };
             // Moved to its place, then filled from 0: adelay only shifts the timestamps, which would
             // leave a hole in the stream instead of silence. The filling also evens out gaps in the
             // source's own sound, so that it stays with the picture.
             let label = if heard.len() == 1 { format!("{fades}[a]") } else { format!("[s{n}]") };
             graph.push(format!(
-                "[{input}:a:0]atrim=start={from:.6}:end={to:.6}{fade},asetpts=PTS-{from:.6}/TB+{lead:.6}/TB,\
+                "[{input}:a:0]atrim=start={begin:.6}:end={to:.6}{fade},{timed},\
                  aresample=48000:async=1:first_pts=0,aformat=channel_layouts=stereo,volume={:.4},\
                  apad=whole_dur={total:.6},atrim=end={total:.6}{label}",
                 clip.gain()
@@ -473,6 +491,36 @@ pub fn plan(files: &SourceFiles, sequence: &Sequence, output: &Path) -> Result<R
     }
     args.push(output.into());
     Ok(RenderPlan { args, total })
+}
+
+/// How much of its input ffmpeg's `atempo` takes in before it gives anything: half of its window,
+/// which is 2048 samples at 48 kHz. What it gives is that much ahead of what it was given.
+const TEMPO_HOLD: f64 = 1024.0 / 48000.0;
+
+/// ffmpeg's `atempo` for `speed`, on sound at 48 kHz, which keeps the pitch; and how many seconds
+/// of its input it holds back, all of the chain together. One `atempo` takes 0.5 to 2 in every
+/// ffmpeg there is, so a speed past that is made of several, and each holds back half its window of
+/// what it is given: of the input, that is as much times the speed of the ones before it.
+pub fn tempo(speed: f64) -> (String, f64) {
+    let mut steps = Vec::new();
+    let mut left = speed;
+    while left > 2.0 + 1e-9 {
+        steps.push(2.0);
+        left /= 2.0;
+    }
+    while left < 0.5 - 1e-9 {
+        steps.push(0.5);
+        left /= 0.5;
+    }
+    if steps.is_empty() || (left - 1.0).abs() > 1e-9 {
+        steps.push(left);
+    }
+    let (mut held, mut rate) = (0.0, 1.0);
+    for step in &steps {
+        held += TEMPO_HOLD * rate;
+        rate *= step;
+    }
+    (steps.iter().map(|step| format!("atempo={step:.6}")).collect::<Vec<_>>().join(","), held)
 }
 
 fn fade_filters(settings: &ExportSettings, total: f64) -> String {
@@ -973,6 +1021,110 @@ mod tests {
         assert!(graph.contains("fade=t=out:st=10.000000:d=2.000000,"), "{graph}");
         assert!(graph.contains("afade=t=in:st=2.000000:d=1.000000"), "{graph}");
         assert!(!graph.contains("alpha=1"), "nothing under it: into black. {graph}");
+    }
+
+    #[test]
+    fn a_faster_clip_goes_through_more_of_its_source_and_keeps_its_pitch() {
+        // Each atempo holds back half its window, of what the ones before it give.
+        let half = 1024.0 / 48000.0;
+        for (speed, filters, held) in [
+            (2.0, "atempo=2.000000".to_owned(), half),
+            (3.0, "atempo=2.000000,atempo=1.500000".to_owned(), 3.0 * half),
+            (16.0, ["atempo=2.000000"; 4].join(","), 15.0 * half),
+            (0.25, "atempo=0.500000,atempo=0.500000".to_owned(), 1.5 * half),
+            (0.3, "atempo=0.500000,atempo=0.600000".to_owned(), 1.5 * half),
+            (0.75, "atempo=0.750000".to_owned(), half),
+        ] {
+            let (made, holds) = tempo(speed);
+            assert_eq!(made, filters, "×{speed}");
+            assert!((holds - held).abs() < 1e-9, "×{speed}: holds {holds}, not {held}");
+        }
+        // Source 2..12 s twice as fast, from 0 s: 5 s, fading in over 1 s, which is 2 s of the source.
+        let mut s = Sequence::new(Clip { source_in: 2.0, source_out: 12.0, ..Clip::new("a".into(), 30.0) });
+        let id = ClipId { track: 0, index: 0 };
+        assert!(s.set_speed(id, 2.0));
+        s.clip_mut(id).add_fade(Edge::In);
+        assert_eq!(s.export, Span { start: 0.0, end: 5.0 });
+        let files = files(Path::new("a.mp4"), &info(30.0));
+        let plan = plan(&files, &s, Path::new("out.mp4")).unwrap();
+        assert_eq!(plan.total, 5.0);
+        let graph = plan.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ");
+        assert!(graph.contains("trim=end=12.000000,fade=t=in:st=2.000000:d=2.000000,setpts=(PTS-2.000000/TB)/2.000000,"), "{graph}");
+        // The sound starts half of atempo's window early, for what atempo holds back.
+        assert!(graph.contains("atrim=start=1.978667:end=12.000000,afade=t=in:st=2.000000:d=2.000000,"), "{graph}");
+        assert!(graph.contains("asetpts=PTS-1.978667/TB,aresample=48000,atempo=2.000000,asetpts=PTS+0.000000/TB,"), "{graph}");
+    }
+
+    /// The tone of a file's sound from `from` to `to` seconds: how many times a second it goes up
+    /// through zero.
+    fn tone(path: &Path, from: f64, to: f64) -> f64 {
+        let output = tools::command(tools::FFMPEG).args(["-v", "error", "-i"]).arg(path).args(["-map", "0:a:0", "-ac", "1", "-ar", "48000", "-f", "s16le", "pipe:1"]).output().unwrap();
+        let samples: Vec<i16> = output.stdout.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+        let part = &samples[(from * 48000.0) as usize..(to * 48000.0) as usize];
+        let rises = part.windows(2).filter(|pair| pair[0] < 0 && pair[1] >= 0).count();
+        rises as f64 / (to - from)
+    }
+
+    #[test]
+    fn a_faster_or_slower_clip_shows_its_source_at_that_speed_and_sounds_at_its_pitch() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let dir = temp_dir("speed");
+        let source = make_source(&dir, 12);
+        let id = ClipId { track: 0, index: 0 };
+        for (factor, from, to, at, moment) in [(2.0, 2.0, 10.0, 1.0, 4.0), (0.5, 2.0, 4.0, 2.0, 3.0)] {
+            // The part of the source from..to at that speed: 4 s either way.
+            let mut s = Sequence::new(Clip { source_in: from, source_out: to, ..Clip::new("source".into(), 12.0) });
+            assert!(s.set_speed(id, factor));
+            s.settings.fades = (0.0, 0.0);
+            s.settings.size = OutputSize::LongSide(W);
+            s.settings.rate = Rate::Quality(10);
+            s.settings.frame_rate = FrameRate::Source;
+            s.settings.speed = Speed::Veryfast;
+            s.output = Output { preset: PresetId::Landscape, ..Output::default() };
+            let path = render(&source, &info(12.0), &s, &dir.join(format!("x{factor}.mp4")));
+            let result = probe::probe(&path).unwrap();
+            assert!((result.duration - 4.0).abs() < 0.1, "×{factor}: duration {}", result.duration);
+            // `at` seconds into the file is `moment` of the source, not what plain speed would show.
+            let out = rgb_at(&path, at, W, H);
+            let right = mean_difference(&out, &rgb_at(&source, moment, W, H));
+            let plain = mean_difference(&out, &rgb_at(&source, from + at, W, H));
+            assert!(right < 8.0, "×{factor}: differs by {right:.1} from the right moment");
+            assert!(right * 1.5 < plain, "×{factor}: right {right:.1}, at plain speed {plain:.1}");
+            let pitch = tone(&path, 0.5, 3.5);
+            assert!((pitch - 440.0).abs() < 440.0 * 0.03, "×{factor}: the 440 Hz tone is {pitch:.0} Hz");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn picture_and_sound_of_a_faster_clip_stay_together() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let dir = temp_dir("speed_sync");
+        let id = ClipId { track: 0, index: 0 };
+        let fps = 30.0;
+        // A white frame and a beep together every two seconds of the source.
+        let source = make_marked_source(&dir, "marked.mp4", "30", 60, 2.0, 0.0);
+        let i = probe::probe(&source).unwrap();
+        for factor in [2.0, 0.5] {
+            let mut s = Sequence::new(Clip { source_in: 1.0, source_out: 17.0, ..Clip::new("source".into(), i.duration) });
+            assert!(s.set_speed(id, factor));
+            s.settings.fades = (0.0, 0.0);
+            s.settings.size = OutputSize::LongSide(W);
+            s.settings.rate = Rate::Quality(12);
+            s.settings.speed = Speed::Ultrafast;
+            s.settings.frame_rate = FrameRate::Fixed(fps);
+            s.output = Output { preset: PresetId::Landscape, ..Output::default() };
+            let errors = picture_minus_sound(&render(&source, &i, &s, &dir.join(format!("x{factor}.mp4"))), fps);
+            assert!(errors.len() >= 3, "×{factor}: {errors:?}");
+            for error in errors {
+                assert!(error.abs() <= 0.5 / fps + 0.01, "×{factor}: picture minus sound {:.1} ms", error * 1000.0);
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

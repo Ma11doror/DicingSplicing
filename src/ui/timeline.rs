@@ -19,7 +19,7 @@
 //! unfolded, also the effects of each clip and its sound as a graph. A clip covers all the lanes of
 //! its row, and is grabbed, cut and trimmed by any of them.
 
-use crate::core::edit::{Clip, ClipId, Curve, Edge, Effect, SourceId, Sequence, Span, Track, TrackId, TrackKind};
+use crate::core::edit::{speed_text, Clip, ClipId, Curve, Edge, Effect, SourceId, Sequence, Span, Track, TrackId, TrackKind};
 use crate::media::geometry::Transform;
 use crate::media::timecode;
 use crate::media::waveform::Peaks;
@@ -291,6 +291,8 @@ pub struct TimelineResponse {
     pub peek: Option<f64>,
     /// A plaque of an effect was clicked: the part of the Output tab it stands for.
     pub open: Option<Section>,
+    /// The speed of this clip could not be taken off: the clips after it could not move that far.
+    pub refused: Option<ClipId>,
 }
 
 /// What the timeline needs to know besides the edit.
@@ -404,6 +406,7 @@ fn effects_of(clip: &Clip) -> Vec<Chip> {
                 chips.push(chip(text, Section::Effects));
             }
             Effect::Color(_) => chips.push(chip("Color".to_owned(), Section::Effects)),
+            Effect::Speed(speed) => chips.push(chip(format!("Speed {}", speed_text(speed.played())), Section::Effects)),
         }
     }
     if (t.cx, t.cy, t.zoom, t.angle_deg) != (plain.cx, plain.cy, plain.zoom, plain.angle_deg) {
@@ -818,6 +821,8 @@ impl Timeline {
             let mut changed = false;
             // An effect added here is set up in the Clip tab: it is shown there.
             let mut added = false;
+            // Without its speed the clip gets longer or shorter, which moves the clips after it.
+            let mut unspeed = false;
             // In this egui it gives something back only as the menu closes: whether it is still
             // open is asked separately.
             let kind = sequence.tracks[id.track].kind;
@@ -871,6 +876,17 @@ impl Timeline {
                     changed = true;
                     ui.close_menu();
                 }
+                let sped = clip.speed_effect().is_some();
+                let speed = ui.button(if sped { "Remove speed" } else { "Add speed" }).on_hover_text("How fast it plays: the clips after it on its track move along").clicked();
+                if speed {
+                    if sped {
+                        unspeed = true;
+                    } else {
+                        added = clip.add_speed();
+                    }
+                    changed = true;
+                    ui.close_menu();
+                }
                 // How each fade the clip has goes.
                 for (edge, name) in [(Edge::In, "Fade in curve"), (Edge::Out, "Fade out curve")] {
                     let Some(now) = clip.fade(edge).map(|fade| fade.curve) else { continue };
@@ -912,6 +928,11 @@ impl Timeline {
                     ui.close_menu();
                 }
             });
+            // When it can't be done, the Speed block in the Clip tab says why.
+            if unspeed && !sequence.remove_speed(id) {
+                out.refused = Some(id);
+                out.open = Some(Section::Effects);
+            }
             if !response.context_menu_opened() {
                 self.menu = None;
             }

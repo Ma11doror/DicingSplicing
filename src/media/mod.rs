@@ -7,6 +7,7 @@ pub mod library;
 pub mod player;
 pub mod probe;
 pub mod render;
+pub mod stretch;
 pub mod timecode;
 pub mod waveform;
 

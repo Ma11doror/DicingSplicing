@@ -2,7 +2,7 @@
 //! looks wrong. As text for people, and as JSON for programs.
 
 use crate::cli::pieces::{clips, find_video_track, ROUNDING, TRACK};
-use crate::core::edit::{Sequence, Span};
+use crate::core::edit::{speed_text, Sequence, Span};
 use crate::core::project::{file_label, Project};
 use crate::media::probe::MediaInfo;
 use crate::media::timecode::format;
@@ -25,6 +25,8 @@ pub struct Line {
     /// The part of the file it plays.
     pub from: f64,
     pub to: f64,
+    /// How fast it plays that part: 2 is twice as fast, so half as long. Set in the editor.
+    pub speed: f64,
     /// All of its picture is in the frame, with black bars around it, as Fit makes it.
     pub bars: bool,
 }
@@ -57,6 +59,7 @@ pub fn summary(project: &Project) -> Summary {
                     file: file_of(clip.source),
                     from: clip.source_in,
                     to: clip.source_out,
+                    speed: clip.speed(),
                     bars: clip.transform.bars && clip.transform.zoom < 1.0 - ROUNDING,
                 })
                 .collect()
@@ -113,8 +116,9 @@ impl Summary {
             for line in &self.lines {
                 let name = shortened(&line.name, width);
                 let file = file_label(Path::new(&line.file));
+                let at = if line.speed == 1.0 { String::new() } else { format!(", at {}", speed_text(line.speed)) };
                 let bars = if line.bars { ", with black bars" } else { "" };
-                text.push_str(&format!("\n  {:>3}  {}  {}  {name:<width$}  {file} {} to {}{bars}", line.number, format(line.start), format(line.length), format(line.from), format(line.to)));
+                text.push_str(&format!("\n  {:>3}  {}  {}  {name:<width$}  {file} {} to {}{at}{bars}", line.number, format(line.start), format(line.length), format(line.from), format(line.to)));
             }
         }
         if !self.others.is_empty() {
@@ -133,7 +137,7 @@ impl Summary {
         let clips: Vec<Value> = self
             .lines
             .iter()
-            .map(|line| json!({"number": line.number, "name": line.name, "start": line.start, "length": line.length, "file": line.file, "from": line.from, "to": line.to, "bars": line.bars}))
+            .map(|line| json!({"number": line.number, "name": line.name, "start": line.start, "length": line.length, "file": line.file, "from": line.from, "to": line.to, "speed": line.speed, "bars": line.bars}))
             .collect();
         let others: Vec<Value> = self.others.iter().map(|(name, count)| json!({"name": name, "clips": count})).collect();
         json!({
@@ -252,6 +256,18 @@ mod tests {
         assert_eq!(json["clips"][1]["file"], "C:/rec/install.mp4");
         assert_eq!(json["other_tracks"][0]["name"], "Audio 1");
         assert_eq!(json["length"], 247.5);
+        assert_eq!(json["clips"][0]["speed"], 1.0);
+    }
+
+    #[test]
+    fn a_clip_at_another_speed_says_so() {
+        let mut project = lesson();
+        let install = crate::core::edit::ClipId { track: 0, index: 1 };
+        assert!(project.sequence.set_speed(install, 2.0));
+        let summary = summary(&project);
+        assert!(summary.text().contains("install.mp4 00:12.00 to 04:05.00, at ×2\n") || summary.text().ends_with("install.mp4 00:12.00 to 04:05.00, at ×2"), "{}", summary.text());
+        assert!(summary.text().contains("  00:12.50  01:56.50  "), "half as long: {}", summary.text());
+        assert_eq!(summary.json()["clips"][1]["speed"], 2.0);
     }
 
     #[test]

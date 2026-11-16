@@ -63,6 +63,8 @@ Step by step, with pictures: [Working with sound](#working-with-sound).
 - Fade in and fade out, of the picture, the sound or both: linear, ease in, ease out, ease in-out,
   and stronger versions of the eases. A clip fading out reveals the clip under it, or black.
 - Color: exposure, contrast, saturation and temperature.
+- Speed, from ×0.25 to ×16: the sound keeps its pitch, and the clips after it on its track move
+  along as it gets shorter or longer.
 - What the Output panel shows is what the file gets: the same formulas run in the preview and
   in the export.
 

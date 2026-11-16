@@ -4,7 +4,7 @@
 //! selected at a time: the middle shows its source with its frame, the side panel its transform and
 //! sound. The output preview shows what goes into the file: the clip seen at the playhead.
 
-use crate::core::edit::{Clip, ClipId, Color, Curve, Edge, Effect, Sequence, SourceId, Span, TrackKind};
+use crate::core::edit::{speed_text, Clip, ClipId, Color, Curve, Edge, Effect, Sequence, SourceId, Span, Speed, TrackKind};
 use crate::core::history::History;
 use crate::core::lock::EditorLock;
 use crate::core::plugins::Plugin;
@@ -12,10 +12,12 @@ use crate::core::project::{self, Project, Source, ViewState, RENDERS_FOLDER};
 use crate::core::settings::Settings;
 use crate::core::workspace::Workspace;
 use crate::media::audio::{PlayRange, Segment, Sound};
+use crate::media::cache::Pcm;
 use crate::media::geometry::{self, Transform};
 use crate::media::library::{Library, SourceState};
 use crate::media::player::Player;
 use crate::media::render;
+use crate::media::stretch::{Part, Stretcher};
 use crate::media::{timecode, Notify, SourceFiles};
 use crate::ui::export::{ExportEnv, ExportPanel};
 use crate::ui::flash;
@@ -141,6 +143,11 @@ pub struct Editor {
     /// The clip Ctrl+C copied, and what it put into the system's clipboard to say so: Ctrl+V pastes
     /// the clip only while that text is still there.
     clipboard: Option<(Clip, TrackKind, String)>,
+    /// The clip whose speed could not change last time it was asked to: the clips after it could not
+    /// move that far. Its Speed block says so.
+    speed_refused: Option<ClipId>,
+    /// The sound of the clips that play faster or slower, for playing them.
+    stretcher: Stretcher,
     /// Keeps ds-tool from changing the project while it is open here. Last, so that it goes last.
     _lock: Option<EditorLock>,
 }
@@ -201,6 +208,8 @@ impl Editor {
             flash: None,
             scroll_to: None,
             clipboard: None,
+            speed_refused: None,
+            stretcher: Stretcher::new(notify.clone()),
             _lock: lock,
         }
     }
@@ -300,6 +309,7 @@ impl Editor {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
         self.autosave(ctx, now, busy);
+        self.keep_stretched(ctx, now);
 
         if self.playing {
             self.player.set_range(self.play_range(self.play_mode));
@@ -325,6 +335,10 @@ impl Editor {
     fn check_selection(&mut self) {
         if self.selected.is_some_and(|id| !self.sequence.has(id)) {
             self.selected = None;
+        }
+        // What was refused is said about that clip only, while it stays selected.
+        if self.speed_refused != self.selected {
+            self.speed_refused = None;
         }
     }
 
@@ -393,6 +407,22 @@ impl Editor {
         self.library.info(source).map(|info| [info.width as f64, info.height as f64])
     }
 
+    /// Has the sound of every clip heard at another speed made for playing, or kept.
+    fn keep_stretched(&mut self, ctx: &egui::Context, now: f64) {
+        let wanted: Vec<(Part, Pcm)> = self
+            .sequence
+            .clips()
+            .filter(|(id, clip)| clip.speed() != 1.0 && self.sequence.sounds(*id))
+            .filter_map(|(_, clip)| {
+                let cache = self.library.cache(clip.source).filter(|cache| cache.info.has_audio)?;
+                Some((stretched(clip), cache.audio.clone()))
+            })
+            .collect();
+        if let Some(wait) = self.stretcher.keep(&wanted, now) {
+            ctx.request_repaint_after(Duration::from_secs_f64(wait));
+        }
+    }
+
     fn play_range(&self, mode: PlayMode) -> PlayRange {
         let sounds: Vec<Sound> = self
             .sequence
@@ -401,16 +431,22 @@ impl Editor {
             .filter_map(|(_, clip)| {
                 let (fade_in, fade_out) = clip.fade_lengths();
                 let sounds = |edge| clip.fade(edge).is_some_and(|fade| fade.sound);
+                // At another speed, its sound is made for it: that sound starts where the clip does.
+                let (pcm, source_start) = if clip.speed() == 1.0 {
+                    (self.library.cache(clip.source)?.audio.clone(), clip.source_in)
+                } else {
+                    self.stretcher.sound(&stretched(clip))?
+                };
                 let segment = Segment {
                     start: clip.start,
                     end: clip.end(),
-                    source_start: clip.source_in,
+                    source_start,
                     gain: clip.gain() as f32,
                     fade_in: if sounds(Edge::In) { fade_in } else { 0.0 },
                     fade_out: if sounds(Edge::Out) { fade_out } else { 0.0 },
                     curves: (clip.fade_curve(Edge::In), clip.fade_curve(Edge::Out)),
                 };
-                Some(Sound { segment, pcm: self.library.cache(clip.source)?.audio.clone() })
+                Some(Sound { segment, pcm })
             })
             .collect();
         let sounds: Arc<[Sound]> = sounds.into();
@@ -893,6 +929,9 @@ impl Editor {
                     self.pause();
                 }
                 self.peek = response.peek;
+                if response.refused.is_some() {
+                    self.speed_refused = response.refused;
+                }
                 if let Some(section) = response.open {
                     self.flash = Some((section, ui.input(|i| i.time)));
                     self.scroll_to = Some(section);
@@ -1048,7 +1087,7 @@ impl Editor {
         let zero = self.sequence.export.start;
         let (fps, at_playhead) = (self.fps, self.frame_start(self.position));
         let clip = self.sequence.clip(id);
-        let (span, source_in, source_out, name) = (clip.span(), clip.source_in, clip.source_out, clip.name.clone());
+        let (span, source_in, source_out, name, speed) = (clip.span(), clip.source_in, clip.source_out, clip.name.clone(), clip.speed());
         let track = track_name(&self.sequence, id.track);
         let kind = self.sequence.tracks[id.track].kind;
         let detached = self.sequence.clip(id).sound_detached;
@@ -1083,7 +1122,8 @@ impl Editor {
             }
             ui.end_row();
         });
-        let from = format!("From its source {} to {}. Delete removes the clip.", timecode::format(source_in), timecode::format(source_out));
+        let at = if speed == 1.0 { String::new() } else { format!(", at {}", speed_text(speed)) };
+        let from = format!("From its source {} to {}{at}. Delete removes the clip.", timecode::format(source_in), timecode::format(source_out));
         ui.label(RichText::new(from).weak().small());
         ui.separator();
 
@@ -1187,9 +1227,18 @@ impl Editor {
             ui.separator();
         }
 
+        let refused = self.speed_refused == Some(id);
         let clip = self.sequence.clip_mut(id);
         let (picture, sound) = (kind == TrackKind::Video, kind == TrackKind::Audio || !detached);
-        let effects_section = flash::frame(ui, effects_flash, false).show(ui, |ui| effects_editor(ui, clip, picture, sound));
+        let effects_section = flash::frame(ui, effects_flash, false).show(ui, |ui| effects_editor(ui, clip, picture, sound, refused));
+        // A new speed makes the clip longer or shorter, and the clips after it move along.
+        if let Some(change) = effects_section.inner {
+            let done = match change {
+                SpeedChange::To(factor) => self.sequence.set_speed(id, factor),
+                SpeedChange::Off => self.sequence.remove_speed(id),
+            };
+            self.speed_refused = (!done).then_some(id);
+        }
         if self.scroll_to == Some(Section::Effects) {
             effects_section.response.scroll_to_me(Some(egui::Align::Center));
             self.scroll_to = None;
@@ -1302,12 +1351,26 @@ fn panel_border(ui: &mut egui::Ui) -> Option<f32> {
     None
 }
 
-/// The effects of a clip, in order, each with its settings, and a way to add more.
-fn effects_editor(ui: &mut egui::Ui, clip: &mut Clip, picture: bool, sound: bool) {
+/// The part of its source's sound a clip plays at its speed.
+fn stretched(clip: &Clip) -> Part {
+    Part::new(clip.source, clip.source_in, clip.source_out, clip.speed())
+}
+
+/// What the Speed block asks for. The clip gets longer or shorter with it, and the clips after it
+/// move along: the sequence does that.
+enum SpeedChange {
+    To(f64),
+    Off,
+}
+
+/// The effects of a clip, in order, each with its settings, and a way to add more. `refused`: the
+/// last change of its speed could not be made.
+fn effects_editor(ui: &mut egui::Ui, clip: &mut Clip, picture: bool, sound: bool, refused: bool) -> Option<SpeedChange> {
     ui.heading("Effects");
     let len = clip.span().len();
     let (fade_in, fade_out) = clip.fade_lengths();
     let mut remove = None;
+    let mut speed_change = None;
     for (i, effect) in clip.effects.iter_mut().enumerate() {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1377,6 +1440,38 @@ fn effects_editor(ui: &mut egui::Ui, clip: &mut Clip, picture: bool, sound: bool
                         ui.end_row();
                     });
                 }
+                Effect::Speed(speed) => {
+                    let factor = speed.played();
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Speed").strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Remove").clicked() {
+                                speed_change = Some(SpeedChange::Off);
+                            }
+                            if ui.add_enabled(factor != 1.0, egui::Button::new("Reset").small()).clicked() {
+                                speed_change = Some(SpeedChange::To(1.0));
+                            }
+                        });
+                    });
+                    let mut wanted = factor;
+                    let slider = egui::Slider::new(&mut wanted, Speed::MIN..=Speed::MAX).logarithmic(true).fixed_decimals(2).prefix("×");
+                    if ui.add(slider).on_hover_text("2 is twice as fast and half as long; 0.5 half as fast. The sound keeps its pitch").changed() {
+                        speed_change = Some(SpeedChange::To(wanted));
+                    }
+                    ui.horizontal(|ui| {
+                        for preset in [0.5, 2.0, 4.0] {
+                            if ui.add(egui::Button::new(speed_text(preset)).selected(factor == preset)).clicked() {
+                                speed_change = Some(SpeedChange::To(preset));
+                            }
+                        }
+                    });
+                    let note = if refused {
+                        RichText::new("The clips after it can't move that far: one chained to them has no room.").color(ERROR)
+                    } else {
+                        RichText::new("Its length changes with it, and the clips after it on its track move along.").weak()
+                    };
+                    ui.label(note.small());
+                }
             }
         });
     }
@@ -1402,7 +1497,13 @@ fn effects_editor(ui: &mut egui::Ui, clip: &mut Clip, picture: bool, sound: bool
                 ui.close_menu();
             }
         }
+        let add = ui.add_enabled(clip.speed_effect().is_none(), egui::Button::new("Speed"));
+        if add.on_disabled_hover_text("The clip has one").clicked() {
+            clip.add_speed();
+            ui.close_menu();
+        }
     });
+    speed_change
 }
 
 /// A time field: drag to change, click to type `mm:ss.cc`, `mm:ss:ff` or seconds.

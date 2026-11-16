@@ -141,7 +141,10 @@ pub fn blade(project: &mut Project, number: usize, at: f64) -> Result<Clip> {
     let id = clip_id(&project.sequence, number)?;
     let clip = project.sequence.clip(id).clone();
     let frame = frame_of(&project.sequence);
-    if at - clip.source_in < frame - ROUNDING || clip.source_out - at < frame - ROUNDING {
+    // Where the recording is at `at` on the timeline: a clip at another speed gets there sooner or
+    // later. Each part is a frame of the result or more.
+    let t = clip.time_of(at);
+    if t - clip.start < frame - ROUNDING || clip.end() - t < frame - ROUNDING {
         let label = project.sources.iter().find(|source| source.id == clip.source).map_or_else(|| clip.name.clone(), |source| source.label());
         bail!(
             "clip {number} plays {label} from {} to {}: a cut at {} has to be inside that, a frame or more from either end",
@@ -151,7 +154,7 @@ pub fn blade(project: &mut Project, number: usize, at: f64) -> Result<Clip> {
         );
     }
     refuse_chained(&project.sequence, id, number)?;
-    project.sequence.split(id, clip.start + at - clip.source_in, frame).ok_or_else(|| anyhow!("clip {number} can not be cut there"))?;
+    project.sequence.split(id, t, frame).ok_or_else(|| anyhow!("clip {number} can not be cut there"))?;
     Ok(clip)
 }
 
@@ -346,6 +349,25 @@ pub mod tests {
         let track = find_video_track(&project.sequence).unwrap();
         project.sequence.detach_sound(ClipId { track, index: 0 }).unwrap();
         assert!(blade(&mut project, 1, 5.0).unwrap_err().to_string().starts_with("clip 1 is chained to a clip on Audio 1"));
+    }
+
+    #[test]
+    fn a_clip_sped_up_in_the_editor_is_cut_and_trimmed_by_the_times_of_its_recording() {
+        let mut project = lesson();
+        // The editor made the installation twice as fast: 12..245 s of it take 116.5 s.
+        let install = ClipId { track: find_video_track(&project.sequence).unwrap(), index: 1 };
+        assert!(project.sequence.set_speed(install, 2.0));
+        assert_eq!(laid_out(&project)[2], ("The result".to_owned(), 129.0, 91.5));
+        // At 1:00 of the recording: 24 s into the clip.
+        blade(&mut project, 2, 60.0).unwrap();
+        let clips = &project.sequence.tracks[0].clips;
+        assert_eq!((clips[1].span().len(), clips[1].source_out, clips[2].start, clips[2].source_in), (24.0, 60.0, 36.5, 60.0));
+        assert_eq!(clips[2].speed(), 2.0, "both parts keep the speed");
+        let edge = "clip 3 plays install.mp4 from 01:00.00 to 04:05.00: a cut at 01:00.01 has to be inside that, a frame or more from either end";
+        assert_eq!(blade(&mut project, 3, 60.01).unwrap_err().to_string(), edge, "less than a frame of the result after its start");
+        // Trimmed to 60..100 s of the recording: 20 s at that speed, and the next clip follows.
+        retime(&mut project, 3, None, Some(100.0)).unwrap();
+        assert_eq!(laid_out(&project)[2..], [("install.mp4".to_owned(), 36.5, 20.0), ("The result".to_owned(), 56.5, 91.5)]);
     }
 
     #[test]

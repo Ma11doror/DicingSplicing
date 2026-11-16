@@ -119,8 +119,8 @@ the command line, or numbers of seconds; `"fit": true` is `--fit`.
 
 - The text: what was done, then the project. With `--json`, the same as an object: `done`, and
   `project` with `name`, `frame`, `ratio`, `clips` (each with `number`, `name`, `start`, `length`,
-  `file`, `from` and `to`, in seconds, and `bars`, true for a picture shown whole with black bars),
-  `length`, `export`, `other_tracks` and `warnings`. `check` adds `problems`.
+  `file`, `from` and `to`, in seconds, `speed`, and `bars`, true for a picture shown whole with black
+  bars), `length`, `export`, `other_tracks` and `warnings`. `check` adds `problems`.
 - The exit code is 0 when it did what was asked. When it can't, it is 1, the reason is on the error
   output, and the project stays as it was. `check` answers 1 when it finds a problem.
 - A mistake in how the command is written comes with how it is written.
@@ -143,6 +143,8 @@ the command line, or numbers of seconds; `"fit": true` is `--fit`.
   Fit does the same to any clip: it is in the menu that opens when the pointer rests on the frame's
   top mark.
 - Recordings are linked, not copied: keep them where they are.
+- A clip can be made faster or slower in the editor (the Speed effect). `show` says so: "at ×2"; it
+  is half as long then. `--from`, `--to` and `--at` are still times in its recording.
 
 ## Asking an agent
 
