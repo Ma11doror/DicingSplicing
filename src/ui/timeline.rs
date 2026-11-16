@@ -17,13 +17,15 @@
 //!
 //! A frame a clip holds is a tinted part of it with a snowflake and its length; narrower than the
 //! snowflake, the snowflake alone, as wide whatever the zoom. On the selected clip, the dots on its
-//! bottom edge drag it: the left ones to another frame, the right ones longer or shorter.
+//! bottom edge drag it: the left ones to another frame, the right ones longer or shorter. A part it
+//! plays in slow motion is tinted too, with a gauge and its speed; its dots move where it starts and
+//! ends in the recording, at the same speed.
 //!
 //! A row is a header and lanes: a lane for each thing its clips show. Folded, there is the picture;
 //! unfolded, also the effects of each clip and its sound as a graph. A clip covers all the lanes of
 //! its row, and is grabbed, cut and trimmed by any of them.
 
-use crate::core::edit::{speed_text, Clip, ClipId, Curve, Edge, Effect, Hold, SourceId, Sequence, Span, Track, TrackId, TrackKind, FREEZE_LENGTH};
+use crate::core::edit::{speed_text, Clip, ClipId, Curve, Edge, Effect, Hold, Slowed, SourceId, Sequence, Span, Track, TrackId, TrackKind, FREEZE_LENGTH};
 use crate::media::geometry::Transform;
 use crate::media::timecode;
 use crate::media::waveform::Peaks;
@@ -100,8 +102,12 @@ const CHIP_COLOR: Color32 = Color32::from_rgb(96, 80, 150);
 const HOLD_TINT: Color32 = Color32::from_rgba_premultiplied(40, 80, 110, 90);
 const HOLD_LINE: Color32 = Color32::from_rgb(150, 215, 255);
 const HOLD_PLAQUE: Color32 = Color32::from_rgb(46, 110, 160);
-/// How big the plaque of a frame held is when it shows the snowflake alone.
-const HOLD_ICON_SIZE: f32 = 16.0;
+/// A part in slow motion: the same, with a gauge.
+const SLOW_TINT: Color32 = Color32::from_rgba_premultiplied(110, 40, 90, 90);
+const SLOW_LINE: Color32 = Color32::from_rgb(255, 165, 225);
+const SLOW_PLAQUE: Color32 = Color32::from_rgb(150, 60, 120);
+/// How big the plaque of a mark is when it shows its sign alone.
+const MARK_ICON_SIZE: f32 = 16.0;
 const WAVE_COLOR: Color32 = Color32::from_rgb(90, 200, 160);
 /// Under the effects and the sound of a clip, darker than its picture lane.
 const LANE_SHADE: Color32 = Color32::from_black_alpha(70);
@@ -283,15 +289,26 @@ enum Drag {
     HoldFrame(ClipId, usize),
     /// How long it holds it: by its right handle.
     HoldLength(ClipId, usize),
+    /// Where a clip's slow motion, the effect with this number, starts in its source: by its left
+    /// handle.
+    SlowFrom(ClipId, usize),
+    /// Where it ends there: by its right handle.
+    SlowTo(ClipId, usize),
 }
 
 impl Drag {
     /// The clip this drag is about.
     fn clip(self) -> Option<ClipId> {
         match self {
-            Drag::ClipStart(id) | Drag::ClipEnd(id) | Drag::ClipMove(id) | Drag::Fade(id, _) | Drag::HoldFrame(id, _) | Drag::HoldLength(id, _) => Some(id),
+            Drag::ClipStart(id) | Drag::ClipEnd(id) | Drag::ClipMove(id) | Drag::Fade(id, _) => Some(id),
+            Drag::HoldFrame(id, _) | Drag::HoldLength(id, _) | Drag::SlowFrom(id, _) | Drag::SlowTo(id, _) => Some(id),
             _ => None,
         }
+    }
+
+    /// Whether it drags a mark inside a clip: a frame held, or a part in slow motion.
+    fn is_mark(self) -> bool {
+        matches!(self, Drag::HoldFrame(..) | Drag::HoldLength(..) | Drag::SlowFrom(..) | Drag::SlowTo(..))
     }
 }
 
@@ -305,11 +322,13 @@ pub struct TimelineResponse {
     pub peek: Option<f64>,
     /// A plaque of an effect was clicked: the part of the Output tab it stands for.
     pub open: Option<Section>,
-    /// This effect of this clip could not be taken off, its speed or a frame held: the clips after it
-    /// could not move that far.
+    /// This effect of this clip could not be taken off, its speed, a frame held or its slow motion:
+    /// the clips after it could not move that far.
     pub refused: Option<(ClipId, usize)>,
     /// Freeze frame was picked in this clip's menu: its frame at the playhead is to be held.
     pub freeze: Option<ClipId>,
+    /// Slow motion was picked in this clip's menu: it is to play slower from the playhead.
+    pub slow: Option<ClipId>,
 }
 
 /// What the timeline needs to know besides the edit.
@@ -444,6 +463,7 @@ fn effects_of(clip: &Clip) -> Vec<Chip> {
             Effect::Color(_) => chips.push(chip("Color".to_owned(), Section::Effects)),
             Effect::Speed(speed) => chips.push(chip(format!("Speed {}", speed_text(speed.played())), Section::Effects)),
             Effect::Freeze(freeze) => chips.push(chip(format!("Freeze {}", seconds_text(freeze.seconds)), Section::Effects)),
+            Effect::SlowMotion(part) => chips.push(chip(format!("Slow motion {}", speed_text(part.played())), Section::Effects)),
         }
     }
     if (t.cx, t.cy, t.zoom, t.angle_deg) != (plain.cx, plain.cy, plain.zoom, plain.angle_deg) {
@@ -859,11 +879,11 @@ impl Timeline {
             // An effect added here is set up in the Clip tab: it is shown there.
             let mut added = false;
             // Without its speed the clip gets longer or shorter, which moves the clips after it, and
-            // so does a frame it holds no more.
+            // so does a frame it holds no more, or a part it plays in slow motion no more.
             let mut unspeed = false;
-            let mut unfreeze = None;
-            // Opened on a frame held: that frame's menu first.
-            let hold = sequence.clip(id).hold_at(at);
+            let (mut unfreeze, mut unslow) = (None, None);
+            // Opened on a frame held or a part in slow motion: their menu first.
+            let (hold, slowed) = (sequence.clip(id).hold_at(at), sequence.clip(id).slowed_at(at));
             // In this egui it gives something back only as the menu closes: whether it is still
             // open is asked separately.
             let kind = sequence.tracks[id.track].kind;
@@ -879,6 +899,16 @@ impl Timeline {
                         changed = true;
                         ui.close_menu();
                     }
+                }
+                if let Some(part) = slowed {
+                    let text = "The clip plays that part at its own speed again: it, and the clips after it on its track, get as much shorter or longer";
+                    if ui.button(format!("Remove slow motion ({})", speed_text(part.rate))).on_hover_text(text).clicked() {
+                        unslow = Some(part.effect);
+                        changed = true;
+                        ui.close_menu();
+                    }
+                }
+                if hold.is_some() || slowed.is_some() {
                     ui.separator();
                 }
                 // Its sound, and what it is chained to.
@@ -974,6 +1004,26 @@ impl Timeline {
                         ui.close_menu();
                     }
                 }
+                // Its picture and its sound: a sound clip too.
+                if !still {
+                    let playhead = timecode::frame_index(pos, env.fps) as f64 / env.fps;
+                    let slow = "Play a second of its recording from the playhead half as fast, its sound at its pitch: the rest of it and the clips after it move later (S)";
+                    let clip = sequence.clip(id);
+                    let slowed_there = clip.slowed().iter().any(|part| part.span.contains(playhead));
+                    let why_not = if slowed_there {
+                        "The playhead is on a part of it in slow motion already: its block in the Clip panel changes it"
+                    } else {
+                        "It slows down from the playhead, which is not on this clip"
+                    };
+                    let button = ui
+                        .add_enabled(clip.span().contains(playhead) && !slowed_there, egui::Button::new("Slow motion"))
+                        .on_hover_text(slow)
+                        .on_disabled_hover_text(why_not);
+                    if button.clicked() {
+                        out.slow = Some(id);
+                        ui.close_menu();
+                    }
+                }
                 if ui.button("Duplicate").on_hover_text("A copy right after it (Ctrl+D)").clicked() {
                     *selected = Some(sequence.duplicate(id));
                     changed = true;
@@ -994,7 +1044,7 @@ impl Timeline {
                 }
             });
             // When it can't be done, the effect's block in the Clip tab says why.
-            if let Some(effect) = take_off(sequence, id, unspeed, unfreeze) {
+            if let Some(effect) = take_off(sequence, id, unspeed, unfreeze, unslow) {
                 out.refused = Some((id, effect));
                 out.open = Some(Section::Effects);
             }
@@ -1075,8 +1125,10 @@ impl Timeline {
             Some(Drag::ExportEnd) => Some(sequence.export.end - frame),
             Some(Drag::ClipStart(id)) => Some(sequence.clip(id).start),
             Some(Drag::ClipEnd(id)) => Some(sequence.clip(id).end() - frame),
-            // The frame it is to hold.
-            Some(drag @ Drag::HoldFrame(..)) => edge_time(sequence, drag),
+            // The frame it is to hold, or to slow down from.
+            Some(drag @ (Drag::HoldFrame(..) | Drag::SlowFrom(..))) => edge_time(sequence, drag),
+            // The last one it plays slowly.
+            Some(drag @ Drag::SlowTo(..)) => edge_time(sequence, drag).map(|end| end - frame),
             _ => None,
         };
         *position = pos;
@@ -1344,13 +1396,14 @@ impl Timeline {
             let fill = if track.hidden { color.gamma_multiply(0.45) } else { color };
             rows_painter.rect_filled(block, 4.0, fill);
             let inside = rows_painter.with_clip_rect(block.shrink(2.0).intersect(layout.rows_area).intersect(body));
-            // Where it holds a frame: tinted, between two lines.
-            let holds = clip.holds();
-            for hold in &holds {
-                let region = Rect::from_x_y_ranges(view.x(hold.span.start)..=view.x(hold.span.end), block.y_range());
-                inside.rect_filled(region, 0.0, HOLD_TINT);
+            // Where it plays in slow motion, and where it holds a frame: tinted, between two lines.
+            let (slowed, holds) = (clip.slowed(), clip.holds());
+            let tinted = slowed.iter().map(|part| (part.span, SLOW_TINT, SLOW_LINE)).chain(holds.iter().map(|hold| (hold.span, HOLD_TINT, HOLD_LINE)));
+            for (span, tint, line) in tinted {
+                let region = Rect::from_x_y_ranges(view.x(span.start)..=view.x(span.end), block.y_range());
+                inside.rect_filled(region, 0.0, tint);
                 for x in [region.left(), region.right()] {
-                    inside.line_segment([pos2(x, block.top()), pos2(x, block.bottom())], Stroke::new(1.0, HOLD_LINE.gamma_multiply(0.7)));
+                    inside.line_segment([pos2(x, block.top()), pos2(x, block.bottom())], Stroke::new(1.0, line.gamma_multiply(0.7)));
                 }
             }
             let text_x = block.left().max(body.left()) + if is_selected { HANDLE_WIDTH + 6.0 } else { 6.0 };
@@ -1459,25 +1512,30 @@ impl Timeline {
                 inside.add(shade);
                 inside.add(Shape::line(points, Stroke::new(1.5, FADE_LINE)));
             }
-            // Each frame held says so on a plaque in the middle of its first lane: a snowflake and how
-            // long, as much as fits; narrower than the snowflake, the snowflake alone, as big as ever.
+            // Each mark says so on a plaque in the middle of its first lane: a frame held with a
+            // snowflake and how long, a part in slow motion with a gauge and how fast, as much as
+            // fits; narrower than its sign, the sign alone, as big as ever.
             if let Some(&(_, lane)) = row.lanes.first() {
                 let y = lane.center().y;
-                for hold in &holds {
-                    let region = Rect::from_x_y_ranges(view.x(hold.span.start)..=view.x(hold.span.end), block.y_range());
-                    if region.width() >= HOLD_ICON_SIZE + 4.0 {
-                        let label = format!("Freeze {}", seconds_text(hold.span.len()));
+                let plaques = slowed.iter().map(|part| (part.span, Sign::Gauge(part.rate))).chain(holds.iter().map(|hold| (hold.span, Sign::Snowflake)));
+                for (span, sign) in plaques {
+                    let region = Rect::from_x_y_ranges(view.x(span.start)..=view.x(span.end), block.y_range());
+                    let (label, fill, line) = match sign {
+                        Sign::Snowflake => (format!("Freeze {}", seconds_text(span.len())), HOLD_PLAQUE, HOLD_LINE),
+                        Sign::Gauge(rate) => (speed_text(rate), SLOW_PLAQUE, SLOW_LINE),
+                    };
+                    if region.width() >= MARK_ICON_SIZE + 4.0 {
                         let width = ui.fonts(|fonts| fonts.layout_no_wrap(label.clone(), FontId::proportional(11.0), Color32::WHITE).size().x);
-                        let plaque = Rect::from_min_size(pos2(region.left() + 2.0, y - 8.0), vec2((HOLD_ICON_SIZE + width + 8.0).min(region.width() - 4.0), 16.0));
+                        let plaque = Rect::from_min_size(pos2(region.left() + 2.0, y - 8.0), vec2((MARK_ICON_SIZE + width + 8.0).min(region.width() - 4.0), 16.0));
                         let painter = inside.with_clip_rect(inside.clip_rect().intersect(region.shrink2(vec2(1.0, 0.0))));
-                        painter.rect_filled(plaque, 4.0, HOLD_PLAQUE);
-                        paint_snowflake(&painter, pos2(plaque.left() + HOLD_ICON_SIZE / 2.0, y), 5.0, Color32::WHITE);
-                        painter.text(pos2(plaque.left() + HOLD_ICON_SIZE + 2.0, y), Align2::LEFT_CENTER, label, FontId::proportional(11.0), Color32::WHITE);
+                        painter.rect_filled(plaque, 4.0, fill);
+                        sign.paint(&painter, pos2(plaque.left() + MARK_ICON_SIZE / 2.0, y), Color32::WHITE);
+                        painter.text(pos2(plaque.left() + MARK_ICON_SIZE + 2.0, y), Align2::LEFT_CENTER, label, FontId::proportional(11.0), Color32::WHITE);
                     } else {
-                        let icon = Rect::from_center_size(pos2(region.center().x, y), vec2(HOLD_ICON_SIZE, HOLD_ICON_SIZE));
-                        rows_painter.rect_filled(icon, 4.0, HOLD_PLAQUE);
-                        rows_painter.rect_stroke(icon, 4.0, Stroke::new(1.0, HOLD_LINE));
-                        paint_snowflake(&rows_painter, icon.center(), 5.0, Color32::WHITE);
+                        let icon = Rect::from_center_size(pos2(region.center().x, y), vec2(MARK_ICON_SIZE, MARK_ICON_SIZE));
+                        rows_painter.rect_filled(icon, 4.0, fill);
+                        rows_painter.rect_stroke(icon, 4.0, Stroke::new(1.0, line));
+                        sign.paint(&rows_painter, icon.center(), Color32::WHITE);
                     }
                 }
             }
@@ -1517,13 +1575,11 @@ impl Timeline {
                         grip_dots(&rows_painter, handle.center(), 3, 1, Color32::from_black_alpha(150));
                     }
                 }
-                // And the frames it holds by these, on its bottom edge.
-                for (effect, frame_handle, length_handle) in hold_handles(block, &holds, view) {
-                    for (handle, drag) in [(frame_handle, Drag::HoldFrame(id, effect)), (length_handle, Drag::HoldLength(id, effect))] {
-                        let color = if active == Some(drag) { Color32::WHITE } else { HANDLE_COLOR };
-                        rows_painter.rect_filled(handle, 3.0, color);
-                        grip_dots(&rows_painter, handle.center(), 3, 1, Color32::from_black_alpha(150));
-                    }
+                // And its marks by these, on its bottom edge: the ones grabbed first drawn last.
+                for (drag, handle) in mark_handles(block, &marks_of(&holds, &slowed, id), view).into_iter().rev() {
+                    let color = if active == Some(drag) { Color32::WHITE } else { HANDLE_COLOR };
+                    rows_painter.rect_filled(handle, 3.0, color);
+                    grip_dots(&rows_painter, handle.center(), 3, 1, Color32::from_black_alpha(150));
                 }
             }
         }
@@ -1676,16 +1732,13 @@ fn hit(p: Pos2, layout: &Layout, view: View, sequence: &Sequence, selected: Opti
     if !layout.rows_area.contains(p) || p.x < layout.body.left() {
         return None;
     }
-    // Edges, fades and frames held only on the selected clip: the others show no handles to grab.
+    // Edges, fades and marks only on the selected clip: the others show no handles to grab.
     if let Some(id) = selected.filter(|&id| sequence.has(id)) {
-        let block = layout.block(id, sequence.clip(id).span(), view);
-        for (effect, frame_handle, length_handle) in hold_handles(block, &sequence.clip(id).holds(), view) {
-            if frame_handle.expand(2.0).contains(p) {
-                return Some(Drag::HoldFrame(id, effect));
-            }
-            if length_handle.expand(2.0).contains(p) {
-                return Some(Drag::HoldLength(id, effect));
-            }
+        let clip = sequence.clip(id);
+        let block = layout.block(id, clip.span(), view);
+        let marks = marks_of(&clip.holds(), &clip.slowed(), id);
+        if let Some((drag, _)) = mark_handles(block, &marks, view).into_iter().find(|(_, handle)| handle.expand(2.0).contains(p)) {
+            return Some(drag);
         }
         for edge in [Edge::In, Edge::Out] {
             if fade_handle(block, sequence.clip(id), edge, view).is_some_and(|handle| handle.expand(2.0).contains(p)) {
@@ -1720,26 +1773,47 @@ fn fade_handle(block: Rect, clip: &Clip, edge: Edge, view: View) -> Option<Rect>
     Some(Rect::from_center_size(pos2(x, block.top() + FADE_HANDLE_SIZE[1] / 2.0 + 1.0), FADE_HANDLE_SIZE.into()))
 }
 
-/// Takes clip `id`'s speed off when `unspeed`, or its Freeze `unfreeze`, as its menu asked. Returns
-/// the effect that could not be taken off, if so: the clips after it could not move that far. The
-/// menu may have removed the clip instead, or moved it to another track: then it asked for neither,
-/// and nothing is asked of the clip.
-fn take_off(sequence: &mut Sequence, id: ClipId, unspeed: bool, unfreeze: Option<usize>) -> Option<usize> {
+/// Takes clip `id`'s speed off when `unspeed`, its Freeze `unfreeze` or its slow motion `unslow`, as
+/// its menu asked. Returns the effect that could not be taken off, if so: the clips after it could
+/// not move that far. The menu may have removed the clip instead, or moved it to another track: then
+/// it asked for none of them, and nothing is asked of the clip.
+fn take_off(sequence: &mut Sequence, id: ClipId, unspeed: bool, unfreeze: Option<usize>, unslow: Option<usize>) -> Option<usize> {
     if unspeed {
         let speed = sequence.clip(id).effects.iter().position(|effect| matches!(effect, Effect::Speed(_)));
         if !sequence.remove_speed(id) {
             return speed;
         }
     }
-    let effect = unfreeze?;
-    (!sequence.remove_freeze(id, effect)).then_some(effect)
+    if let Some(effect) = unfreeze.filter(|&effect| !sequence.remove_freeze(id, effect)) {
+        return Some(effect);
+    }
+    let effect = unslow?;
+    (!sequence.remove_slow_motion(id, effect)).then_some(effect)
 }
 
-/// The handles of the frames a clip drawn as `block` holds, on its bottom edge: of each, which of
-/// its effects it is, and the handles of the frame held and of the length, where the hold starts and
-/// where it ends. Kept off the corners, where the edges are trimmed, and apart from each other. A
-/// clip too narrow for that on screen has none: they are set in the Clip tab, or after zooming in.
-fn hold_handles(block: Rect, holds: &[Hold], view: View) -> Vec<(usize, Rect, Rect)> {
+/// A mark inside a clip, dragged by the handles on its bottom edge: a frame held, or a part in slow
+/// motion. What its left and its right handle drag, and where it is on the timeline.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Mark {
+    left: Drag,
+    right: Drag,
+    span: Span,
+}
+
+/// The marks of clip `id`, which holds `holds` and plays `slowed` in slow motion: the frames held
+/// first, whose handles are grabbed first where they meet those of a part in slow motion.
+fn marks_of(holds: &[Hold], slowed: &[Slowed], id: ClipId) -> Vec<Mark> {
+    let held = holds.iter().map(|hold| Mark { left: Drag::HoldFrame(id, hold.effect), right: Drag::HoldLength(id, hold.effect), span: hold.span });
+    let slow = slowed.iter().map(|part| Mark { left: Drag::SlowFrom(id, part.effect), right: Drag::SlowTo(id, part.effect), span: part.span });
+    held.chain(slow).collect()
+}
+
+/// The handles of the marks of a clip drawn as `block`, on its bottom edge, with what each drags:
+/// inside each mark at its edges, so that those of marks one after another stay apart; those of a
+/// mark too narrow for both apart around its middle. Kept off the corners, where the edges are
+/// trimmed. A clip too narrow for that on screen has none: they are set in the Clip tab, or after
+/// zooming in.
+fn mark_handles(block: Rect, marks: &[Mark], view: View) -> Vec<(Drag, Rect)> {
     let half = FADE_HANDLE_SIZE[0] / 2.0;
     let (lo, hi) = (block.left() + HANDLE_WIDTH + half, block.right() - HANDLE_WIDTH - half);
     if hi - lo < FADE_HANDLE_SIZE[0] + 2.0 {
@@ -1747,16 +1821,47 @@ fn hold_handles(block: Rect, holds: &[Hold], view: View) -> Vec<(usize, Rect, Re
     }
     let y = block.bottom() - FADE_HANDLE_SIZE[1] / 2.0 - 1.0;
     let handle = |x: f32| Rect::from_center_size(pos2(x, y), FADE_HANDLE_SIZE.into());
-    holds
+    marks
         .iter()
-        .map(|hold| {
-            let (start, end) = (view.x(hold.span.start), view.x(hold.span.end));
+        .flat_map(|mark| {
+            let (start, end) = (view.x(mark.span.start), view.x(mark.span.end));
             let middle = ((start + end) / 2.0).clamp(lo + half + 1.0, hi - half - 1.0);
-            let left = start.min(middle - half - 1.0).clamp(lo, hi);
-            let right = end.max(middle + half + 1.0).clamp(lo, hi);
-            (hold.effect, handle(left), handle(right))
+            let left = (start + half).min(middle - half - 1.0).clamp(lo, hi);
+            let right = (end - half).max(middle + half + 1.0).clamp(lo, hi);
+            [(mark.left, handle(left)), (mark.right, handle(right))]
         })
         .collect()
+}
+
+/// The sign of a mark on its plaque.
+#[derive(Clone, Copy)]
+enum Sign {
+    /// A frame held.
+    Snowflake,
+    /// A part in slow motion, this fast.
+    Gauge(f64),
+}
+
+impl Sign {
+    fn paint(self, painter: &egui::Painter, center: Pos2, color: Color32) {
+        match self {
+            Sign::Snowflake => paint_snowflake(painter, center, 5.0, color),
+            Sign::Gauge(rate) => paint_gauge(painter, center, 5.5, rate, color),
+        }
+    }
+}
+
+/// The mark of a part in slow motion: a gauge of radius `r` around `center`, its needle up at ×1, to
+/// the left when slower, to the right when faster.
+fn paint_gauge(painter: &egui::Painter, center: Pos2, r: f32, rate: f64, color: Color32) {
+    let stroke = Stroke::new(1.3, color);
+    // Its dial goes from down left over the top to down right: its middle is a little below it.
+    let center = center + vec2(0.0, r * 0.25);
+    let at = |degrees: f32, length: f32| center + vec2(degrees.to_radians().cos(), -degrees.to_radians().sin()) * length;
+    painter.add(Shape::line((0..=12).map(|k| at(210.0 - 20.0 * k as f32, r)).collect(), stroke));
+    let needle = (90.0 - 60.0 * rate.log2() as f32).clamp(-30.0, 210.0);
+    painter.line_segment([center, at(needle, r * 0.85)], stroke);
+    painter.circle_filled(center, 1.5, color);
 }
 
 /// The mark of a frame held: a snowflake of radius `r` around `center`.
@@ -1783,16 +1888,21 @@ fn seconds_text(seconds: f64) -> String {
 }
 
 /// A clip's sound as a graph in `area`: for each pixel, the loudest the source gets in the time it
-/// stands for, times the clip's volume and its fades; flat where it holds a frame. Pale when the
-/// clip or its track is muted.
+/// stands for, times the clip's volume and its fades; flat where it holds a frame, drawn out where it
+/// plays in slow motion. Pale when the clip or its track is muted.
 fn paint_sound(painter: &egui::Painter, area: Rect, clip: &Clip, view: View, peaks: &Peaks, muted: bool) {
     let color = if muted { WAVE_COLOR.gamma_multiply(0.35) } else { WAVE_COLOR };
     let (middle, half) = (area.center().y, area.height() / 2.0 - 3.0);
-    let holds = clip.holds();
+    // Its time in runs, worked out once rather than for every pixel.
+    let runs = clip.runs();
+    let source_time = |t: f64| match runs.iter().find(|run| t < run.span.end) {
+        Some(run) if t >= clip.start => run.source_time(t),
+        _ => clip.source_time(t),
+    };
     let mut x = area.left().floor();
     while x < area.right() {
-        let (from, to) = (clip.source_time(view.t(x)), clip.source_time(view.t(x + 1.0)));
-        let held = holds.iter().any(|hold| hold.span.contains(view.t(x + 0.5)));
+        let (from, to) = (source_time(view.t(x)), source_time(view.t(x + 1.0)));
+        let held = runs.iter().any(|run| run.is_held() && run.span.contains(view.t(x + 0.5)));
         let fade = if held { 0.0 } else { clip.sound_fade(view.t(x + 0.5)) as f32 };
         let level = (peaks.level(from, to) * clip.volume as f32 * fade).min(1.0);
         let height = (level * half).max(0.5);
@@ -1913,9 +2023,8 @@ fn cursor(target: Option<Drag>) -> CursorIcon {
         None => CursorIcon::Grab,
         Some(Drag::Scrub { .. }) => CursorIcon::Grabbing,
         Some(Drag::ClipMove(_) | Drag::ExportMove) => CursorIcon::Move,
-        Some(Drag::ClipStart(_) | Drag::ClipEnd(_) | Drag::ExportStart | Drag::ExportEnd | Drag::Fade(..) | Drag::HoldFrame(..) | Drag::HoldLength(..)) => {
-            CursorIcon::ResizeHorizontal
-        }
+        Some(Drag::ClipStart(_) | Drag::ClipEnd(_) | Drag::ExportStart | Drag::ExportEnd | Drag::Fade(..)) => CursorIcon::ResizeHorizontal,
+        Some(Drag::HoldFrame(..) | Drag::HoldLength(..) | Drag::SlowFrom(..) | Drag::SlowTo(..)) => CursorIcon::ResizeHorizontal,
     }
 }
 
@@ -1954,12 +2063,19 @@ fn edge_time(sequence: &Sequence, drag: Drag) -> Option<f64> {
         }
         Drag::HoldFrame(id, effect) => hold_of(sequence, id, effect).map(|hold| hold.span.start),
         Drag::HoldLength(id, effect) => hold_of(sequence, id, effect).map(|hold| hold.span.end),
+        Drag::SlowFrom(id, effect) => slowed_of(sequence, id, effect).map(|part| part.span.start),
+        Drag::SlowTo(id, effect) => slowed_of(sequence, id, effect).map(|part| part.span.end),
     }
 }
 
 /// Clip `id`'s Freeze `effect` where it holds its frame, if it is there.
 fn hold_of(sequence: &Sequence, id: ClipId, effect: usize) -> Option<Hold> {
     sequence.has(id).then(|| sequence.clip(id).holds().into_iter().find(|hold| hold.effect == effect)).flatten()
+}
+
+/// Clip `id`'s slow motion `effect` where it plays, if it is there.
+fn slowed_of(sequence: &Sequence, id: ClipId, effect: usize) -> Option<Slowed> {
+    sequence.has(id).then(|| sequence.clip(id).slowed().into_iter().find(|part| part.effect == effect)).flatten()
 }
 
 /// Moves an edge (or the start of what is moved whole) to `t`. Returns the snap target used.
@@ -2035,6 +2151,24 @@ fn edit(sequence: &mut Sequence, drag: Drag, t: f64, playhead: f64, snap_range: 
             sequence.set_freeze_length(id, effect, (t - hold.span.start).max(frame));
             snapped
         }
+        // Where the clip gets to there without it is where it starts in the source, as slow as it
+        // was: what comes before it stays, and what comes after it moves along. A frame long at
+        // least.
+        Drag::SlowFrom(id, effect) => {
+            let (t, snapped) = place(t);
+            let part = slowed_of(sequence, id, effect)?;
+            let from = sequence.clip(id).moment_without(effect, t).min(part.to - frame * part.rate);
+            sequence.move_slow_motion(id, effect, from, part.to);
+            snapped
+        }
+        // Where it would end there at its speed is where it ends in the source.
+        Drag::SlowTo(id, effect) => {
+            let (t, snapped) = place(t);
+            let part = slowed_of(sequence, id, effect)?;
+            let to = sequence.clip(id).slow_motion_end_at(effect, t).max(part.from + frame * part.rate);
+            sequence.move_slow_motion(id, effect, part.from, to);
+            snapped
+        }
     }
 }
 
@@ -2044,15 +2178,15 @@ fn snap_targets(sequence: &Sequence, drag: Drag, playhead: f64) -> Vec<f64> {
     let mut targets = vec![playhead];
     let moving: Vec<ClipId> = match drag {
         Drag::ClipMove(id) => sequence.group_of(id),
-        // A frame held moves the clip's own picture, and a longer one the clips after it, each with
-        // what is chained to it: the clips of other tracks that stay are what it sticks to.
-        Drag::HoldFrame(id, _) | Drag::HoldLength(id, _) => {
+        // A mark moves the clip's own picture, and a longer one the clips after it, each with what is
+        // chained to it: the clips of other tracks that stay are what it sticks to.
+        Drag::HoldFrame(id, _) | Drag::HoldLength(id, _) | Drag::SlowFrom(id, _) | Drag::SlowTo(id, _) => {
             let group = sequence.group_of(id);
             sequence.clips().filter(|(other, _)| other.track == id.track || group.contains(other)).map(|(other, _)| other).collect()
         }
         _ => Vec::new(),
     };
-    if matches!(drag, Drag::HoldFrame(..) | Drag::HoldLength(..)) {
+    if drag.is_mark() {
         let staying = sequence.clips().filter(|(other, _)| !moving.contains(other)).flat_map(|(_, clip)| [clip.start, clip.end()]);
         targets.extend(staying);
         return targets;
@@ -2125,7 +2259,7 @@ fn ticks(from: f64, to: f64, step: f64) -> impl Iterator<Item = f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::edit::Clip;
+    use crate::core::edit::{Clip, SLOW_MOTION_FACTOR, SLOW_MOTION_SECONDS};
 
     const CLIP: ClipId = ClipId { track: 0, index: 0 };
 
@@ -2472,7 +2606,9 @@ mod tests {
         let layout = layout(&sequence, 102.0);
         let block = layout.block(CLIP, sequence.clip(CLIP).span(), view());
         let holds = sequence.clip(CLIP).holds();
-        let [(effect, frame_handle, length_handle)] = hold_handles(block, &holds, view())[..] else { panic!("one hold") };
+        let effect = holds[0].effect;
+        let [(frame_drag, frame_handle), (length_drag, length_handle)] = mark_handles(block, &marks_of(&holds, &[], CLIP), view())[..] else { panic!("one hold") };
+        assert_eq!((frame_drag, length_drag), (Drag::HoldFrame(CLIP, effect), Drag::HoldLength(CLIP, effect)));
         // On the bottom edge, where it starts and ends, apart from each other.
         assert_eq!((frame_handle.center().x, length_handle.center().x), (450.0, 470.0));
         assert_eq!(frame_handle.bottom(), block.bottom() - 1.0);
@@ -2482,7 +2618,7 @@ mod tests {
         assert_eq!(cursor(Some(Drag::HoldLength(CLIP, effect))), CursorIcon::ResizeHorizontal);
         // A hold too narrow for both: they go apart around its middle.
         let short = [Hold { span: Span { start: 35.0, end: 35.2 }, ..holds[0] }];
-        let [(_, left, right)] = hold_handles(block, &short, view())[..] else { panic!("one hold") };
+        let [(_, left), (_, right)] = mark_handles(block, &marks_of(&short, &[], CLIP), view())[..] else { panic!("one hold") };
         assert!(left.right() < right.left() && left.center().x < 451.0 && right.center().x > 451.0);
 
         // Longer to 39.01 s: 4 s, on the frame; the clip with it.
@@ -2503,6 +2639,47 @@ mod tests {
     }
 
     #[test]
+    fn a_part_in_slow_motion_is_dragged_by_its_handles() {
+        // A clip 30..50 s (x = 400..600), selected, of a 60 s source, playing 5..6 s of it half as
+        // fast: 35..37 s, x = 450..470. The clip ends at 51 s then.
+        let mut sequence = Sequence::new(Clip { start: 30.0, source_out: 20.0, ..Clip::new("a".into(), 60.0) });
+        assert!(sequence.slow_motion(CLIP, 35.0, SLOW_MOTION_SECONDS, SLOW_MOTION_FACTOR));
+        let layout = layout(&sequence, 102.0);
+        let block = layout.block(CLIP, sequence.clip(CLIP).span(), view());
+        let slowed = sequence.clip(CLIP).slowed();
+        let effect = slowed[0].effect;
+        let marks = marks_of(&[], &slowed, CLIP);
+        let [(from_drag, from_handle), (to_drag, to_handle)] = mark_handles(block, &marks, view())[..] else { panic!("one part") };
+        assert_eq!((from_drag, to_drag), (Drag::SlowFrom(CLIP, effect), Drag::SlowTo(CLIP, effect)));
+        assert_eq!((from_handle.center().x, to_handle.center().x), (450.0, 470.0));
+        assert_eq!(hit(from_handle.center(), &layout, view(), &sequence, Some(CLIP)), Some(Drag::SlowFrom(CLIP, effect)));
+        assert_eq!(hit(to_handle.center(), &layout, view(), &sequence, Some(CLIP)), Some(Drag::SlowTo(CLIP, effect)));
+        assert_eq!(cursor(Some(Drag::SlowTo(CLIP, effect))), CursorIcon::ResizeHorizontal);
+        // A wide one has them inside it, at its edges, clear of the marks before and after it.
+        let wide = [Mark { span: Span { start: 35.0, end: 40.0 }, ..marks[0] }];
+        let [(_, left), (_, right)] = mark_handles(block, &wide, view())[..] else { panic!("one part") };
+        assert_eq!((left.left(), right.right()), (450.0, 500.0));
+
+        // Its end to 39 s: 2 s of its source, 4 s long; the clip with it.
+        assert_eq!(edge_time(&sequence, Drag::SlowTo(CLIP, effect)), Some(37.0));
+        edit(&mut sequence, Drag::SlowTo(CLIP, effect), 39.0, 100.0, 0.0, 0.04);
+        let part = sequence.clip(CLIP).slowed()[0];
+        assert!((part.to - 7.0).abs() < 1e-9 && (part.span.end - 39.0).abs() < 1e-9, "{part:?}");
+        assert!((sequence.clip(CLIP).end() - 52.0).abs() < 1e-9);
+        // Not shorter than a frame.
+        edit(&mut sequence, Drag::SlowTo(CLIP, effect), 30.0, 100.0, 0.0, 0.04);
+        assert!((sequence.clip(CLIP).slowed()[0].span.len() - 0.04).abs() < 1e-9);
+        // Its start to 33 s: from 3 s of its source, as slow; what comes before it stays.
+        edit(&mut sequence, Drag::SlowFrom(CLIP, effect), 33.0, 100.0, 0.0, 0.04);
+        let part = sequence.clip(CLIP).slowed()[0];
+        assert!((part.from - 3.0).abs() < 1e-9 && (part.span.start - 33.0).abs() < 1e-9 && part.rate == 0.5, "{part:?}");
+        assert_eq!(sequence.clip(CLIP).start, 30.0);
+        // It sticks to the playhead.
+        edit(&mut sequence, Drag::SlowFrom(CLIP, effect), 34.1, 34.0, 0.2, 0.04);
+        assert!((sequence.clip(CLIP).slowed()[0].span.start - 34.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn what_the_menu_takes_off_asks_nothing_of_a_clip_it_removed() {
         // a 0..10, b 10..14 and c 14..20 on one track.
         let mut sequence = Sequence::new(Clip { source_out: 10.0, ..Clip::new("a".into(), 30.0) });
@@ -2511,16 +2688,22 @@ mod tests {
         // Delete in the menu of the last one: the clip is gone, and so is its place on the track.
         let last = ClipId { track: 0, index: 2 };
         sequence.remove_clip(last);
-        assert_eq!(take_off(&mut sequence, last, false, None), None);
+        assert_eq!(take_off(&mut sequence, last, false, None, None), None);
         // Remove speed and Remove freeze take them off, and the clips after it move along.
         let a = ClipId { track: 0, index: 0 };
         assert!(sequence.set_speed(a, 2.0) && sequence.freeze(a, 1.0, 2.0));
         assert_eq!(sequence.clip(a).span().len(), 7.0);
         let freeze = sequence.clip(a).holds()[0].effect;
-        assert_eq!(take_off(&mut sequence, a, false, Some(freeze)), None);
-        assert_eq!(take_off(&mut sequence, a, true, None), None);
+        assert_eq!(take_off(&mut sequence, a, false, Some(freeze), None), None);
+        assert_eq!(take_off(&mut sequence, a, true, None, None), None);
         assert_eq!((sequence.clip(a).span().len(), sequence.clip(a).effects.len()), (10.0, 0));
         assert_eq!(sequence.tracks[0].clips[1].start, 10.0);
+        // Remove slow motion: the clip plays that part at its speed again.
+        assert!(sequence.slow_motion(a, 1.0, SLOW_MOTION_SECONDS, SLOW_MOTION_FACTOR));
+        assert_eq!(sequence.tracks[0].clips[1].start, 11.0);
+        let slow = sequence.clip(a).slowed()[0].effect;
+        assert_eq!(take_off(&mut sequence, a, false, None, Some(slow)), None);
+        assert_eq!((sequence.clip(a).span().len(), sequence.tracks[0].clips[1].start), (10.0, 10.0));
         // No room for a slower clip: the speed stays, and its block says so.
         let mut tight = Sequence::new(Clip { source_out: 10.0, ..Clip::new("a".into(), 30.0) });
         assert!(tight.set_speed(a, 2.0));
@@ -2529,7 +2712,7 @@ mod tests {
         let blocker = tight.place_clip(Some(wall), Clip { start: 5.0, ..Clip::new("w".into(), 1.0) }).unwrap();
         tight.place_clip(Some(wall), Clip { start: 6.0, ..Clip::new("x".into(), 1.0) }).unwrap();
         tight.chain(chained, blocker);
-        assert_eq!(take_off(&mut tight, a, true, None), Some(0));
+        assert_eq!(take_off(&mut tight, a, true, None, None), Some(0));
         assert_eq!(tight.clip(a).speed(), 2.0);
     }
 

@@ -119,12 +119,13 @@ the command line, or numbers of seconds; `"fit": true` is `--fit`.
 
 - The text: what was done, then the project. With `--json`, the same as an object: `done`, and
   `project` with `name`, `frame`, `ratio`, `clips` (each with `number`, `name`, `start`, `length`,
-  `file`, `from` and `to`, in seconds, `speed`, `holds`, `still`, `image`, and `bars`, true for a
-  picture shown whole with black bars), `length`, `export`, `other_tracks` and `warnings`. `check`
-  adds `problems`. `holds` are the frames the clip holds on the way, each with `at`, its moment in
-  the file, and `seconds`, how long it is held. `still` is true for a clip that shows one picture all
-  along, and `image` for one of an image; `from` and `to` of such a clip are both the moment of its
-  picture in the file.
+  `file`, `from` and `to`, in seconds, `speed`, `slow_motion`, `holds`, `still`, `image`, and
+  `bars`, true for a picture shown whole with black bars), `length`, `export`, `other_tracks` and
+  `warnings`. `check` adds `problems`. `slow_motion` are the parts of the file the clip plays at a
+  speed of their own, each with `from` and `to` in the file and `speed`. `holds` are the frames the
+  clip holds on the way, each with `at`, its moment in the file, and `seconds`, how long it is held.
+  `still` is true for a clip that shows one picture all along, and `image` for one of an image;
+  `from` and `to` of such a clip are both the moment of its picture in the file.
 - The exit code is 0 when it did what was asked. When it can't, it is 1, the reason is on the error
   output, and the project stays as it was. `check` answers 1 when it finds a problem.
 - A mistake in how the command is written comes with how it is written.
@@ -140,6 +141,10 @@ the command line, or numbers of seconds; `"fit": true` is `--fit`.
   much longer: `show` tells it after the part the clip plays, "holding its frame at 00:12.40 for
   00:02.00". `blade` cuts it with the clip, and `trim` keeps it while its moment stays in the part
   played.
+- So does a part in slow motion, made in the editor with Slow motion, which makes the clip longer
+  or shorter: `show` tells it as "00:19.50 to 00:20.50 in slow motion at ×0.5". `blade` cuts it with
+  the clip, its `--at` being a moment of the file as ever, and `trim` keeps what of it stays in the
+  part played.
 - A clip chained to another in the editor, as a picture to its detached sound, is left to the editor:
   delete, move, trim and blade refuse it rather than part them.
 - While the editor has the project open, ds-tool changes nothing: the editor saves what it shows by

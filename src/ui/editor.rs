@@ -4,7 +4,7 @@
 //! selected at a time: the middle shows its source with its frame, the side panel its transform and
 //! sound. The output preview shows what goes into the file: the clip seen at the playhead.
 
-use crate::core::edit::{speed_text, Clip, ClipId, Color, Curve, Edge, Effect, Sequence, SourceId, Span, Speed, TrackKind, FREEZE_LENGTH};
+use crate::core::edit::{speed_text, Clip, ClipId, Color, Curve, Edge, Effect, Run, Sequence, SourceId, Span, Speed, TrackKind, FREEZE_LENGTH, SLOW_MOTION_FACTOR, SLOW_MOTION_SECONDS};
 use crate::core::history::History;
 use crate::core::lock::EditorLock;
 use crate::core::plugins::Plugin;
@@ -150,6 +150,8 @@ pub struct Editor {
     length_refused: Option<ClipId>,
     /// The clip whose frame could not be held last time, for the same reason. Its Timing says so.
     freeze_refused: Option<ClipId>,
+    /// The clip that could not play slower from the playhead last time, and why. Its Timing says so.
+    slow_refused: Option<(ClipId, SlowRefused)>,
     /// The sound of the clips that play faster or slower, for playing them.
     stretcher: Stretcher,
     /// Keeps ds-tool from changing the project while it is open here. Last, so that it goes last.
@@ -215,6 +217,7 @@ impl Editor {
             effect_refused: None,
             length_refused: None,
             freeze_refused: None,
+            slow_refused: None,
             stretcher: Stretcher::new(notify.clone()),
             _lock: lock,
         }
@@ -352,6 +355,9 @@ impl Editor {
         if self.freeze_refused != self.selected {
             self.freeze_refused = None;
         }
+        if self.slow_refused.map(|(id, _)| id) != self.selected {
+            self.slow_refused = None;
+        }
     }
 
     /// Asks for the frames the views will need: the selected clip's for the middle, the one seen at
@@ -419,17 +425,16 @@ impl Editor {
         self.library.info(source).map(|info| [info.width as f64, info.height as f64])
     }
 
-    /// Has the sound of every clip heard at another speed made for playing, or kept.
+    /// Has the sound of every clip heard at another speed made for playing, or kept: of the whole
+    /// clip, or of a part of it in slow motion.
     fn keep_stretched(&mut self, ctx: &egui::Context, now: f64) {
-        let wanted: Vec<(Part, Pcm)> = self
-            .sequence
-            .clips()
-            .filter(|(id, clip)| clip.speed() != 1.0 && self.sequence.sounds(*id))
-            .filter_map(|(_, clip)| {
-                let cache = self.library.cache(clip.source).filter(|cache| cache.info.has_audio)?;
-                Some((stretched(clip), cache.audio.clone()))
-            })
-            .collect();
+        let mut wanted: Vec<(Part, Pcm)> = Vec::new();
+        for (_, clip) in self.sequence.clips().filter(|(id, _)| self.sequence.sounds(*id)) {
+            let Some(cache) = self.library.cache(clip.source).filter(|cache| cache.info.has_audio) else { continue };
+            for stretch in stretches(clip).into_iter().filter(|stretch| stretch.rate != 1.0) {
+                wanted.push((stretch.part(clip), cache.audio.clone()));
+            }
+        }
         if let Some(wait) = self.stretcher.keep(&wanted, now) {
             ctx.request_repaint_after(Duration::from_secs_f64(wait));
         }
@@ -440,23 +445,28 @@ impl Editor {
         for (_, clip) in self.sequence.clips().filter(|(id, _)| self.sequence.sounds(*id)) {
             let (fade_in, fade_out) = clip.fade_lengths();
             let fades = |edge| clip.fade(edge).is_some_and(|fade| fade.sound);
-            // At another speed, its sound is made for it: that sound starts where the clip does.
-            let speed = clip.speed();
-            let found = if speed == 1.0 { self.library.cache(clip.source).map(|cache| (cache.audio.clone(), clip.source_in)) } else { self.stretcher.sound(&stretched(clip)) };
-            let Some((pcm, source_start)) = found else { continue };
-            // Where the clip plays its source, not where it holds a frame: silent then.
-            for run in clip.runs().into_iter().filter(|run| !run.is_held()) {
-                let segment = Segment {
-                    start: run.span.start,
-                    end: run.span.end,
-                    source_start: source_start + (run.source - clip.source_in) / speed,
-                    gain: clip.gain() as f32,
-                    fade_in: if fades(Edge::In) { fade_in } else { 0.0 },
-                    fade_out: if fades(Edge::Out) { fade_out } else { 0.0 },
-                    curves: (clip.fade_curve(Edge::In), clip.fade_curve(Edge::Out)),
-                    edges: Some((clip.start, clip.end())),
+            for stretch in stretches(clip) {
+                // At another speed, its sound is made for it: that sound starts where the stretch does.
+                let found = if stretch.rate == 1.0 {
+                    self.library.cache(clip.source).map(|cache| (cache.audio.clone(), stretch.from))
+                } else {
+                    self.stretcher.sound(&stretch.part(clip))
                 };
-                sounds.push(Sound { segment, pcm: pcm.clone() });
+                let Some((pcm, source_start)) = found else { continue };
+                // Where the clip plays its source, not where it holds a frame: silent then.
+                for run in &stretch.runs {
+                    let segment = Segment {
+                        start: run.span.start,
+                        end: run.span.end,
+                        source_start: source_start + (run.source - stretch.from) / stretch.rate,
+                        gain: clip.gain() as f32,
+                        fade_in: if fades(Edge::In) { fade_in } else { 0.0 },
+                        fade_out: if fades(Edge::Out) { fade_out } else { 0.0 },
+                        curves: (clip.fade_curve(Edge::In), clip.fade_curve(Edge::Out)),
+                        edges: Some((clip.start, clip.end())),
+                    };
+                    sounds.push(Sound { segment, pcm: pcm.clone() });
+                }
             }
         }
         let sounds: Arc<[Sound]> = sounds.into();
@@ -577,6 +587,39 @@ impl Editor {
         self.selected = Some(id);
         if !self.sequence.freeze(id, t, FREEZE_LENGTH) {
             self.freeze_refused = Some(id);
+        }
+    }
+
+    /// Plays a second of the recording from the playhead half as fast: the selected clip's if it is
+    /// there and plays a recording, a sound clip's too, else the one of the clip seen there.
+    fn slow_motion_at_playhead(&mut self) {
+        let t = self.frame_start(self.position);
+        let moving = |id: &ClipId| {
+            let clip = self.sequence.clip(*id);
+            clip.still.is_none() && clip.span().contains(t)
+        };
+        let target = self.selected.filter(&moving).or_else(|| self.sequence.shown_at(t).filter(&moving));
+        if let Some(id) = target {
+            self.slow_motion(id);
+        }
+    }
+
+    /// Plays `SLOW_MOTION_SECONDS` of clip `id`'s recording from the playhead at `SLOW_MOTION_FACTOR`:
+    /// the clip is selected. When it can't, its Timing says why.
+    fn slow_motion(&mut self, id: ClipId) {
+        let t = self.frame_start(self.position);
+        self.pause();
+        self.selected = Some(id);
+        if !self.sequence.slow_motion(id, t, SLOW_MOTION_SECONDS, SLOW_MOTION_FACTOR) {
+            let clip = self.sequence.clip(id);
+            let why = if clip.slowed().iter().any(|part| part.span.contains(t)) {
+                SlowRefused::InOne
+            } else if clip.source_time(t) >= clip.source_out - 1e-6 {
+                SlowRefused::AtEnd
+            } else {
+                SlowRefused::NoRoom
+            };
+            self.slow_refused = Some((id, why));
         }
     }
 
@@ -848,6 +891,9 @@ impl Editor {
         if pressed(none, Key::F) {
             self.freeze_at_playhead();
         }
+        if pressed(none, Key::S) {
+            self.slow_motion_at_playhead();
+        }
         if pressed(none, Key::V) || pressed(none, Key::Escape) {
             self.timeline.tool = Tool::Select;
             self.timeline.cancel_chaining();
@@ -934,10 +980,17 @@ impl Editor {
                     }
                     let freeze = ui.button("Freeze frame (F)").on_hover_text(format!(
                         "Hold the frame at the playhead for {FREEZE_LENGTH} s, of the selected clip or the one seen there: \
-                         the clip is cut there, and the rest of it and the clips after it on its track move later"
+                         the rest of it and the clips after it on its track move later"
                     ));
                     if freeze.clicked() {
                         self.freeze_at_playhead();
+                    }
+                    let slow = ui.button("Slow motion (S)").on_hover_text(
+                        "Play a second of the recording from the playhead half as fast, of the selected clip or the one seen there, \
+                         its sound at its pitch: the rest of it and the clips after it on its track move later",
+                    );
+                    if slow.clicked() {
+                        self.slow_motion_at_playhead();
                     }
                 });
 
@@ -979,6 +1032,9 @@ impl Editor {
                 }
                 if let Some(id) = response.freeze {
                     self.freeze(id);
+                }
+                if let Some(id) = response.slow {
+                    self.slow_motion(id);
                 }
                 if let Some(section) = response.open {
                     self.flash = Some((section, ui.input(|i| i.time)));
@@ -1136,7 +1192,7 @@ impl Editor {
         let (fps, at_playhead) = (self.fps, self.frame_start(self.position));
         let clip = self.sequence.clip(id);
         let (span, source_in, source_out, name, speed, still) = (clip.span(), clip.source_in, clip.source_out, clip.name.clone(), clip.speed(), clip.still);
-        let holds = clip.holds();
+        let (holds, slowed) = (clip.holds(), clip.slowed());
         let image = clip.is_image();
         let track = track_name(&self.sequence, id.track);
         let kind = self.sequence.tracks[id.track].kind;
@@ -1191,6 +1247,12 @@ impl Editor {
                     1 => at += &format!(", a frame of it held {}", timecode::format(held)),
                     count => at += &format!(", {count} frames of it held {} in all", timecode::format(held)),
                 }
+                // Some of it at a speed of its own.
+                match slowed.as_slice() {
+                    [] => {}
+                    [part] => at += &format!(", {} to {} of it at {}", timecode::format(part.from), timecode::format(part.to), speed_text(part.rate)),
+                    parts => at += &format!(", {} parts of it in slow motion", parts.len()),
+                }
                 format!("From its source {} to {}{at}. Delete removes the clip.", timecode::format(source_in), timecode::format(source_out))
             }
         };
@@ -1200,6 +1262,14 @@ impl Editor {
         }
         if self.freeze_refused == Some(id) {
             let why = format!("No freeze frame: the clips after the playhead can't move {FREEZE_LENGTH} s later, one chained to them has no room.");
+            ui.label(RichText::new(why).color(ERROR).small());
+        }
+        if let Some((_, why)) = self.slow_refused.filter(|(clip, _)| *clip == id) {
+            let why = match why {
+                SlowRefused::InOne => "No slow motion: the playhead is on a part in slow motion already. Its block in Effects changes it.",
+                SlowRefused::AtEnd => "No slow motion: its recording ends at the playhead.",
+                SlowRefused::NoRoom => "No slow motion: the clips after the playhead can't move that much later, one chained to them has no room.",
+            };
             ui.label(RichText::new(why).color(ERROR).small());
         }
         ui.separator();
@@ -1319,6 +1389,9 @@ impl Editor {
                 EffectChange::FreezeFrame(at) => self.sequence.move_freeze(id, effect, at),
                 EffectChange::FreezeLength(seconds) => self.sequence.set_freeze_length(id, effect, seconds),
                 EffectChange::FreezeOff => self.sequence.remove_freeze(id, effect),
+                EffectChange::SlowMotionSpeed(factor) => self.sequence.set_slow_motion_speed(id, effect, factor),
+                EffectChange::SlowMotionPart(from, to) => self.sequence.move_slow_motion(id, effect, from, to),
+                EffectChange::SlowMotionOff => self.sequence.remove_slow_motion(id, effect),
             };
             self.effect_refused = (!done).then_some((id, effect));
         }
@@ -1443,9 +1516,50 @@ fn panel_border(ui: &mut egui::Ui) -> Option<f32> {
     None
 }
 
-/// The part of its source's sound a clip plays at its speed.
-fn stretched(clip: &Clip) -> Part {
-    Part::new(clip.source, clip.source_in, clip.source_out, clip.speed())
+/// A stretch of a clip's source it plays at one speed: its runs that play it, one after another
+/// however many frames it holds on the way.
+struct Stretch {
+    from: f64,
+    to: f64,
+    rate: f64,
+    runs: Vec<Run>,
+}
+
+impl Stretch {
+    /// Its source's sound, as made for playing at its speed.
+    fn part(&self, clip: &Clip) -> Part {
+        Part::new(clip.source, self.from, self.to, self.rate)
+    }
+}
+
+/// The stretches of its source a clip plays, in order: at its speed, and at the speed of each part
+/// in slow motion. The sound of one at another speed than 1 is made for it.
+fn stretches(clip: &Clip) -> Vec<Stretch> {
+    let runs = clip.runs();
+    let mut stretches: Vec<Stretch> = Vec::new();
+    for (n, run) in runs.iter().enumerate().filter(|(_, run)| !run.is_held()) {
+        // It goes on in the source up to where the next run is in it, or the end of what the clip plays.
+        let to = runs.get(n + 1).map_or(clip.source_out, |next| next.source);
+        match stretches.last_mut() {
+            Some(last) if last.rate == run.rate && (last.to - run.source).abs() < 1e-6 => {
+                last.to = to;
+                last.runs.push(*run);
+            }
+            _ => stretches.push(Stretch { from: run.source, to, rate: run.rate, runs: vec![*run] }),
+        }
+    }
+    stretches
+}
+
+/// Why a clip did not play slower from the playhead.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SlowRefused {
+    /// It plays that moment in slow motion already.
+    InOne,
+    /// Its recording ends there.
+    AtEnd,
+    /// The clips after it could not move later.
+    NoRoom,
 }
 
 /// What a block of the Effects asks for, of the effect it is about. The clip gets longer or shorter
@@ -1457,6 +1571,10 @@ enum EffectChange {
     FreezeFrame(f64),
     FreezeLength(f64),
     FreezeOff,
+    SlowMotionSpeed(f64),
+    /// The moments of the source it is to play in slow motion instead.
+    SlowMotionPart(f64, f64),
+    SlowMotionOff,
 }
 
 /// The effects of a clip, in order, each with its settings, and a way to add more. `refused`: the
@@ -1467,6 +1585,8 @@ fn effects_editor(ui: &mut egui::Ui, clip: &mut Clip, picture: bool, sound: bool
     let len = clip.span().len();
     let (fade_in, fade_out) = clip.fade_lengths();
     let (source_in, source_out) = (clip.source_in, clip.source_out);
+    // The parts it plays in slow motion, as it plays them: within what it plays.
+    let slowed = clip.slowed();
     let mut remove = None;
     let mut change = None;
     let no_room = || RichText::new("The clips after it can't move that far: one chained to them has no room.").color(ERROR);
@@ -1598,6 +1718,51 @@ fn effects_editor(ui: &mut egui::Ui, clip: &mut Clip, picture: bool, sound: bool
                     };
                     ui.label(note.small());
                 }
+                Effect::SlowMotion(part) => {
+                    let factor = part.played();
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Slow motion").strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Remove").clicked() {
+                                change = Some((i, EffectChange::SlowMotionOff));
+                            }
+                        });
+                    });
+                    let mut wanted = factor;
+                    let slider = egui::Slider::new(&mut wanted, Speed::MIN..=Speed::MAX).logarithmic(true).fixed_decimals(2).prefix("×");
+                    let hover = "How fast this part of its recording plays, whatever the speed of the rest of the clip: 0.5 is half as fast and twice as long. The sound keeps its pitch";
+                    if ui.add(slider).on_hover_text(hover).changed() {
+                        change = Some((i, EffectChange::SlowMotionSpeed(wanted)));
+                    }
+                    ui.horizontal(|ui| {
+                        for preset in [0.25, 0.5, 2.0] {
+                            if ui.add(egui::Button::new(speed_text(preset)).selected(factor == preset)).clicked() {
+                                change = Some((i, EffectChange::SlowMotionSpeed(preset)));
+                            }
+                        }
+                    });
+                    let (from, to) = slowed.iter().find(|played| played.effect == i).map_or((part.from, part.to), |played| (played.from, played.to));
+                    egui::Grid::new(("slow motion", i)).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                        ui.label("From");
+                        let mut start = from;
+                        if ui.add(time_value(&mut start, fps)).on_hover_text("The moment of its recording where it starts").changed() {
+                            change = Some((i, EffectChange::SlowMotionPart(start.clamp(source_in, (to - frame).max(source_in)), to)));
+                        }
+                        ui.end_row();
+                        ui.label("To");
+                        let mut end = to;
+                        if ui.add(time_value(&mut end, fps)).on_hover_text("The moment of its recording where it ends").changed() {
+                            change = Some((i, EffectChange::SlowMotionPart(from, end.clamp((from + frame).min(source_out), source_out))));
+                        }
+                        ui.end_row();
+                    });
+                    let note = if refused == Some(i) {
+                        no_room()
+                    } else {
+                        RichText::new("The rest of the clip and the clips after it on its track move along, and so does its detached sound.").weak()
+                    };
+                    ui.label(note.small());
+                }
             }
         });
     }
@@ -1641,4 +1806,26 @@ fn time_value(value: &mut f64, fps: f64) -> egui::DragValue<'_> {
         .speed(1.0 / fps)
         .custom_formatter(|v, _| timecode::format(v))
         .custom_parser(move |s| timecode::parse(s, fps))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_sound_of_a_clip_is_made_for_each_stretch_of_one_speed() {
+        // 0..10 s of a 30 s source at ×2, with 4..5 s of it in slow motion at ×0.5 and the frame at
+        // 7 s held: ×2 up to 4 s, ×0.5 up to 5 s, and ×2 on from there through the frame held.
+        let mut sequence = Sequence::new(Clip { source_out: 10.0, ..Clip::new("a".into(), 30.0) });
+        let id = ClipId { track: 0, index: 0 };
+        assert!(sequence.set_speed(id, 2.0));
+        assert!(sequence.slow_motion(id, 2.0, SLOW_MOTION_SECONDS, SLOW_MOTION_FACTOR));
+        assert!(sequence.freeze(id, 5.0, FREEZE_LENGTH));
+        let found: Vec<(f64, f64, f64, usize)> = stretches(sequence.clip(id)).iter().map(|s| (s.from, s.to, s.rate, s.runs.len())).collect();
+        assert_eq!(found, [(0.0, 4.0, 2.0, 1), (4.0, 5.0, 0.5, 1), (5.0, 10.0, 2.0, 2)]);
+        // A plain clip is one stretch at its speed.
+        let plain = Clip { source_in: 2.0, source_out: 12.0, ..Clip::new("a".into(), 30.0) };
+        let found: Vec<(f64, f64, f64, usize)> = stretches(&plain).iter().map(|s| (s.from, s.to, s.rate, s.runs.len())).collect();
+        assert_eq!(found, [(2.0, 12.0, 1.0, 1)]);
+    }
 }

@@ -96,7 +96,8 @@ struct Piece {
 
 /// The result's picture, frame by frame: the clip each run of frames shows, and while it fades, the
 /// clip under it. Where one clip gives way to another, a fade begins or ends, or a clip starts or
-/// stops holding a frame, falls on the frame nearest to where it is on the timeline.
+/// stops holding a frame or playing in slow motion, falls on the frame nearest to where it is on the
+/// timeline.
 fn pieces(sequence: &Sequence, fps: f64) -> Vec<Piece> {
     let export = sequence.export;
     let frame_at = |t: f64| ((t - export.start) * fps).round().max(0.0) as u64;
@@ -106,13 +107,13 @@ fn pieces(sequence: &Sequence, fps: f64) -> Vec<Piece> {
     }
     for (_, clip) in sequence.clips().filter(|(id, _)| !sequence.tracks[id.track].hidden) {
         let (fade_in, fade_out) = clip.fade_lengths();
-        let holds = clip.holds().into_iter().flat_map(|hold| [hold.span.start, hold.span.end]);
-        cuts.extend([clip.start + fade_in, clip.end() - fade_out].into_iter().chain(holds).filter(|&t| export.contains(t)));
+        let runs = clip.runs().into_iter().flat_map(|run| [run.span.start, run.span.end]);
+        cuts.extend([clip.start + fade_in, clip.end() - fade_out].into_iter().chain(runs).filter(|&t| export.contains(t)));
     }
     cuts.sort_by(f64::total_cmp);
     let mut pieces: Vec<Piece> = Vec::new();
     // Which run of its clip, and of the clip under it, the last piece is in: a piece plays its
-    // source or holds a frame, all of it.
+    // source at one rate or holds a frame, all of it.
     let mut last_runs = (None, None);
     for pair in cuts.windows(2) {
         let (first, end) = (frame_at(pair[0]), frame_at(pair[1]));
@@ -856,7 +857,7 @@ fn run(plan: &RenderPlan, shared: &Shared, notify: &Notify) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::edit::{Clip, Span, FREEZE_LENGTH};
+    use crate::core::edit::{Clip, Span, FREEZE_LENGTH, SLOW_MOTION_FACTOR, SLOW_MOTION_SECONDS};
     use crate::core::export::{AudioCodec, Container, OutputSize, Speed};
     use crate::core::preset::{get, Output, PresetId, Ratio};
     use crate::core::edit::Track;
@@ -1450,6 +1451,23 @@ mod tests {
     }
 
     #[test]
+    fn a_part_in_slow_motion_is_a_piece_of_its_own() {
+        // 0..10 s at 10 fps, a second of it from 4 s half as fast: played, slow, played.
+        let mut s = sequence(10.0);
+        let id = ClipId { track: 0, index: 0 };
+        assert!(s.slow_motion(id, 4.0, SLOW_MOTION_SECONDS, SLOW_MOTION_FACTOR));
+        let piece = |first, count| Piece { first, count, clip: Some(id), under: None };
+        assert_eq!(pieces(&s, 10.0), [piece(0, 40), piece(40, 20), piece(60, 50)]);
+        // Its picture goes through its source at half the speed, its sound too, at its pitch.
+        let files = files(Path::new("a.mp4"), &info(10.0));
+        let plan = plan(&files, &s, Path::new("out.mp4")).unwrap();
+        let graph = plan.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ");
+        assert!(graph.contains("trim=end=4.000000,setpts=(PTS-3.000000/TB)/0.500000,"), "{graph}");
+        assert_eq!(graph.matches("atrim=start=").count(), 3, "{graph}");
+        assert!(graph.contains("atempo=0.500000"), "{graph}");
+    }
+
+    #[test]
     fn a_fade_goes_on_through_a_frame_held_by_its_formula() {
         // Source 0..10 s at 0 s, fading in over 2 s, holding its frame at 0.5 s for 1 s: played
         // 0..0.5 s, held 0.5..1.5 s, played on from 0.5 s of its source.
@@ -1516,6 +1534,57 @@ mod tests {
             // Silent while it is held.
             let (silent, heard) = (sound_level(&path, t + 0.2, t + 1.8), sound_level(&path, t + 2.2, t + 2.5));
             assert!(silent < 50.0 && heard > 1000.0, "frame {held}: {silent:.0} while held, {heard:.0} after");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A second of a counted source half as fast: each of its frames is seen twice, its sound keeps
+    /// its pitch, and the picture and the sound stay together through it and after it.
+    #[test]
+    fn a_part_in_slow_motion_shows_each_frame_twice_at_its_pitch_with_its_sound() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let dir = temp_dir("slow_motion");
+        let source = make_counted_source(&dir, 100);
+        let i = MediaInfo { width: 160, height: 90, ..info(4.0) };
+        let colors = frame_colors(&source);
+        assert_eq!(colors.len(), 100);
+        let off = |n: usize, (y, u): (f64, f64)| (colors[n].0 - y).powi(2) + (colors[n].1 - u).powi(2);
+        let number = |color: (f64, f64)| (0..colors.len()).min_by(|&a, &b| off(a, color).total_cmp(&off(b, color))).unwrap();
+        let settle = |s: &mut Sequence, quality: u8, frame_rate: FrameRate| {
+            s.settings.fades = (0.0, 0.0);
+            s.settings.size = OutputSize::LongSide(W);
+            s.settings.rate = Rate::Quality(quality);
+            s.settings.frame_rate = frame_rate;
+            s.settings.speed = Speed::Veryfast;
+            s.output = Output { preset: PresetId::Landscape, ..Output::default() };
+        };
+        // Frames 25 to 49 half as fast: 2 s instead of 1.
+        let mut s = sequence(4.0);
+        settle(&mut s, 1, FrameRate::Source);
+        assert!(s.slow_motion(ClipId { track: 0, index: 0 }, 1.0, SLOW_MOTION_SECONDS, SLOW_MOTION_FACTOR));
+        assert_eq!(s.export, Span { start: 0.0, end: 5.0 });
+        let path = render(&source, &i, &s, &dir.join("slow.mp4"));
+        let shown: Vec<usize> = frame_colors(&path).into_iter().map(number).collect();
+        let expected: Vec<usize> = (0..125).map(|k| if k < 25 { k } else if k < 75 { 25 + (k - 25) / 2 } else { k - 25 }).collect();
+        assert_eq!(shown, expected);
+        for (from, to) in [(0.1, 0.9), (1.2, 2.8), (3.2, 4.8)] {
+            let pitch = tone(&path, from, to);
+            assert!((pitch - 440.0).abs() < 440.0 * 0.03, "{from}..{to} s: the 440 Hz tone is {pitch:.0} Hz");
+        }
+        // A white frame and a beep together every two seconds of the source: 1..17 s of it, with 3.5
+        // to 4.5 s, and the mark at 4 s, half as fast. The marks after it are a second later.
+        let fps = 30.0;
+        let marked = make_marked_source(&dir, "marked.mp4", "30", 60, 2.0, 0.0);
+        let i = probe::probe(&marked).unwrap();
+        let mut s = Sequence::new(Clip { source_in: 1.0, source_out: 17.0, ..Clip::new("source".into(), i.duration) });
+        settle(&mut s, 12, FrameRate::Fixed(fps));
+        assert!(s.slow_motion(ClipId { track: 0, index: 0 }, 2.5, SLOW_MOTION_SECONDS, SLOW_MOTION_FACTOR));
+        let errors = picture_minus_sound(&render(&marked, &i, &s, &dir.join("slow_marked.mp4")), fps);
+        assert!(errors.len() >= 6, "{errors:?}");
+        for error in errors {
+            assert!(error.abs() <= 0.5 / fps + 0.01, "picture minus sound {:.1} ms", error * 1000.0);
         }
         let _ = fs::remove_dir_all(&dir);
     }

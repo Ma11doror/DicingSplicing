@@ -30,6 +30,9 @@ pub struct Line {
     pub image: bool,
     /// How fast it plays that part: 2 is twice as fast, so half as long. Set in the editor.
     pub speed: f64,
+    /// The parts of the file it plays in slow motion, each where it starts and ends in the file and
+    /// how fast, in the order they come. Set in the editor.
+    pub slow_motion: Vec<(f64, f64, f64)>,
     /// The frames it holds on the way, each the moment of the file and for how long, in the order
     /// they come. Set in the editor.
     pub holds: Vec<(f64, f64)>,
@@ -68,6 +71,7 @@ pub fn summary(project: &Project) -> Summary {
                     still: clip.still.is_some(),
                     image: clip.is_image(),
                     speed: clip.speed(),
+                    slow_motion: clip.slowed().iter().map(|part| (part.from, part.to, part.rate)).collect(),
                     holds: clip.holds().iter().map(|hold| (hold.at, hold.span.len())).collect(),
                     bars: clip.transform.bars && clip.transform.zoom < 1.0 - ROUNDING,
                 })
@@ -126,6 +130,9 @@ impl Summary {
                 let name = shortened(&line.name, width);
                 let file = file_label(Path::new(&line.file));
                 let mut at = if line.speed == 1.0 { String::new() } else { format!(", at {}", speed_text(line.speed)) };
+                for (from, to, speed) in &line.slow_motion {
+                    at += &format!(", {} to {} in slow motion at {}", format(*from), format(*to), speed_text(*speed));
+                }
                 for (moment, seconds) in &line.holds {
                     at += &format!(", holding its frame at {} for {}", format(*moment), format(*seconds));
                 }
@@ -155,8 +162,12 @@ impl Summary {
             .lines
             .iter()
             .map(|line| {
+                let slow_motion: Vec<Value> = line.slow_motion.iter().map(|(from, to, speed)| json!({"from": from, "to": to, "speed": speed})).collect();
                 let holds: Vec<Value> = line.holds.iter().map(|(at, seconds)| json!({"at": at, "seconds": seconds})).collect();
-                json!({"number": line.number, "name": line.name, "start": line.start, "length": line.length, "file": line.file, "from": line.from, "to": line.to, "speed": line.speed, "holds": holds, "still": line.still, "image": line.image, "bars": line.bars})
+                json!({
+                    "number": line.number, "name": line.name, "start": line.start, "length": line.length, "file": line.file, "from": line.from, "to": line.to,
+                    "speed": line.speed, "slow_motion": slow_motion, "holds": holds, "still": line.still, "image": line.image, "bars": line.bars,
+                })
             })
             .collect();
         let others: Vec<Value> = self.others.iter().map(|(name, count)| json!({"name": name, "clips": count})).collect();
@@ -314,6 +325,25 @@ mod tests {
         let told = summary(&project);
         assert_eq!(told.json()["clips"][2]["holds"], json!([{"at": 19.5, "seconds": 2.0}]), "{}", told.text());
         assert_eq!(told.json()["clips"][1]["holds"], json!([]), "{}", told.text());
+    }
+
+    #[test]
+    fn a_slow_motion_in_the_editor_is_told_and_cut_with_the_clip() {
+        let mut project = lesson();
+        let install = crate::core::edit::ClipId { track: 0, index: 1 };
+        // At 20 s of the timeline the recording is at 19.5 s: a second of it from there half as fast.
+        assert!(project.sequence.slow_motion(install, 20.0, 1.0, 0.5));
+        let told = summary(&project);
+        let text = told.text();
+        assert!(text.contains("  00:12.50  03:54.00  "), "1 s longer: {text}");
+        assert!(text.contains("install.mp4 00:12.00 to 04:05.00, 00:19.50 to 00:20.50 in slow motion at ×0.5"), "{text}");
+        assert_eq!(told.json()["clips"][1]["slow_motion"], json!([{"from": 19.5, "to": 20.5, "speed": 0.5}]));
+        assert_eq!(told.json()["clips"][0]["slow_motion"], json!([]));
+        // A cut at 20 s of the recording, in it: each part has its part of it.
+        crate::cli::pieces::blade(&mut project, 2, 20.0).unwrap();
+        let told = summary(&project);
+        assert_eq!(told.json()["clips"][1]["slow_motion"], json!([{"from": 19.5, "to": 20.0, "speed": 0.5}]), "{}", told.text());
+        assert_eq!(told.json()["clips"][2]["slow_motion"], json!([{"from": 20.0, "to": 20.5, "speed": 0.5}]), "{}", told.text());
     }
 
     #[test]

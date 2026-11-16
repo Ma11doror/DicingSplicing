@@ -75,6 +75,10 @@ pub const DEFAULT_FADE: f64 = 1.0;
 pub const IMAGE_LENGTH: f64 = 5.0;
 /// How long a frame is held when a freeze frame is made.
 pub const FREEZE_LENGTH: f64 = 2.0;
+/// How much of its recording a new slow motion takes, and how fast it plays it: a second of it,
+/// two on the timeline.
+pub const SLOW_MOTION_SECONDS: f64 = 1.0;
+pub const SLOW_MOTION_FACTOR: f64 = 0.5;
 
 /// An edge of a clip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,6 +252,25 @@ pub struct Freeze {
     pub seconds: f64,
 }
 
+/// A part of the clip's source played at a speed of its own: the moments `from` to `to` of it,
+/// `factor` times as fast as it was recorded, whatever the speed of the rest of the clip. The clip
+/// is as much longer or shorter. Its sound keeps its pitch; its fades stay in the clip's own time
+/// and go on through it. A frame may be held in it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SlowMotion {
+    /// Where it starts and ends in the source, in source seconds.
+    pub from: f64,
+    pub to: f64,
+    pub factor: f64,
+}
+
+impl SlowMotion {
+    /// The factor as the clip plays it, see `Speed::played`.
+    pub fn played(self) -> f64 {
+        playable(self.factor)
+    }
+}
+
 /// Something done to a clip. Effects apply in the order of the clip's list.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
@@ -256,6 +279,7 @@ pub enum Effect {
     Color(Color),
     Speed(Speed),
     Freeze(Freeze),
+    SlowMotion(SlowMotion),
 }
 
 impl Effect {
@@ -280,6 +304,13 @@ impl Effect {
         }
     }
 
+    pub fn as_slow_motion(&self) -> Option<&SlowMotion> {
+        match self {
+            Effect::SlowMotion(part) => Some(part),
+            _ => None,
+        }
+    }
+
     fn is_fade_at(&self, edge: Edge) -> bool {
         self.as_fade().is_some_and(|fade| fade.edge == edge)
     }
@@ -295,8 +326,22 @@ pub struct Hold {
     pub span: Span,
 }
 
+/// A part of a clip's source it plays in slow motion, where it is on the timeline.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Slowed {
+    /// Which of the clip's effects it is: its SlowMotion.
+    pub effect: usize,
+    /// Where it starts and ends in the source.
+    pub from: f64,
+    pub to: f64,
+    /// How fast it plays that.
+    pub rate: f64,
+    /// Where it is on the timeline, with the frames held in it.
+    pub span: Span,
+}
+
 /// A part of a clip's time in which its source goes on at one rate: as fast as the clip plays it,
-/// or not at all while a frame is held.
+/// as fast as a part of it in slow motion goes, or not at all while a frame is held.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Run {
     /// Where it is on the timeline.
@@ -315,6 +360,40 @@ impl Run {
     /// Source time at timeline time `t`, also outside the run.
     pub fn source_time(&self, t: f64) -> f64 {
         self.source + (t - self.span.start) * self.rate
+    }
+}
+
+/// A clip's time from its start to its end, see `Clip::timing`.
+#[derive(Default)]
+struct Timing {
+    runs: Vec<Run>,
+    holds: Vec<Hold>,
+    slowed: Vec<Slowed>,
+    /// How far it has got, on the timeline.
+    t: f64,
+}
+
+impl Timing {
+    /// Plays the source from `from` to `to` at `rate`: on in the run before when that has the same
+    /// rate.
+    fn play(&mut self, from: f64, to: f64, rate: f64) {
+        if to - from <= SAME_TIME {
+            return;
+        }
+        let end = self.t + (to - from) / rate;
+        match self.runs.last_mut() {
+            Some(last) if !last.is_held() && last.rate == rate => last.span.end = end,
+            _ => self.runs.push(Run { span: Span { start: self.t, end }, source: from, rate }),
+        }
+        self.t = end;
+    }
+
+    /// Holds the frame of the moment `at` of the source for `seconds`, as Freeze `effect` says.
+    fn hold(&mut self, effect: usize, at: f64, seconds: f64) {
+        let span = Span { start: self.t, end: self.t + seconds };
+        self.runs.push(Run { span, source: at, rate: 0.0 });
+        self.holds.push(Hold { effect, at, span });
+        self.t = span.end;
     }
 }
 
@@ -425,9 +504,11 @@ impl Clip {
             self.source_out = duration;
         }
         self.source_out = self.source_out.min(duration);
-        // A frame held that is not in what it plays any more goes.
+        // A frame held that is not in what it plays any more goes, and so does what of its slow
+        // motion is not.
         let (from, to) = (self.source_in, self.source_out);
         self.effects.retain(|effect| effect.as_freeze().is_none_or(|freeze| freeze.at >= from - SAME_TIME && freeze.at <= to + SAME_TIME));
+        self.keep_slow_motions(from, to);
     }
 
     /// What the clip's sound is multiplied by.
@@ -482,11 +563,31 @@ impl Clip {
     }
 
     pub fn end(&self) -> f64 {
-        self.start + (self.source_out - self.source_in) / self.speed() + self.held()
+        self.start + self.played() + self.held()
     }
 
     pub fn span(&self) -> Span {
         Span { start: self.start, end: self.end() }
+    }
+
+    /// How long it takes to play the part of its source it plays: at its speed, and the parts of it
+    /// in slow motion at theirs. Without the frames it holds.
+    fn played(&self) -> f64 {
+        let (speed, parts) = (self.speed(), self.slow_motions());
+        if parts.is_empty() {
+            return (self.source_out - self.source_in) / speed;
+        }
+        let (mut played, mut at) = (0.0, self.source_in);
+        for (_, part) in &parts {
+            played += (part.from - at) / speed + (part.to - part.from) / part.factor;
+            at = part.to;
+        }
+        played + (self.source_out - at) / speed
+    }
+
+    /// Whether its time is one run: it holds no frame and plays nothing in slow motion.
+    fn plain(&self) -> bool {
+        !self.effects.iter().any(|effect| matches!(effect, Effect::Freeze(_) | Effect::SlowMotion(_)))
     }
 
     /// Its Freeze effects that hold a frame of what it plays, for some time, with their places in its
@@ -503,41 +604,104 @@ impl Clip {
         self.freezes().map(|(_, freeze)| freeze.seconds).sum()
     }
 
-    /// The frames it holds, in the order they come, each where it is on the timeline.
-    pub fn holds(&self) -> Vec<Hold> {
-        let mut freezes: Vec<(usize, Freeze)> = self.freezes().map(|(effect, freeze)| (effect, *freeze)).collect();
-        freezes.sort_by(|a, b| a.1.at.total_cmp(&b.1.at).then(a.0.cmp(&b.0)));
-        let speed = self.speed();
-        let mut held = 0.0;
-        freezes
-            .into_iter()
-            .map(|(effect, freeze)| {
-                let at = clamp(freeze.at, self.source_in, self.source_out);
-                let start = self.start + (at - self.source_in) / speed + held;
-                held += freeze.seconds;
-                Hold { effect, at, span: Span { start, end: start + freeze.seconds } }
-            })
-            .collect()
+    /// Its SlowMotion effects over what it plays, with their places in its list of effects, as it
+    /// plays them: in the order they come, each cut to what it plays and to start where the one
+    /// before ends at the earliest, at a speed within the limits. A still has none.
+    fn slow_motions(&self) -> Vec<(usize, SlowMotion)> {
+        if self.still.is_some() {
+            return Vec::new();
+        }
+        let mut parts: Vec<(usize, SlowMotion)> = self
+            .effects
+            .iter()
+            .enumerate()
+            .filter_map(|(index, effect)| Some((index, *effect.as_slow_motion()?)))
+            .filter(|(_, part)| part.from.is_finite() && part.to.is_finite())
+            .collect();
+        parts.sort_by(|a, b| a.1.from.total_cmp(&b.1.from).then(a.0.cmp(&b.0)));
+        let mut after = self.source_in;
+        let mut played = Vec::new();
+        for (index, part) in parts {
+            let (from, to) = (part.from.max(after), part.to.min(self.source_out));
+            if to - from > SAME_TIME {
+                played.push((index, SlowMotion { from, to, factor: part.played() }));
+                after = to;
+            }
+        }
+        played
     }
 
-    /// Its time from its start to its end in runs, one after another: where it plays its source and
-    /// where it holds a frame.
-    pub fn runs(&self) -> Vec<Run> {
+    /// Its time from its start to its end: runs one after another, where it plays its source at one
+    /// rate or holds a frame; the frames it holds; and the parts it plays in slow motion, with the
+    /// frames held in them. A frame held where such a part starts is held before it, and one held
+    /// where it ends after it.
+    fn timing(&self) -> Timing {
         let speed = self.speed();
-        let mut runs = Vec::new();
-        let (mut t, mut source) = (self.start, self.source_in);
-        for hold in self.holds() {
-            if hold.span.start > t + SAME_TIME {
-                runs.push(Run { span: Span { start: t, end: hold.span.start }, source, rate: speed });
+        let mut freezes: Vec<(usize, Freeze)> = self.freezes().map(|(effect, freeze)| (effect, *freeze)).collect();
+        freezes.sort_by(|a, b| a.1.at.total_cmp(&b.1.at).then(a.0.cmp(&b.0)));
+        let mut freezes = freezes.into_iter().map(|(effect, freeze)| (effect, clamp(freeze.at, self.source_in, self.source_out), freeze.seconds)).peekable();
+        // The stretches of its source, each at one rate: its own, or that of a part in slow motion.
+        let mut stretches = Vec::new();
+        let mut at = self.source_in;
+        for (effect, part) in self.slow_motions() {
+            stretches.push((at, part.from, speed, None));
+            stretches.push((part.from, part.to, part.factor, Some(effect)));
+            at = part.to;
+        }
+        stretches.push((at, self.source_out.max(at), speed, None));
+        let mut timing = Timing { t: self.start, ..Timing::default() };
+        for (from, to, rate, part) in stretches {
+            while let Some((effect, held, seconds)) = freezes.next_if(|&(_, held, _)| held <= from + SAME_TIME) {
+                timing.hold(effect, held, seconds);
             }
-            runs.push(Run { span: hold.span, source: hold.at, rate: 0.0 });
-            (t, source) = (hold.span.end, hold.at);
+            let (start, mut at) = (timing.t, from);
+            while let Some((effect, held, seconds)) = freezes.next_if(|&(_, held, _)| held < to - SAME_TIME) {
+                timing.play(at, held, rate);
+                timing.hold(effect, held, seconds);
+                at = held;
+            }
+            timing.play(at, to, rate);
+            if let Some(effect) = part {
+                timing.slowed.push(Slowed { effect, from, to, rate, span: Span { start, end: timing.t } });
+            }
         }
-        let end = self.end();
-        if end > t + SAME_TIME || runs.is_empty() {
-            runs.push(Run { span: Span { start: t, end }, source, rate: speed });
+        for (effect, held, seconds) in freezes {
+            timing.hold(effect, held, seconds);
         }
-        runs
+        // What plays last ends where the clip does, however the times were rounded on the way.
+        let (end, walked) = (self.end(), timing.t);
+        match timing.runs.last_mut() {
+            Some(last) if !last.is_held() => last.span.end = end,
+            Some(_) => {}
+            None => timing.runs.push(Run { span: Span { start: self.start, end }, source: self.source_in, rate: speed }),
+        }
+        if let Some(part) = timing.slowed.last_mut().filter(|part| part.span.end == walked && timing.runs.last().is_some_and(|last| !last.is_held())) {
+            part.span.end = end;
+        }
+        timing
+    }
+
+    /// The frames it holds, in the order they come, each where it is on the timeline.
+    pub fn holds(&self) -> Vec<Hold> {
+        if self.plain() {
+            return Vec::new();
+        }
+        self.timing().holds
+    }
+
+    /// The parts of its source it plays in slow motion, in the order they come, each where it is on
+    /// the timeline.
+    pub fn slowed(&self) -> Vec<Slowed> {
+        if self.plain() {
+            return Vec::new();
+        }
+        self.timing().slowed
+    }
+
+    /// Its time from its start to its end in runs, one after another: where it plays its source at
+    /// one rate, and where it holds a frame.
+    pub fn runs(&self) -> Vec<Run> {
+        self.timing().runs
     }
 
     /// The frame it holds at timeline time `t`, if it holds one then.
@@ -545,29 +709,35 @@ impl Clip {
         self.holds().into_iter().find(|hold| hold.span.contains(t))
     }
 
-    /// Where the whole source would be if it were not trimmed. A still is all there is of itself.
+    /// The part it plays in slow motion at timeline time `t`, if it plays one then.
+    pub fn slowed_at(&self, t: f64) -> Option<Slowed> {
+        self.slowed().into_iter().find(|part| part.span.contains(t))
+    }
+
+    /// Where the whole source would be if it were not trimmed: what is trimmed off at the clip's
+    /// speed. A still is all there is of itself.
     pub fn source_span(&self) -> Span {
         if self.still.is_some() {
             return self.span();
         }
+        let speed = self.speed();
+        // Its parts in slow motion and the frames it holds make it this much longer.
+        let longer = self.played() - (self.source_out - self.source_in) / speed + self.held();
         let offset = self.offset();
-        Span { start: offset, end: offset + self.source_duration / self.speed() + self.held() }
+        Span { start: offset, end: offset + self.source_duration / speed + longer }
     }
 
-    /// Source time at timeline time `t`, also outside the trimmed part: while a frame is held, the
-    /// moment of that frame. A still's own time.
+    /// Source time at timeline time `t`, also outside the trimmed part, as if it played on at its
+    /// speed: while a frame is held, the moment of that frame. A still's own time.
     pub fn source_time(&self, t: f64) -> f64 {
-        let (mut time, mut source) = (self.start, self.source_in);
-        for hold in self.holds() {
-            if t < hold.span.start {
-                break;
-            }
-            if t < hold.span.end {
-                return hold.at;
-            }
-            (time, source) = (hold.span.end, hold.at);
+        let speed = self.speed();
+        if t < self.start || self.plain() {
+            return self.source_in + (t - self.start) * speed;
         }
-        source + (t - time) * self.speed()
+        match self.runs().iter().find(|run| t < run.span.end) {
+            Some(run) => run.source_time(t),
+            None => self.source_out + (t - self.end()) * speed,
+        }
     }
 
     /// The source time of the frame seen at timeline time `t`: a still shows the same one all along.
@@ -578,22 +748,64 @@ impl Clip {
     /// Timeline time at which the source is at `source` seconds: the other way round from
     /// `source_time`. A frame held is first seen where it starts to be held.
     pub fn time_of(&self, source: f64) -> f64 {
-        let (mut time, mut from) = (self.start, self.source_in);
-        for hold in self.holds() {
-            if source <= hold.at + SAME_TIME {
-                break;
-            }
-            (time, from) = (hold.span.end, hold.at);
+        let speed = self.speed();
+        if source < self.source_in || self.plain() {
+            return self.start + (source - self.source_in) / speed;
         }
-        time + (source - from) / self.speed()
+        for run in self.runs() {
+            if run.is_held() {
+                if source <= run.source + SAME_TIME {
+                    return run.span.start;
+                }
+            } else if source <= run.source_time(run.span.end) + SAME_TIME {
+                return run.span.start + (source - run.source) / run.rate;
+            }
+        }
+        self.end() + (source - self.source_out) / speed
     }
 
     /// The moment of its source that its Freeze `effect` would hold to be held from timeline time
-    /// `t` on: what it shows at `t` without that hold.
+    /// `t` on, or where its slow motion `effect` would start to start then: what it shows at `t`
+    /// without that effect.
     pub fn moment_without(&self, effect: usize, t: f64) -> f64 {
         let mut without = self.clone();
         without.remove_effects(&[effect]);
         without.source_time(t).clamp(self.source_in.min(self.source_out), self.source_out)
+    }
+
+    /// The moment of its source where its slow motion `effect` would end to end at timeline time
+    /// `t`, as fast as it goes: after where it starts, and no further than the next part in slow
+    /// motion or the end of what the clip plays.
+    pub fn slow_motion_end_at(&self, effect: usize, t: f64) -> f64 {
+        let slowed = self.slowed();
+        let Some(part) = slowed.iter().find(|part| part.effect == effect) else {
+            return self.source_out;
+        };
+        let limit = slowed.iter().map(|other| other.from).filter(|&from| from >= part.to - SAME_TIME).fold(self.source_out, f64::min);
+        let mut longest = self.clone();
+        if let Some(Effect::SlowMotion(slow)) = longest.effects.get_mut(effect) {
+            (slow.from, slow.to) = (part.from, limit);
+        }
+        longest.source_time(t).clamp(part.from, limit.max(part.from))
+    }
+
+    /// Its part in slow motion from the moment `from` of its source to `to`, by its place in its
+    /// list of effects, if it plays that part so.
+    fn slow_motion_over(&self, from: f64, to: f64) -> Option<usize> {
+        let same = |part: &SlowMotion| (part.from - from).abs() < SAME_TIME && (part.to - to).abs() < SAME_TIME;
+        self.slow_motions().into_iter().find(|(_, part)| same(part)).map(|(effect, _)| effect)
+    }
+
+    /// Keeps the parts it plays in slow motion within the moments `from` to `to` of its source: one
+    /// that reaches out of them is cut to them, and one that is not in them goes.
+    fn keep_slow_motions(&mut self, from: f64, to: f64) {
+        self.effects.retain_mut(|effect| match effect {
+            Effect::SlowMotion(part) => {
+                (part.from, part.to) = (part.from.max(from), part.to.min(to));
+                part.from.is_finite() && part.to.is_finite() && part.to - part.from > SAME_TIME
+            }
+            _ => true,
+        });
     }
 
     /// Holds the frame at the moment `at` of its source `seconds` longer: one it holds already, or a
@@ -774,7 +986,8 @@ impl Clip {
     }
 
     /// Moves the start edge to `t`, not before `lo`; the picture stays where it is on the timeline.
-    /// A frame held before `t` goes, and one held through it is held from `t` on. A still has no
+    /// A frame held before `t` goes, and one held through it is held from `t` on; so with a part in
+    /// slow motion. Trimmed back out, it plays more of its source at its speed. A still has no
     /// source to run out of: only `lo` stops it.
     fn trim_start(&mut self, t: f64, lo: f64, min_len: f64) {
         if self.still.is_some() {
@@ -789,6 +1002,7 @@ impl Clip {
             } else {
                 let source_in = self.source_time(start);
                 self.cut_holds_before(start);
+                self.keep_slow_motions(source_in, self.source_out);
                 self.source_in = source_in;
             }
             self.start = start;
@@ -797,7 +1011,7 @@ impl Clip {
     }
 
     /// Moves the end edge to `t`, not after `hi`. A frame held after `t` goes, and one held through it
-    /// is held up to `t`. A still goes as far as `hi`.
+    /// is held up to `t`; so with a part in slow motion. A still goes as far as `hi`.
     fn trim_end(&mut self, t: f64, hi: f64, min_len: f64) {
         if self.still.is_some() {
             let end = clamp(t, self.start + min_len, hi);
@@ -812,6 +1026,7 @@ impl Clip {
             } else {
                 let source_out = self.source_time(end);
                 self.cut_holds_after(end);
+                self.keep_slow_motions(self.source_in, source_out);
                 self.source_out = source_out;
             }
         }
@@ -1203,11 +1418,12 @@ impl Sequence {
         if part.start < 0.0 || part.len() < SAME_TIME || part.end > clip.source_duration + SAME_TIME {
             return false;
         }
-        // The frames it holds stay held, those in the new part.
+        // The frames it holds stay held, those in the new part, and what of its slow motion is in it.
         let mut changed = clip.clone();
         changed.source_in = part.start;
         changed.source_out = part.end.min(clip.source_duration);
         changed.effects.retain(|effect| effect.as_freeze().is_none_or(|freeze| freeze.at >= part.start - SAME_TIME && freeze.at <= part.end + SAME_TIME));
+        changed.keep_slow_motions(changed.source_in, changed.source_out);
         changed.fit_fades();
         let delta = changed.span().len() - clip.span().len();
         let fit = self.export_fits();
@@ -1468,6 +1684,142 @@ impl Sequence {
         true
     }
 
+    /// Plays the part of its source clip `id` shows from `t` on in slow motion: `seconds` of it,
+    /// `factor` times as fast, whatever the speed of the rest of the clip; as much of it as there is
+    /// before the end of what the clip plays, or the next part it plays in slow motion. The other
+    /// clips chained to it that show that moment at the same time, like the sound detached from it,
+    /// play it so too, the sound at its pitch. They get longer or shorter, the clips after them on
+    /// their tracks move along, each with the clips chained to it, and so do the clips chained to
+    /// them from that moment on: see `ripple`. False, with nothing changed, if the clip is a still,
+    /// is not there at `t`, plays that moment in slow motion already or ends there, or what has to
+    /// move can't go that far.
+    pub fn slow_motion(&mut self, id: ClipId, t: f64, seconds: f64, factor: f64) -> bool {
+        if !(self.has(id) && seconds.is_finite() && seconds > 0.0) {
+            return false;
+        }
+        let clip = self.clip(id);
+        if clip.still.is_some() || !clip.span().contains(t) {
+            return false;
+        }
+        let from = clip.source_time(t);
+        let members: Vec<ClipId> = std::iter::once(id).chain(self.partners(id, from)).collect();
+        let mut to = from + seconds;
+        for &member in &members {
+            let clip = self.clip(member);
+            let slowed = clip.slowed();
+            if slowed.iter().any(|part| from > part.from - SAME_TIME && from < part.to - SAME_TIME) {
+                return false;
+            }
+            to = slowed.iter().map(|part| part.from).filter(|&start| start > from).fold(to.min(clip.source_out), f64::min);
+        }
+        if to - from <= SAME_TIME {
+            return false;
+        }
+        let factor = playable(factor);
+        let starts = self.clip(id).time_of(from);
+        let changed = members
+            .into_iter()
+            .map(|member| {
+                let mut clip = self.clip(member).clone();
+                clip.effects.push(Effect::SlowMotion(SlowMotion { from, to, factor }));
+                (member, clip)
+            })
+            .collect();
+        self.ripple(changed, starts)
+    }
+
+    /// Clip `id` and its partners that play the part its slow motion `effect` plays in slow motion
+    /// too, each changed by `change` with the place of that part in its list of effects; and where
+    /// the part is. None if it has no such part.
+    fn changed_slow_motions(&self, id: ClipId, effect: usize, change: impl Fn(&mut Clip, usize)) -> Option<(Vec<(ClipId, Clip)>, Slowed)> {
+        if !self.has(id) {
+            return None;
+        }
+        let part = self.clip(id).slowed().into_iter().find(|part| part.effect == effect)?;
+        let mut changed = Vec::new();
+        for member in std::iter::once(id).chain(self.partners(id, part.from)) {
+            let mut clip = self.clip(member).clone();
+            let own = if member == id { Some(effect) } else { clip.slow_motion_over(part.from, part.to) };
+            let Some(own) = own else { continue };
+            change(&mut clip, own);
+            changed.push((member, clip));
+        }
+        Some((changed, part))
+    }
+
+    /// Makes clip `id`'s slow motion `effect` go `factor` times as fast, and the same part of its
+    /// partners: see `slow_motion`. False, with nothing changed, if it has no such part, or what has
+    /// to move can't go that far.
+    pub fn set_slow_motion_speed(&mut self, id: ClipId, effect: usize, factor: f64) -> bool {
+        let factor = playable(factor);
+        let faster = |clip: &mut Clip, own: usize| {
+            if let Effect::SlowMotion(part) = &mut clip.effects[own] {
+                part.factor = factor;
+            }
+        };
+        let Some((changed, part)) = self.changed_slow_motions(id, effect, faster) else {
+            return false;
+        };
+        self.ripple(changed, part.span.end)
+    }
+
+    /// Makes clip `id`'s slow motion `effect` play the moments `from` to `to` of its source instead,
+    /// as fast as before, and the same part of its partners: within what all of them play, and
+    /// between their parts in slow motion before and after it. They get as much longer or shorter
+    /// as that takes, see `slow_motion`. False, with nothing changed, if it has no such part, nothing
+    /// is left of it, or what has to move can't go that far.
+    pub fn move_slow_motion(&mut self, id: ClipId, effect: usize, from: f64, to: f64) -> bool {
+        if !self.has(id) {
+            return false;
+        }
+        let Some(part) = self.clip(id).slowed().into_iter().find(|part| part.effect == effect) else {
+            return false;
+        };
+        let (mut lo, mut hi) = (f64::NEG_INFINITY, f64::INFINITY);
+        for member in std::iter::once(id).chain(self.partners(id, part.from)) {
+            let clip = self.clip(member);
+            if member != id && clip.slow_motion_over(part.from, part.to).is_none() {
+                continue;
+            }
+            (lo, hi) = (lo.max(clip.source_in), hi.min(clip.source_out));
+            for other in clip.slowed().into_iter().filter(|other| (other.from - part.from).abs() >= SAME_TIME) {
+                if other.to <= part.from + SAME_TIME {
+                    lo = lo.max(other.to);
+                } else {
+                    hi = hi.min(other.from);
+                }
+            }
+        }
+        let (from, to) = (clamp(from, lo, hi), clamp(to, lo, hi));
+        if to - from <= SAME_TIME {
+            return false;
+        }
+        let moved = |clip: &mut Clip, own: usize| {
+            if let Effect::SlowMotion(slow) = &mut clip.effects[own] {
+                (slow.from, slow.to) = (from, to);
+            }
+        };
+        let Some((changed, part)) = self.changed_slow_motions(id, effect, moved) else {
+            return false;
+        };
+        self.ripple(changed, part.span.end)
+    }
+
+    /// Takes clip `id`'s slow motion `effect` off, and the same part of its partners: they play it at
+    /// their speed again, see `slow_motion`. False, with nothing changed, if it has no such part, or
+    /// what has to move can't go that far.
+    pub fn remove_slow_motion(&mut self, id: ClipId, effect: usize) -> bool {
+        match self.changed_slow_motions(id, effect, |clip, own| clip.remove_effects(&[own])) {
+            Some((changed, part)) => self.ripple(changed, part.span.end),
+            // One that plays nothing just goes.
+            None if self.has(id) && self.clip(id).effects.get(effect).is_some_and(|effect| effect.as_slow_motion().is_some()) => {
+                self.clip_mut(id).remove_effects(&[effect]);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Removes a clip. Its track stays, even when it is left empty.
     pub fn remove_clip(&mut self, id: ClipId) {
         let fitted = self.export_fits();
@@ -1625,9 +1977,9 @@ impl Sequence {
 
     /// Makes the sound of a clip on a video track a clip of its own, on an audio track right under
     /// it: the one there if it is free at that time, else a new one. The two are chained. The sound's
-    /// part of the fades goes with the sound; the colour stays with the picture; both keep the speed
-    /// and the frames held, so that they stay together. Returns where the picture and the sound are
-    /// now, or None if the clip has no sound of its own to detach, like a still.
+    /// part of the fades goes with the sound; the colour stays with the picture; both keep the speed,
+    /// the frames held and the slow motion, so that they stay together. Returns where the picture and
+    /// the sound are now, or None if the clip has no sound of its own to detach, like a still.
     pub fn detach_sound(&mut self, id: ClipId) -> Option<(ClipId, ClipId)> {
         if self.tracks[id.track].kind != TrackKind::Video || self.clip(id).sound_detached || self.clip(id).still.is_some() {
             return None;
@@ -1647,6 +1999,7 @@ impl Sequence {
                 Effect::Speed(speed) => Some(Effect::Speed(*speed)),
                 // Silent while the picture holds a frame.
                 Effect::Freeze(freeze) => Some(Effect::Freeze(*freeze)),
+                Effect::SlowMotion(part) => Some(Effect::SlowMotion(*part)),
                 _ => None,
             })
             .collect();
@@ -1760,8 +2113,9 @@ impl Sequence {
 
     /// Cuts a clip in two at `t`. It keeps what is before the cut; a new clip right after it plays
     /// the rest, with the same framing and sound. A frame held through the cut is held in both, each
-    /// for its part of the time. From then on they are two clips like any others. None if `t` is
-    /// closer than `min_len` to an edge. Returns the part after the cut.
+    /// for its part of the time, and a part in slow motion through it is played so in both, each its
+    /// part. From then on they are two clips like any others. None if `t` is closer than `min_len` to
+    /// an edge. Returns the part after the cut.
     pub fn split(&mut self, id: ClipId, t: f64, min_len: f64) -> Option<ClipId> {
         let clip = self.clip(id);
         if t - clip.start < min_len - SAME_TIME || clip.end() - t < min_len - SAME_TIME {
@@ -1772,12 +2126,14 @@ impl Sequence {
         // Both keep the colour.
         let mut after = clip.clone();
         after.cut_holds_before(t);
+        after.keep_slow_motions(cut, after.source_out);
         (after.start, after.source_in) = (t, cut);
         after.settle_still();
         after.effects.retain(|effect| !effect.is_fade_at(Edge::In));
         after.fit_fades();
         let before = self.clip_mut(id);
         before.cut_holds_after(t);
+        before.keep_slow_motions(before.source_in, cut);
         before.source_out = cut;
         before.effects.retain(|effect| !effect.is_fade_at(Edge::Out));
         before.fit_fades();
@@ -3166,6 +3522,209 @@ mod tests {
         let text = serde_json::to_string(&clip.effects).unwrap();
         assert_eq!(text, r#"[{"kind":"Freeze","at":4.5,"seconds":2.0}]"#);
         assert_eq!(serde_json::from_str::<Vec<Effect>>(&text).unwrap(), clip.effects);
+    }
+
+    /// The parts a clip plays in slow motion: where in its source, how fast, where on the timeline.
+    fn slowed_parts(clip: &Clip) -> Vec<(f64, f64, f64, Span)> {
+        clip.slowed().iter().map(|part| (part.from, part.to, part.rate, part.span)).collect()
+    }
+
+    #[test]
+    fn a_slow_motion_plays_its_part_at_its_own_speed_and_what_comes_after_moves_later() {
+        // a 0..10, b 10..14 and c 14..20 on one track; another track's clip stays where it is.
+        let mut sequence = three_in_a_row();
+        sequence.tracks.push(track_of(vec![Clip { start: 12.0, ..Clip::of(3, "d".into(), 2.0) }]));
+        let a = ClipId { track: 0, index: 0 };
+        sequence.clip_mut(a).add_fade(Edge::Out);
+        // A second of its source from 4 s, half as fast: two on the timeline.
+        assert!(sequence.slow_motion(a, 4.0, SLOW_MOTION_SECONDS, SLOW_MOTION_FACTOR));
+        assert_eq!(names_and_starts(&sequence, 0), [("a", 0.0), ("b", 11.0), ("c", 15.0)], "one clip, 1 s longer");
+        let clip = sequence.clip(a);
+        assert_eq!((clip.span(), clip.source_in, clip.source_out), (span(0.0, 11.0), 0.0, 10.0));
+        assert_eq!(slowed_parts(clip), [(4.0, 5.0, 0.5, span(4.0, 6.0))]);
+        let runs: Vec<(Span, f64, f64)> = clip.runs().iter().map(|run| (run.span, run.source, run.rate)).collect();
+        assert_eq!(runs, [(span(0.0, 4.0), 0.0, 1.0), (span(4.0, 6.0), 4.0, 0.5), (span(6.0, 11.0), 5.0, 1.0)]);
+        assert_eq!([3.0, 5.0, 6.0, 8.0, 11.0].map(|t| clip.source_time(t)), [3.0, 4.5, 5.0, 7.0, 10.0]);
+        assert_eq!([4.5, 5.0, 7.0].map(|source| clip.time_of(source)), [5.0, 6.0, 8.0]);
+        assert_eq!(clip.slowed_at(5.0).map(|part| part.effect), Some(1));
+        assert_eq!(clip.slowed_at(6.5), None);
+        assert_eq!(clip.source_span(), span(0.0, 31.0), "its whole source, with the part in slow motion");
+        assert_eq!(clip.fade_lengths(), (0.0, 1.0));
+        assert_eq!(sequence.tracks[1].clips[0].start, 12.0, "other tracks stay");
+        assert_eq!(sequence.export, span(0.0, 21.0), "a fitted export range goes on fitting");
+
+        // A frame held in it: the part is that much longer.
+        assert!(sequence.freeze(a, 5.0, FREEZE_LENGTH));
+        let clip = sequence.clip(a);
+        assert_eq!(slowed_parts(clip), [(4.0, 5.0, 0.5, span(4.0, 8.0))]);
+        assert_eq!(hold_spans(clip), [span(5.0, 7.0)]);
+        assert_eq!([4.5, 6.0, 7.5, 9.0].map(|t| clip.source_time(t)), [4.25, 4.5, 4.75, 6.0]);
+        // Slower: the part is longer, and what comes after it moves later.
+        let effect = clip.slowed()[0].effect;
+        assert!(sequence.set_slow_motion_speed(a, effect, 0.25));
+        assert_eq!(slowed_parts(sequence.clip(a)), [(4.0, 5.0, 0.25, span(4.0, 10.0))]);
+        assert_eq!(names_and_starts(&sequence, 0), [("a", 0.0), ("b", 15.0), ("c", 19.0)]);
+        // Other moments, 3 s to 5 s of its source, as slow.
+        assert!(sequence.move_slow_motion(a, effect, 3.0, 5.0));
+        let clip = sequence.clip(a);
+        assert_eq!((clip.span(), slowed_parts(clip)), (span(0.0, 18.0), vec![(3.0, 5.0, 0.25, span(3.0, 13.0))]));
+        assert_eq!(names_and_starts(&sequence, 0), [("a", 0.0), ("b", 18.0), ("c", 22.0)]);
+        // No further than what it plays.
+        assert!(sequence.move_slow_motion(a, effect, -5.0, 40.0));
+        assert_eq!((sequence.clip(a).span(), slowed_parts(sequence.clip(a))), (span(0.0, 42.0), vec![(0.0, 10.0, 0.25, span(0.0, 42.0))]));
+        // Off: as it was, with the frame held.
+        assert!(sequence.remove_slow_motion(a, effect));
+        assert_eq!(names_and_starts(&sequence, 0), [("a", 0.0), ("b", 12.0), ("c", 16.0)]);
+        assert_eq!((slowed_parts(sequence.clip(a)), hold_spans(sequence.clip(a))), (vec![], vec![span(4.5, 6.5)]));
+
+        // A clip twice as fast: the part in slow motion goes at its own speed all the same, and the
+        // clip's speed changes the rest only.
+        let mut fast = three_in_a_row();
+        assert!(fast.set_speed(a, 2.0));
+        assert!(fast.slow_motion(a, 1.0, SLOW_MOTION_SECONDS, SLOW_MOTION_FACTOR));
+        assert_eq!((fast.clip(a).span(), slowed_parts(fast.clip(a))), (span(0.0, 6.5), vec![(2.0, 3.0, 0.5, span(1.0, 3.0))]));
+        assert!(fast.set_speed(a, 1.0));
+        assert_eq!((fast.clip(a).span(), slowed_parts(fast.clip(a))), (span(0.0, 11.0), vec![(2.0, 3.0, 0.5, span(2.0, 4.0))]));
+
+        // As far as what it plays goes, and up to the next part in slow motion.
+        let mut ends = three_in_a_row();
+        assert!(ends.slow_motion(a, 9.5, SLOW_MOTION_SECONDS, SLOW_MOTION_FACTOR));
+        assert_eq!(slowed_parts(ends.clip(a)), [(9.5, 10.0, 0.5, span(9.5, 10.5))]);
+        assert!(ends.slow_motion(a, 9.0, SLOW_MOTION_SECONDS, SLOW_MOTION_FACTOR));
+        assert_eq!(slowed_parts(ends.clip(a)), [(9.0, 9.5, 0.5, span(9.0, 10.0)), (9.5, 10.0, 0.5, span(10.0, 11.0))]);
+        // Where it plays in slow motion already, past its end, of a still: nothing changes.
+        let before = ends.clone();
+        assert!(!ends.slow_motion(a, 9.6, SLOW_MOTION_SECONDS, SLOW_MOTION_FACTOR), "in one already");
+        assert!(!ends.slow_motion(a, 11.5, SLOW_MOTION_SECONDS, SLOW_MOTION_FACTOR), "not there then");
+        assert!(!ends.slow_motion(a, 2.0, 0.0, SLOW_MOTION_FACTOR), "no length");
+        assert!(!ends.set_slow_motion_speed(a, 5, 2.0), "it has no such part");
+        assert!(!ends.move_slow_motion(a, 5, 1.0, 2.0));
+        assert!(!ends.remove_slow_motion(a, 5));
+        assert_eq!(ends, before);
+        let logo = ends.paste(Clip::image(1, "logo".into()), 30.0, Some(0), TrackKind::Video);
+        let with_logo = ends.clone();
+        assert!(!ends.slow_motion(logo, 31.0, SLOW_MOTION_SECONDS, SLOW_MOTION_FACTOR), "a still shows one frame however fast");
+        assert_eq!(ends, with_logo);
+    }
+
+    #[test]
+    fn a_slow_motion_is_saved_as_an_effect_and_played_as_it_can_be() {
+        let effect = Effect::SlowMotion(SlowMotion { from: 4.0, to: 5.0, factor: 0.5 });
+        let text = serde_json::to_string(&effect).unwrap();
+        assert_eq!(text, r#"{"kind":"SlowMotion","from":4.0,"to":5.0,"factor":0.5}"#);
+        assert_eq!(serde_json::from_str::<Effect>(&text).unwrap(), effect);
+        // Parts that reach out of what it plays, overlap or have no speed, as a file may have them:
+        // within what it plays, one after another, ×1 for no speed; one with no moments, none.
+        let mut clip = Clip { source_out: 10.0, ..Clip::new("a".into(), 30.0) };
+        clip.effects = [(8.0, 40.0, 0.0), (2.0, 4.0, 0.5), (3.0, 6.0, 2.0), (f64::NAN, 1.0, 0.5)]
+            .into_iter()
+            .map(|(from, to, factor)| Effect::SlowMotion(SlowMotion { from, to, factor }))
+            .collect();
+        let parts: Vec<(f64, f64, f64)> = slowed_parts(&clip).into_iter().map(|(from, to, rate, _)| (from, to, rate)).collect();
+        assert_eq!(parts, [(2.0, 4.0, 0.5), (4.0, 6.0, 2.0), (8.0, 10.0, 1.0)]);
+        assert_eq!(clip.span(), span(0.0, 11.0));
+    }
+
+    #[test]
+    fn trimming_and_cutting_a_clip_take_its_slow_motion_with_the_time() {
+        // A 30 s source, 0..10 of it from 0, 4..5 s of it in slow motion at ×0.5: 0..11.
+        let slowed = || {
+            let mut sequence = Sequence::new(Clip { source_out: 10.0, ..Clip::new("a".into(), 30.0) });
+            assert!(sequence.slow_motion(ClipId { track: 0, index: 0 }, 4.0, SLOW_MOTION_SECONDS, SLOW_MOTION_FACTOR));
+            sequence
+        };
+        let a = ClipId { track: 0, index: 0 };
+        // The start into it: the rest of it is slow, the picture stays where it was.
+        let mut sequence = slowed();
+        sequence.trim_start(a, 5.0, MIN);
+        let clip = sequence.clip(a);
+        assert_eq!((clip.span(), clip.source_in, slowed_parts(clip)), (span(5.0, 11.0), 4.5, vec![(4.5, 5.0, 0.5, span(5.0, 6.0))]));
+        assert_eq!(clip.source_time(5.5), 4.75);
+        // Past it: it goes.
+        sequence.trim_start(a, 7.0, MIN);
+        let clip = sequence.clip(a);
+        assert_eq!((clip.span(), clip.source_in, clip.effects.len()), (span(7.0, 11.0), 6.0, 0));
+        // Back out: what comes back plays at the clip's speed.
+        sequence.trim_start(a, 2.0, MIN);
+        assert_eq!((sequence.clip(a).span(), sequence.clip(a).source_in), (span(2.0, 11.0), 1.0));
+
+        // The end into it, past it, and out again.
+        let mut sequence = slowed();
+        sequence.trim_end(a, 5.0, MIN);
+        let clip = sequence.clip(a);
+        assert_eq!((clip.span(), clip.source_out, slowed_parts(clip)), (span(0.0, 5.0), 4.5, vec![(4.0, 4.5, 0.5, span(4.0, 5.0))]));
+        sequence.trim_end(a, 3.0, MIN);
+        let clip = sequence.clip(a);
+        assert_eq!((clip.span(), clip.source_out, clip.effects.len()), (span(0.0, 3.0), 3.0, 0));
+        sequence.trim_end(a, 6.0, MIN);
+        assert_eq!((sequence.clip(a).span(), sequence.clip(a).source_out), (span(0.0, 6.0), 6.0));
+
+        // A cut in it: each part plays its part of it in slow motion.
+        let mut sequence = slowed();
+        let after = sequence.split(a, 5.0, MIN).unwrap();
+        let (first, second) = (sequence.clip(a), sequence.clip(after));
+        assert_eq!((first.span(), first.source_out, slowed_parts(first)), (span(0.0, 5.0), 4.5, vec![(4.0, 4.5, 0.5, span(4.0, 5.0))]));
+        assert_eq!((second.span(), second.source_in, slowed_parts(second)), (span(5.0, 11.0), 4.5, vec![(4.5, 5.0, 0.5, span(5.0, 6.0))]));
+        assert_eq!((second.source_time(5.5), second.source_time(7.0)), (4.75, 6.0));
+        // A cut after it or before it: it goes with the part it is in.
+        for (t, first_parts, second_parts) in [(8.0, 1, 0), (3.0, 0, 1)] {
+            let mut sequence = slowed();
+            let after = sequence.split(a, t, MIN).unwrap();
+            assert_eq!((sequence.clip(a).slowed().len(), sequence.clip(after).slowed().len()), (first_parts, second_parts), "a cut at {t}");
+            assert_eq!(sequence.clip(after).span(), span(t, 11.0));
+        }
+
+        // Another part of its source: what of it is in the new part stays slow.
+        let mut sequence = slowed();
+        assert!(sequence.ripple_retime(a, span(4.5, 8.0)));
+        assert_eq!((sequence.clip(a).span(), slowed_parts(sequence.clip(a))), (span(0.0, 4.0), vec![(4.5, 5.0, 0.5, span(0.0, 1.0))]));
+        assert!(sequence.ripple_retime(a, span(6.0, 8.0)));
+        assert_eq!((sequence.clip(a).span(), sequence.clip(a).effects.len()), (span(0.0, 2.0), 0));
+        // Its file turned out shorter: what is left of it.
+        let mut sequence = slowed();
+        sequence.refit_source(0, 4.5);
+        assert_eq!(slowed_parts(sequence.clip(a)), [(4.0, 4.5, 0.5, span(4.0, 5.0))]);
+    }
+
+    #[test]
+    fn the_sound_detached_from_a_clip_plays_its_slow_motion_with_it() {
+        // The picture 10..20 on the video track, its sound 10..20 on the audio track under it, both
+        // from 2 s of their source.
+        let (mut sequence, picture, sound) = detached();
+        assert!(sequence.slow_motion(picture, 14.0, SLOW_MOTION_SECONDS, SLOW_MOTION_FACTOR));
+        for id in [picture, sound] {
+            let clip = sequence.clip(id);
+            assert_eq!((clip.span(), slowed_parts(clip)), (span(10.0, 21.0), vec![(6.0, 7.0, 0.5, span(14.0, 16.0))]));
+        }
+        // Slower from either of them, other moments, off: both alike.
+        let effect = sequence.clip(sound).slowed()[0].effect;
+        assert!(sequence.set_slow_motion_speed(sound, effect, 0.25));
+        assert_eq!((sequence.clip(picture).span(), sequence.clip(sound).span()), (span(10.0, 23.0), span(10.0, 23.0)));
+        let effect = sequence.clip(picture).slowed()[0].effect;
+        assert!(sequence.move_slow_motion(picture, effect, 5.0, 6.0));
+        assert_eq!(slowed_parts(sequence.clip(sound)), [(5.0, 6.0, 0.25, span(13.0, 17.0))]);
+        assert!(sequence.remove_slow_motion(picture, effect));
+        assert_eq!((sequence.clip(picture).span(), sequence.clip(sound).span()), (span(10.0, 20.0), span(10.0, 20.0)));
+        assert!(sequence.clip(sound).effects.iter().all(|effect| effect.as_slow_motion().is_none()));
+
+        // Detached after: the sound plays it so too.
+        let mut clip = placed_clip();
+        clip.effects.push(Effect::SlowMotion(SlowMotion { from: 6.0, to: 7.0, factor: 0.5 }));
+        let mut sequence = Sequence::new(clip);
+        let (picture, sound) = sequence.detach_sound(ClipId { track: 0, index: 0 }).unwrap();
+        assert_eq!(slowed_parts(sequence.clip(sound)), slowed_parts(sequence.clip(picture)));
+        assert_eq!(sequence.clip(sound).span(), span(10.0, 21.0));
+
+        // Something in the way of what has to move: nothing changes.
+        let (mut blocked, picture, sound) = detached();
+        let music = blocked.place_clip(Some(sound.track), Clip { start: 21.0, ..Clip::of(2, "music".into(), 3.0) }).unwrap();
+        let wall = blocked.add_track(blocked.tracks.len(), TrackKind::Video);
+        let tied = blocked.place_clip(Some(wall), Clip { start: 30.0, ..Clip::of(3, "tied".into(), 1.0) }).unwrap();
+        blocked.place_clip(Some(wall), Clip { start: 31.0, ..Clip::of(3, "wall".into(), 1.0) }).unwrap();
+        blocked.chain(tied, music);
+        let before = blocked.clone();
+        assert!(!blocked.slow_motion(picture, 14.0, SLOW_MOTION_SECONDS, SLOW_MOTION_FACTOR));
+        assert_eq!(blocked, before);
     }
 
     #[test]

@@ -73,6 +73,12 @@ Step by step, with pictures: [Working with sound](#working-with-sound).
   tinted blue, with a snowflake. The clips after it on its track move later, and so does the sound
   detached from it. The dots on the bottom edge of the selected clip drag it: the left ones to
   another frame, the right ones longer or shorter. The Clip panel has both too.
+- **Slow motion** (S, or the clip's menu): a second of the recording from the playhead plays half
+  as fast, its sound at its pitch, and the clip stays one. The part is tinted pink, with a gauge and
+  its speed. The dots on the bottom edge of the selected clip move where it starts and ends in the
+  recording; the Clip panel has that and how fast, from ×0.25 to ×16, whatever the speed of the
+  rest of the clip. The clips after it on its track move along, and the sound detached from it
+  plays it the same.
 - What the Output panel shows is what the file gets: the same formulas run in the preview and
   in the export.
 
@@ -147,6 +153,7 @@ Press **F1** in the editor for the list of keys.
 | [ / ] | Trim the selected clip's start / end to the playhead |
 | Ctrl+B | Cut the selected clip at the playhead |
 | F | Freeze frame: hold the frame at the playhead for 2 s |
+| S | Slow motion: play a second of the recording from the playhead half as fast |
 | Ctrl+D | Duplicate the selected clip, right after it |
 | Ctrl+C / Ctrl+V | Copy the selected clip / paste it at the playhead |
 | Delete | Delete the selected clip |
@@ -165,7 +172,7 @@ Press **F1** in the editor for the list of keys.
 | Drag a clip | Moves it, also onto another track of its kind; chained clips go along |
 | Drag an edge of the selected clip | Trims it |
 | Drag the dots on the top edge of the selected clip | Changes the length of its fade |
-| Drag the dots on the bottom edge of the selected clip | Holds another frame (left) or holds it longer or shorter (right) |
+| Drag the dots on the bottom edge of the selected clip | Holds another frame (left) or holds it longer or shorter (right); moves where a part in slow motion starts (left) or ends (right) |
 | Right click on a clip | Its menu |
 | Double click on a clip | Unfolds or folds its track |
 | Drag with the right or middle button | Moves along the time, and the tracks up and down |
