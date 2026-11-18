@@ -7,6 +7,7 @@ pub mod lock;
 pub mod plugins;
 pub mod preset;
 pub mod project;
+pub mod selection;
 pub mod settings;
 pub mod tools;
 pub mod workspace;

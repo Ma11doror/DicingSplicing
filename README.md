@@ -35,6 +35,10 @@ yt-dlp come along in the same folder.
 - Move clips along and between tracks, trim them by their edges, cut them with the Blade or at the
   playhead, duplicate, copy and paste, delete with or without closing the gap. Undo and redo
   everything.
+- Select several clips as in a file manager: Ctrl+click adds one or takes it out, Shift+click takes
+  the ones from the clip clicked last to this one, Ctrl+A all of them. Dragged, they move together;
+  Delete, Ctrl+D, Ctrl+C and Ctrl+V take all of them, as far apart as they are and on their tracks;
+  what is set in the Clip panel, or in Output, goes to all of them.
 - Unfold a track to see each clip's effects and the graph of its sound.
 
 **Sound**
@@ -154,10 +158,13 @@ Press **F1** in the editor for the list of keys.
 | Ctrl+B | Cut the selected clip at the playhead |
 | F | Freeze frame: hold the frame at the playhead for 2 s |
 | S | Slow motion: play a second of the recording from the playhead half as fast |
-| Ctrl+D | Duplicate the selected clip, right after it |
-| Ctrl+C / Ctrl+V | Copy the selected clip / paste it at the playhead |
-| Delete | Delete the selected clip |
-| Shift+Delete | Delete it and close the gap on its track |
+| Ctrl+D | Duplicate the selected clips, right after them |
+| Ctrl+C / Ctrl+V | Copy the selected clips / paste them at the playhead, onto their tracks or the nearest one above with room |
+| Ctrl+Shift+V | Paste them where the mouse pointer is, onto the track under it |
+| Ctrl+X | Copy the selected clips and delete them |
+| Delete | Delete the selected clips |
+| No key for now | Delete them and close the gaps on their tracks: it is in a clip's menu |
+| Ctrl+A / Ctrl+Shift+A | Select all the clips / none |
 | Ctrl+Z | Undo |
 | Ctrl+Y, Ctrl+Shift+Z | Redo |
 | V or Esc | Select tool: pick, move and trim clips |
@@ -169,7 +176,9 @@ Press **F1** in the editor for the list of keys.
 | Where | What it does |
 |---|---|
 | Click on the ruler | Takes the playhead there |
-| Drag a clip | Moves it, also onto another track of its kind; chained clips go along |
+| Click on a clip | Selects it; Ctrl+click adds it to the selected ones or takes it out |
+| Shift+click on a clip | Selects the clips from the one clicked last to this one: on one track those between them, on several those of the tracks between them that lie between the start of the first and the end of the last; with Ctrl too, besides those selected |
+| Drag a clip | Moves it, also onto another track of its kind; chained clips go along. Several selected move together in time |
 | Drag an edge of the selected clip | Trims it |
 | Drag the dots on the top edge of the selected clip | Changes the length of its fade |
 | Drag the dots on the bottom edge of the selected clip | Holds another frame (left) or holds it longer or shorter (right); moves where a part in slow motion starts (left) or ends (right) |

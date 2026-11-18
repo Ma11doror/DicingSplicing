@@ -1,10 +1,12 @@
 //! The editor: source view, output preview with transform controls, timeline and transport.
 //!
-//! A project has sources, videos linked from the disk, and clips of them on tracks. One clip is
-//! selected at a time: the middle shows its source with its frame, the side panel its transform and
-//! sound. The output preview shows what goes into the file: the clip seen at the playhead.
+//! A project has sources, videos linked from the disk, and clips of them on tracks. Clips are picked
+//! as in a file manager, one or several; the main one is shown: the middle shows its source with its
+//! frame, the side panel its transform, sound and effects, and what is set there goes to all the
+//! picked clips. The output preview shows what goes into the file: the clip seen at the playhead.
 
-use crate::core::edit::{speed_text, Clip, ClipId, Color, Curve, Edge, Effect, Run, Sequence, SourceId, Span, Speed, TrackKind, FREEZE_LENGTH, SLOW_MOTION_FACTOR, SLOW_MOTION_SECONDS};
+use crate::core::edit::{speed_text, Clip, ClipId, ClipKey, Color, Copied, Curve, Edge, Effect, Run, Sequence, SourceId, Span, Speed, TrackKind, FREEZE_LENGTH, SLOW_MOTION_FACTOR, SLOW_MOTION_SECONDS};
+use crate::core::selection::Selection;
 use crate::core::history::History;
 use crate::core::lock::EditorLock;
 use crate::core::plugins::Plugin;
@@ -113,7 +115,8 @@ pub struct Editor {
     play_mode: PlayMode,
     loop_export: bool,
     sequence: Sequence,
-    selected: Option<ClipId>,
+    /// The picked clips. The main one is what the Clip tab, the middle and most keys are about.
+    selection: Selection,
     history: History<Sequence>,
     framing: Framing,
     side_tab: SideTab,
@@ -140,9 +143,9 @@ pub struct Editor {
     flash: Option<(Section, f64)>,
     /// That part is still to be scrolled into sight.
     scroll_to: Option<Section>,
-    /// The clip Ctrl+C copied, and what it put into the system's clipboard to say so: Ctrl+V pastes
-    /// the clip only while that text is still there.
-    clipboard: Option<(Clip, TrackKind, String)>,
+    /// The clips Ctrl+C copied, each with its track and that track's kind, and what it put into the
+    /// system's clipboard to say so: Ctrl+V pastes them only while that text is still there.
+    clipboard: Option<(Vec<Copied>, String)>,
     /// The clip whose effect could not change last time it was asked to, and which effect: the clips
     /// after it could not move that far. That effect's block says so.
     effect_refused: Option<(ClipId, usize)>,
@@ -173,7 +176,8 @@ impl Editor {
         }
         let saved = project.clone();
         let Project { name, sources, sequence, view, .. } = project;
-        let selected = sequence.shown_at(view.playhead).or_else(|| sequence.clips().next().map(|(id, _)| id));
+        let mut selection = Selection::default();
+        selection.pick(&sequence, sequence.shown_at(view.playhead).or_else(|| sequence.clips().next().map(|(id, _)| id)));
         let export = ExportPanel::for_project(&name, dir.join(RENDERS_FOLDER), view.export_path, view.export_shown_frames);
         Self {
             library,
@@ -197,7 +201,7 @@ impl Editor {
             loop_export: view.loop_export,
             history: History::new(sequence.clone()),
             sequence,
-            selected,
+            selection,
             framing: Framing::restored(&view.frames, view.ratio_locked),
             side_tab: SideTab::default(),
             export,
@@ -340,22 +344,26 @@ impl Editor {
         }
     }
 
-    /// A selection that an undo or a removal left without its clip goes.
+    /// The main picked clip: the one the Clip tab, the middle and most keys are about.
+    fn selected(&self) -> Option<ClipId> {
+        self.selection.main(&self.sequence)
+    }
+
+    /// Clips that an undo or a removal took away are picked no more.
     fn check_selection(&mut self) {
-        if self.selected.is_some_and(|id| !self.sequence.has(id)) {
-            self.selected = None;
-        }
-        // What was refused is said about that clip only, while it stays selected.
-        if self.effect_refused.map(|(id, _)| id) != self.selected {
+        self.selection.tidy(&self.sequence);
+        // What was refused is said about that clip only, while it stays the main one.
+        let selected = self.selected();
+        if self.effect_refused.map(|(id, _)| id) != selected {
             self.effect_refused = None;
         }
-        if self.length_refused != self.selected {
+        if self.length_refused != selected {
             self.length_refused = None;
         }
-        if self.freeze_refused != self.selected {
+        if self.freeze_refused != selected {
             self.freeze_refused = None;
         }
-        if self.slow_refused.map(|(id, _)| id) != self.selected {
+        if self.slow_refused.map(|(id, _)| id) != selected {
             self.slow_refused = None;
         }
     }
@@ -364,7 +372,7 @@ impl Editor {
     /// the playhead for the output, unless it is the same frame.
     fn request_frames(&mut self) {
         let t = self.shown_time();
-        let framed = self.selected.filter(|id| self.sequence.tracks[id.track].kind == TrackKind::Video);
+        let framed = self.selected().filter(|id| self.sequence.tracks[id.track].kind == TrackKind::Video);
         let center = framed.map(|id| self.sequence.clip(id)).map(|clip| (clip.source, clip.picture_time(t)));
         let mut center_frame = None;
         if let Some((source, time)) = center {
@@ -542,14 +550,14 @@ impl Editor {
 
     fn trim_start(&mut self, t: f64) {
         let frame = self.frame();
-        if let Some(id) = self.selected {
+        if let Some(id) = self.selected() {
             self.sequence.trim_start(id, t, frame);
         }
     }
 
     fn trim_end(&mut self, t: f64) {
         let frame = self.frame();
-        if let Some(id) = self.selected {
+        if let Some(id) = self.selected() {
             self.sequence.trim_end(id, t, frame);
         }
     }
@@ -558,10 +566,10 @@ impl Editor {
     /// after the cut is selected.
     fn split_at_playhead(&mut self) {
         let t = self.frame_start(self.position);
-        let target = self.selected.filter(|id| self.sequence.clip(*id).span().contains(t)).or_else(|| self.sequence.shown_at(t));
+        let target = self.selected().filter(|id| self.sequence.clip(*id).span().contains(t)).or_else(|| self.sequence.shown_at(t));
         if let Some(part) = target.and_then(|id| self.sequence.split(id, t, self.frame())) {
             self.pause();
-            self.selected = Some(part);
+            self.selection.pick(&self.sequence, Some(part));
         }
     }
 
@@ -573,18 +581,18 @@ impl Editor {
             let clip = self.sequence.clip(*id);
             self.sequence.tracks[id.track].kind == TrackKind::Video && clip.still.is_none() && clip.span().contains(t)
         };
-        let target = self.selected.filter(&moving).or_else(|| self.sequence.shown_at(t).filter(&moving));
+        let target = self.selected().filter(&moving).or_else(|| self.sequence.shown_at(t).filter(&moving));
         if let Some(id) = target {
             self.freeze(id);
         }
     }
 
-    /// Holds the frame of clip `id` at the playhead for `FREEZE_LENGTH`: the clip is selected. When
-    /// the clips after it can't move later, its Timing says why.
+    /// Holds the frame of clip `id` at the playhead for `FREEZE_LENGTH`: the clip is the main one
+    /// picked. When the clips after it can't move later, its Timing says why.
     fn freeze(&mut self, id: ClipId) {
         let t = self.frame_start(self.position);
         self.pause();
-        self.selected = Some(id);
+        self.selection.focus(&self.sequence, id);
         if !self.sequence.freeze(id, t, FREEZE_LENGTH) {
             self.freeze_refused = Some(id);
         }
@@ -598,18 +606,18 @@ impl Editor {
             let clip = self.sequence.clip(*id);
             clip.still.is_none() && clip.span().contains(t)
         };
-        let target = self.selected.filter(&moving).or_else(|| self.sequence.shown_at(t).filter(&moving));
+        let target = self.selected().filter(&moving).or_else(|| self.sequence.shown_at(t).filter(&moving));
         if let Some(id) = target {
             self.slow_motion(id);
         }
     }
 
     /// Plays `SLOW_MOTION_SECONDS` of clip `id`'s recording from the playhead at `SLOW_MOTION_FACTOR`:
-    /// the clip is selected. When it can't, its Timing says why.
+    /// the clip is the main one picked. When it can't, its Timing says why.
     fn slow_motion(&mut self, id: ClipId) {
         let t = self.frame_start(self.position);
         self.pause();
-        self.selected = Some(id);
+        self.selection.focus(&self.sequence, id);
         if !self.sequence.slow_motion(id, t, SLOW_MOTION_SECONDS, SLOW_MOTION_FACTOR) {
             let clip = self.sequence.clip(id);
             let why = if clip.slowed().iter().any(|part| part.span.contains(t)) {
@@ -623,46 +631,125 @@ impl Editor {
         }
     }
 
+    /// Deletes the picked clips.
     fn delete_selected(&mut self) {
-        if let Some(id) = self.selected.take() {
+        let ids = self.selection.ids(&self.sequence);
+        if !ids.is_empty() {
             self.pause();
-            self.sequence.remove_clip(id);
+            self.sequence.remove_clips(&ids);
+            self.selection.clear();
         }
     }
 
-    /// Deletes the selected clip and closes the gap it leaves on its track.
+    /// Deletes the picked clips and closes the gaps they leave on their tracks. No key does it for
+    /// now (on Windows Shift+Delete comes as cutting): which one is to be settled later.
+    #[allow(dead_code)]
     fn ripple_delete_selected(&mut self) {
-        if let Some(id) = self.selected.take() {
+        let ids = self.selection.ids(&self.sequence);
+        if !ids.is_empty() {
             self.pause();
-            self.sequence.ripple_delete(id);
+            self.sequence.ripple_delete_clips(&ids);
+            self.selection.clear();
         }
     }
 
+    /// Copies of the picked clips right after them, which are picked then: of several, as far apart
+    /// as they are, after the last of them.
     fn duplicate_selected(&mut self) {
-        if let Some(id) = self.selected {
-            self.pause();
-            self.selected = Some(self.sequence.duplicate(id));
+        let ids = self.selection.ids(&self.sequence);
+        match ids[..] {
+            [] => {}
+            [id] => {
+                self.pause();
+                let copy = self.sequence.duplicate(id);
+                self.selection.pick(&self.sequence, Some(copy));
+            }
+            _ => {
+                self.pause();
+                let copies = self.sequence.duplicate_clips(&ids);
+                self.selection.set(&self.sequence, &copies);
+            }
         }
     }
 
-    /// Keeps the selected clip for pasting, and says so in the system's clipboard.
+    /// Keeps the picked clips for pasting, and says so in the system's clipboard.
     fn copy_selected(&mut self, ctx: &egui::Context) {
-        if let Some(id) = self.selected {
-            let clip = self.sequence.clip(id).clone();
-            let note = format!("DicingSplicing clip: {} ({})", clip.name, timecode::format(clip.span().len()));
-            ctx.copy_text(note.clone());
-            self.clipboard = Some((clip, self.sequence.tracks[id.track].kind, note));
+        let copied = self.sequence.copied(&self.selection.ids(&self.sequence));
+        let note = match &copied[..] {
+            [] => return,
+            [(clip, _, _)] => format!("DicingSplicing clip: {} ({})", clip.name, timecode::format(clip.span().len())),
+            many => format!("DicingSplicing clips: {}", many.len()),
+        };
+        ctx.copy_text(note.clone());
+        self.clipboard = Some((copied, note));
+    }
+
+    /// Keeps the picked clips for pasting, and deletes them.
+    fn cut_selected(&mut self, ctx: &egui::Context) {
+        self.copy_selected(ctx);
+        self.delete_selected();
+    }
+
+    /// Pastes the copied clips, if the clipboard still has what copying put there, and picks them: at
+    /// the playhead, or given `pointer` (Ctrl+Shift+V), at its time. One goes onto the track under
+    /// the pointer, else the main picked clip's, else the one it was copied from, the first of them
+    /// of its kind; several each onto the one it came from, or with the pointer over a track, those
+    /// of its kind from there up, as far apart as they were. Where a track has no room then, the
+    /// nearest one above that has takes them.
+    fn paste(&mut self, text: &str, pointer: Option<(f64, Option<usize>)>) {
+        let Some((copied, _)) = self.clipboard.as_ref().filter(|(_, note)| note == text) else { return };
+        let copied = copied.clone();
+        let at = pointer.map_or_else(|| self.frame_start(self.position), |(t, _)| t);
+        let under = pointer.and_then(|(_, track)| track);
+        self.pause();
+        match &copied[..] {
+            [(clip, from, kind)] => {
+                let tracks = &self.sequence.tracks;
+                let of_kind = |track: &usize| tracks.get(*track).is_some_and(|it| it.kind == *kind);
+                let track = under
+                    .filter(of_kind)
+                    .or_else(|| self.selected().map(|id| id.track).filter(of_kind))
+                    .or_else(|| tracks.iter().position(|it| it.id == *from));
+                let pasted = self.sequence.paste(clip.clone(), at, track, *kind);
+                self.selection.pick(&self.sequence, Some(pasted));
+            }
+            _ => {
+                let pasted = self.sequence.paste_clips(&copied, at, under);
+                self.selection.set(&self.sequence, &pasted);
+            }
         }
     }
 
-    /// Pastes the copied clip at the playhead, if the clipboard still has what copying put there.
-    fn paste(&mut self, text: &str) {
-        let Some((clip, kind, _)) = self.clipboard.as_ref().filter(|(_, _, note)| note == text) else { return };
-        let (clip, kind, at) = (clip.clone(), *kind, self.frame_start(self.position));
-        self.pause();
-        // Onto the selected clip's track, if it is of the kind the copy came from.
-        let track = self.selected.map(|id| id.track);
-        self.selected = Some(self.sequence.paste(clip, at, track, kind));
+    /// Does `change` to clip `id` and to the other picked clips, to all of them or to none: false,
+    /// with nothing changed, if it can't be done to one of them.
+    fn change_picked(&mut self, id: ClipId, change: impl Fn(&mut Sequence, ClipId) -> bool) -> bool {
+        let others = self.selection.others(&self.sequence).into_iter().filter(|&other| other != id);
+        let keys: Vec<ClipKey> = std::iter::once(id).chain(others).map(|clip| self.sequence.clip(clip).key()).collect();
+        let mut next = self.sequence.clone();
+        for key in keys {
+            if let Some(clip) = next.find(key) {
+                if !change(&mut next, clip) {
+                    return false;
+                }
+            }
+        }
+        self.sequence = next;
+        true
+    }
+
+    /// The frame of clip `id`, which was `before`, set so in the other picked clips that are seen:
+    /// what changed, each keeping the rest of its own.
+    fn carry_transform(&mut self, id: ClipId, before: Transform) {
+        let after = self.sequence.clip(id).clone();
+        if after.transform == before {
+            return;
+        }
+        let was = Clip { transform: before, ..after.clone() };
+        for other in self.selection.ids(&self.sequence).into_iter().filter(|&other| other != id) {
+            if self.sequence.tracks[other.track].kind == TrackKind::Video {
+                self.sequence.clip_mut(other).take_changes(&was, &after, true);
+            }
+        }
     }
 
     fn undo(&mut self) {
@@ -728,7 +815,7 @@ impl Editor {
         // A file of sound only goes onto an audio track.
         let kind = if info.has_video() { TrackKind::Video } else { TrackKind::Audio };
         let added = self.sequence.add_below(clip, kind);
-        self.selected = Some(added);
+        self.selection.pick(&self.sequence, Some(added));
         self.seek(self.sequence.clip(added).start);
     }
 
@@ -864,24 +951,35 @@ impl Editor {
         if pressed(none, Key::End) {
             self.seek(self.content().end);
         }
-        // With Shift first: without it, Delete would take Shift+Delete too.
-        if pressed(shift, Key::Delete) {
-            self.ripple_delete_selected();
-        } else if pressed(none, Key::Delete) || pressed(none, Key::Backspace) {
+        if pressed(none, Key::Delete) || pressed(none, Key::Backspace) {
             self.delete_selected();
         }
         if pressed(Modifiers::COMMAND, Key::D) {
             self.duplicate_selected();
         }
-        // Copying and pasting come as events of their own, not as keys; pasting only when the
-        // system's clipboard has text.
+        // With Shift first: without it, Ctrl+A would take Ctrl+Shift+A too.
+        if pressed(Modifiers::COMMAND | shift, Key::A) {
+            self.selection.clear();
+        } else if pressed(Modifiers::COMMAND, Key::A) {
+            self.selection.all(&self.sequence);
+        }
+        // Copying, cutting and pasting come as events of their own, not as keys; pasting only when
+        // the system's clipboard has text.
         let copied = ctx.input(|i| i.events.iter().any(|event| matches!(event, egui::Event::Copy)));
+        let cut = ctx.input(|i| i.events.iter().any(|event| matches!(event, egui::Event::Cut)));
         let pasted = ctx.input(|i| i.events.iter().find_map(|event| if let egui::Event::Paste(text) = event { Some(text.clone()) } else { None }));
         if copied {
             self.copy_selected(ctx);
         }
+        if cut {
+            self.pause();
+            self.cut_selected(ctx);
+        }
         if let Some(text) = pasted {
-            self.paste(&text);
+            // Ctrl+Shift+V: where the mouse pointer is over the timeline, elsewhere at the playhead.
+            // Shift+Insert, the old Windows key for pasting, comes without Ctrl.
+            let at_pointer = ctx.input(|i| i.modifiers.command && i.modifiers.shift);
+            self.paste(&text, self.timeline.under_pointer.filter(|_| at_pointer));
         }
         if pressed(Modifiers::COMMAND, Key::B) {
             self.split_at_playhead();
@@ -1022,7 +1120,7 @@ impl Editor {
             });
             egui::CentralPanel::default().frame(egui::Frame::none()).show_inside(ui, |ui| {
                 let env = TimelineEnv { fps, missing: &missing, placeable: &placeable, sounds: &sounds };
-                let response = self.timeline.show(ui, &mut self.position, &mut self.sequence, &mut self.selected, &env);
+                let response = self.timeline.show(ui, &mut self.position, &mut self.sequence, &mut self.selection, &env);
                 if (response.seeked || response.edit_started) && self.playing {
                     self.pause();
                 }
@@ -1156,7 +1254,9 @@ impl Editor {
             _ => None,
         };
         ui.vertical_centered(|ui| {
-            // Dragging or zooming the output edits the clip it shows, and selects it.
+            // Dragging or zooming the output edits the clip it shows: when it is picked, the other
+            // picked clips that are seen too; when not, it alone is picked then.
+            let before = live.map(|id| self.sequence.clip(id).transform);
             let touched = match live {
                 Some(id) => {
                     let t = &mut self.sequence.clip_mut(id).transform;
@@ -1169,8 +1269,13 @@ impl Editor {
                     false
                 }
             };
-            if touched {
-                self.selected = live;
+            if let (true, Some(id), Some(before)) = (touched, live, before) {
+                if self.selection.contains(&self.sequence, id) {
+                    self.selection.focus(&self.sequence, id);
+                    self.carry_transform(id, before);
+                } else {
+                    self.selection.pick(&self.sequence, Some(id));
+                }
             }
             let [px_w, px_h] = settings.pixels(output);
             let caption = format!("{} · {} · {px_w}×{px_h}", output.preset().name, output.ratio().label());
@@ -1181,9 +1286,10 @@ impl Editor {
         }
     }
 
-    /// The selected clip: where it is, its frame, its sound, its effects and its source.
+    /// The main picked clip: where it is, its frame, its sound, its effects and its source. What is
+    /// set here, other than its timing, goes to the other picked clips too.
     fn clip_tab(&mut self, ui: &mut egui::Ui) {
-        let Some(id) = self.selected else {
+        let Some(id) = self.selected() else {
             ui.label(RichText::new("Select a clip on the timeline to set its timing, frame, sound and effects.").weak());
             return;
         };
@@ -1197,8 +1303,13 @@ impl Editor {
         let track = track_name(&self.sequence, id.track);
         let kind = self.sequence.tracks[id.track].kind;
         let detached = self.sequence.clip(id).sound_detached;
+        let others: Vec<ClipKey> = self.selection.others(&self.sequence).into_iter().map(|other| self.sequence.clip(other).key()).collect();
         ui.label(RichText::new(name).strong());
         ui.label(RichText::new(format!("{track} · {} to {}", timecode::format(span.start - zero), timecode::format(span.end - zero))).weak());
+        if !others.is_empty() {
+            let note = format!("{} clips selected: what is set here goes to all of them, Timing to this one only.", others.len() + 1);
+            ui.label(RichText::new(note).weak().small());
+        }
         ui.separator();
 
         ui.heading("Timing");
@@ -1274,6 +1385,8 @@ impl Editor {
         }
         ui.separator();
 
+        // From here on, what is set goes to the other picked clips too.
+        let before = self.sequence.clip(id).clone();
         let source = self.sequence.clip(id).source;
         let info = self.library.info(source).cloned();
         let flash_of = |section: Section| self.flash.filter(|(flashed, _)| *flashed == section).map(|(_, started)| started);
@@ -1383,9 +1496,11 @@ impl Editor {
         // A new speed or hold makes the clip longer or shorter, and the clips after it move along;
         // what is chained to it and holds the same frame changes with it.
         if let Some((effect, change)) = effects_section.inner {
+            // A speed is set to all the picked clips, but the stills, which show one frame however
+            // fast. The frames held and the slow motion are moments of this clip's own recording.
             let done = match change {
-                EffectChange::Speed(factor) => self.sequence.set_speed(id, factor),
-                EffectChange::SpeedOff => self.sequence.remove_speed(id),
+                EffectChange::Speed(factor) => self.change_picked(id, |sequence, clip| sequence.clip(clip).still.is_some() || sequence.set_speed(clip, factor)),
+                EffectChange::SpeedOff => self.change_picked(id, |sequence, clip| sequence.remove_speed(clip)),
                 EffectChange::FreezeFrame(at) => self.sequence.move_freeze(id, effect, at),
                 EffectChange::FreezeLength(seconds) => self.sequence.set_freeze_length(id, effect, seconds),
                 EffectChange::FreezeOff => self.sequence.remove_freeze(id, effect),
@@ -1398,6 +1513,13 @@ impl Editor {
         if self.scroll_to == Some(Section::Effects) {
             effects_section.response.scroll_to_me(Some(egui::Align::Center));
             self.scroll_to = None;
+        }
+        let after = self.sequence.clip(id).clone();
+        if after != before {
+            for other in self.sequence.find_all(&others) {
+                let seen = self.sequence.tracks[other.track].kind == TrackKind::Video;
+                self.sequence.clip_mut(other).take_changes(&before, &after, seen);
+            }
         }
         ui.separator();
 
@@ -1443,8 +1565,8 @@ impl Editor {
     }
 
     fn source_panel(&mut self, ctx: &egui::Context) {
-        let sound_clip = self.selected.filter(|id| self.sequence.tracks[id.track].kind == TrackKind::Audio);
-        let selected = self.selected.filter(|_| sound_clip.is_none()).map(|id| (id, self.sequence.clip(id).source));
+        let sound_clip = self.selected().filter(|id| self.sequence.tracks[id.track].kind == TrackKind::Audio);
+        let selected = self.selected().filter(|_| sound_clip.is_none()).map(|id| (id, self.sequence.clip(id).source));
         let size = selected.and_then(|(_, source)| self.size_of(source).filter(|[w, h]| *w > 0.0 && *h > 0.0));
         let aspect = size.map_or(NO_SIZE[0] / NO_SIZE[1], |[w, h]| w / h);
         let note = selected.filter(|(id, _)| !self.sequence.clip(*id).span().contains(self.shown_time())).map(|_| "Outside the clip");
@@ -1467,10 +1589,13 @@ impl Editor {
                 (Some((id, source)), Some(size)) => {
                     let frames = self.framing.overlays(self.sequence.output);
                     let texture = self.center.of(source);
+                    let before = self.sequence.clip(id).transform;
                     let transform = &mut self.sequence.clip_mut(id).transform;
                     if let Some(aspect) = self.source_view.show(ui, texture, size, &frames, note, transform) {
                         self.framing.set_dragged_ratio(&mut self.sequence.output, aspect);
                     }
+                    // The frame set here goes to the other picked clips that are seen too.
+                    self.carry_transform(id, before);
                 }
                 _ => {
                     let text = match selected {

@@ -6,7 +6,10 @@
 //! by the ruler or an empty place, a clip when dragged by its body, also into another row. The edges
 //! of the selected clip trim it, the anchors on the ruler move the edges of the export range, the
 //! strip between them moves all of it. Dragged with the right or the middle button, it is always
-//! the tape. A click on the ruler takes the playhead there; in the rows it picks a clip, or nothing.
+//! the tape. A click on the ruler takes the playhead there; in the rows it picks a clip, or nothing;
+//! with Ctrl it adds the clip to the picked ones or takes it out, with Shift it picks the clips from
+//! the one clicked last. Picked clips are outlined, the main one has the handles; dragged, they go
+//! together.
 //! The wheel zooms; over the headers or the scroll bar left of them it scrolls the rows. Dragged with
 //! the right or the middle button, or the left one on an empty place in the rows, the tape also
 //! moves the rows up and down. The rows give a little past their ends and spring back: there is
@@ -26,6 +29,7 @@
 //! its row, and is grabbed, cut and trimmed by any of them.
 
 use crate::core::edit::{speed_text, Clip, ClipId, Curve, Edge, Effect, Hold, Slowed, SourceId, Sequence, Span, Track, TrackId, TrackKind, FREEZE_LENGTH};
+use crate::core::selection::Selection;
 use crate::media::geometry::Transform;
 use crate::media::timecode;
 use crate::media::waveform::Peaks;
@@ -193,6 +197,9 @@ pub struct Timeline {
     pushed_at: f64,
     /// A clip waiting to be chained: the next click on a clip chains it there.
     chaining: Option<ClipId>,
+    /// Where the mouse pointer is over the timeline: its time, caught by the playhead or a clip edge
+    /// near it, else on a frame, and the track under it. Ctrl+Shift+V pastes there.
+    pub under_pointer: Option<(f64, Option<usize>)>,
 }
 
 /// The rows' scroll after a push by `delta`: past an end they give way less, and no further than
@@ -619,6 +626,7 @@ impl Timeline {
             pan: None,
             pushed_at: 0.0,
             chaining: None,
+            under_pointer: None,
         }
     }
 
@@ -644,14 +652,7 @@ impl Timeline {
     }
 
     /// Draws the timeline and applies input to the playhead, the sequence and the selection.
-    pub fn show(
-        &mut self,
-        ui: &mut egui::Ui,
-        position: &mut f64,
-        sequence: &mut Sequence,
-        selected: &mut Option<ClipId>,
-        env: &TimelineEnv,
-    ) -> TimelineResponse {
+    pub fn show(&mut self, ui: &mut egui::Ui, position: &mut f64, sequence: &mut Sequence, selection: &mut Selection, env: &TimelineEnv) -> TimelineResponse {
         let fps = env.fps;
         let frame = 1.0 / fps;
         let width = ui.available_width();
@@ -730,6 +731,13 @@ impl Timeline {
         let center_x = layout.body.center().x;
         let view = |pos: f64| View { center_x, pps, pos };
         let snap_range = if ui.input(|i| i.modifiers.alt) { 0.0 } else { (SNAP_DISTANCE / pps) as f64 };
+        // Where Ctrl+Shift+V pastes: over the ruler or the rows, not over the names of the tracks.
+        self.under_pointer = pointer.filter(|p| response.hovered() && p.x >= layout.body.left() && (layout.rows_area.contains(*p) || layout.ruler.contains(*p))).map(|p| {
+            let t = view(pos).t(p.x);
+            let edges: Vec<f64> = std::iter::once(pos).chain(sequence.clips().flat_map(|(_, clip)| [clip.start, clip.end()])).collect();
+            let t = snap(t, &edges, snap_range).unwrap_or_else(|| (t / frame).round() * frame);
+            (t.max(0.0), layout.row_at(p.y).map(|row| row.track))
+        });
 
         // Waiting for a clip to chain to: a click on a clip chains, anything else gives up.
         if self.chaining.is_some_and(|id| !sequence.has(id)) || response.drag_started() {
@@ -739,10 +747,10 @@ impl Timeline {
         let mut click_used = false;
         if let (Some(waiting), true) = (self.chaining, response.clicked()) {
             click_used = true;
-            let clicked = response.interact_pointer_pos().and_then(|p| hit(p, &layout, view(pos), sequence, *selected)).and_then(Drag::clip);
+            let clicked = response.interact_pointer_pos().and_then(|p| hit(p, &layout, view(pos), sequence, selection.main(sequence))).and_then(Drag::clip);
             if let Some(to) = clicked.filter(|&to| to != waiting) {
                 sequence.chain(waiting, to);
-                *selected = Some(waiting);
+                selection.pick(sequence, Some(waiting));
                 out.edit_started = true;
             }
             self.chaining = None;
@@ -754,7 +762,7 @@ impl Timeline {
             if let Some(p) = press.filter(|p| p.x >= layout.body.left()) {
                 // The Blade cuts with a click: a drag in the rows is the tape.
                 let blade = self.tool == Tool::Blade && !layout.ruler.contains(p);
-                let grabbed = if tape || blade { None } else { hit(p, &layout, view(pos), sequence, *selected) };
+                let grabbed = if tape || blade { None } else { hit(p, &layout, view(pos), sequence, selection.main(sequence)) };
                 let drag = grabbed.unwrap_or(Drag::Scrub { start_time: pos, start_x: p.x });
                 // The tape over the rows takes them along up and down.
                 self.pan = (grabbed.is_none() && layout.rows_area.contains(p)).then_some((p.y, self.scroll));
@@ -762,8 +770,9 @@ impl Timeline {
                     self.grab = edge - view(pos).t(p.x);
                     out.edit_started = true;
                 }
+                // A picked clip is dragged with the others picked; another one alone.
                 if let Some(id) = drag.clip() {
-                    *selected = Some(id);
+                    selection.focus(sequence, id);
                 }
                 self.press_x = p.x;
                 self.stuck = false;
@@ -787,10 +796,12 @@ impl Timeline {
                     ui.ctx().request_repaint();
                 }
                 let wanted = view(pos).t(p.x) + self.grab;
-                // A clip dragged over another row goes there, if there is room for it. If not, it
-                // will go on a new row right above that one when let go.
+                // The other picked clips go along in time.
+                let along = if matches!(drag, Drag::ClipMove(_)) { selection.others(sequence) } else { Vec::new() };
+                // A clip dragged alone over another row goes there, if there is room for it. If not,
+                // it will go on a new row right above that one when let go.
                 self.new_row = None;
-                if let Drag::ClipMove(id) = drag {
+                if let (Drag::ClipMove(id), true) = (drag, along.is_empty()) {
                     let row_speed = row_autoscroll_speed(p.y, layout.rows_area);
                     if row_speed != 0.0 && rows_height > shown_rows {
                         let dt = ui.input(|i| i.stable_dt).min(0.1);
@@ -806,13 +817,12 @@ impl Timeline {
                             Some(moved) => {
                                 drag = Drag::ClipMove(moved);
                                 self.drag = Some(drag);
-                                *selected = Some(moved);
                             }
                             None => self.new_row = Some((track, (wanted / frame).round() * frame)),
                         }
                     }
                 }
-                self.snapped = edit(sequence, drag, wanted, pos, snap_range, frame);
+                self.snapped = edit(sequence, drag, wanted, pos, snap_range, frame, &along);
                 self.stuck = edge_time(sequence, drag).is_some_and(|edge| (edge - wanted).abs() > snap_range + frame);
             }
         }
@@ -821,7 +831,7 @@ impl Timeline {
             if let (Some(Drag::ClipMove(id)), Some((above, start))) = (self.drag, self.new_row.take()) {
                 let track = sequence.add_track(above + 1, sequence.tracks[id.track].kind);
                 let id = ClipId { track: after_insert(id.track, track), ..id };
-                *selected = sequence.move_clip_to_track(id, track, start).or(Some(id));
+                sequence.move_clip_to_track(id, track, start);
             }
             self.drag = None;
             self.snapped = None;
@@ -843,23 +853,31 @@ impl Timeline {
                     pos = view(pos).t(p.x);
                     out.seeked = true;
                 } else if layout.rows_area.contains(p) {
-                    let clicked = hit(p, &layout, view(pos), sequence, *selected).and_then(Drag::clip);
+                    let clicked = hit(p, &layout, view(pos), sequence, selection.main(sequence)).and_then(Drag::clip);
+                    let modifiers = ui.input(|i| i.modifiers);
                     match (self.tool, clicked) {
                         // The Blade cuts the clip there, with Shift every clip there. The part after
                         // the cut is what is picked: it is what gets moved or removed next.
                         (Tool::Blade, Some(id)) => {
                             let t = cut_time(sequence, view(pos).t(p.x), pos, snap_range, frame);
-                            if ui.input(|i| i.modifiers.shift) {
-                                *selected = sequence.split_all(t, frame).into_iter().find(|part| part.track == id.track);
+                            if modifiers.shift {
+                                let part = sequence.split_all(t, frame).into_iter().find(|part| part.track == id.track);
+                                selection.pick(sequence, part);
                             } else if let Some(part) = sequence.split(id, t, frame) {
-                                *selected = Some(part);
+                                selection.pick(sequence, Some(part));
                             }
                             out.edit_started = true;
                         }
-                        // A click picks the clip under it, or nothing; the playhead stays. A plaque
-                        // of an effect also opens what it stands for.
+                        // As in a file manager: Ctrl adds the clip or takes it out, Shift picks the
+                        // clips from the one clicked last without it, Ctrl and Shift add those.
+                        (_, Some(id)) if modifiers.command && modifiers.shift => selection.extend_to(sequence, id, true),
+                        (_, Some(id)) if modifiers.shift => selection.extend_to(sequence, id, false),
+                        (_, Some(id)) if modifiers.command => selection.toggle(sequence, id),
+                        (_, None) if modifiers.command || modifiers.shift => {}
+                        // A click picks the clip under it alone, or nothing; the playhead stays. A
+                        // plaque of an effect also opens what it stands for.
                         (_, clicked) => {
-                            *selected = clicked;
+                            selection.pick(sequence, clicked);
                             out.open = clicked.and_then(|id| self.chip_at(ui, &layout, view(pos), sequence, id, p)).map(|chip| chip.section);
                         }
                     }
@@ -869,9 +887,10 @@ impl Timeline {
         // A right click on a clip opens its menu.
         if response.secondary_clicked() {
             let clicked = response.interact_pointer_pos().filter(|p| layout.rows_area.contains(*p) && p.x >= layout.body.left());
-            self.menu = clicked.and_then(|p| Some((hit(p, &layout, view(pos), sequence, *selected).and_then(Drag::clip)?, view(pos).t(p.x))));
+            self.menu = clicked.and_then(|p| Some((hit(p, &layout, view(pos), sequence, selection.main(sequence)).and_then(Drag::clip)?, view(pos).t(p.x))));
+            // On a picked clip, the others stay picked: what the menu deletes or duplicates is all of them.
             if let Some((id, _)) = self.menu {
-                *selected = Some(id);
+                selection.focus(sequence, id);
             }
         }
         if let Some((id, at)) = self.menu.filter(|(id, _)| sequence.has(*id)) {
@@ -891,6 +910,9 @@ impl Timeline {
             let still = sequence.clip(id).still.is_some();
             let has_sound = matches!(env.sounds.get(&sequence.clip(id).source), Some(SourceSound::Graph(_))) && !still;
             let chained = sequence.is_chained(id);
+            // With others picked, it is about all of them.
+            let picked = selection.ids(sequence);
+            let many = picked.len() > 1 && picked.contains(&id);
             response.context_menu(|ui| {
                 if let Some(hold) = hold {
                     let text = "The clip plays on through that moment: it, and the clips after it on its track, get as much shorter";
@@ -916,7 +938,7 @@ impl Timeline {
                     let detach = ui.button("Detach sound").on_hover_text("Its sound becomes a clip of its own on an audio track under it, chained to it");
                     if detach.clicked() {
                         if let Some((_, sound)) = sequence.detach_sound(id) {
-                            *selected = Some(sound);
+                            selection.pick(sequence, Some(sound));
                         }
                         changed = true;
                         ui.close_menu();
@@ -986,7 +1008,7 @@ impl Timeline {
                 if ui.button("Split here").on_hover_text("Cut the clip where the menu was opened").clicked() {
                     let t = cut_time(sequence, at, pos, snap_range, frame);
                     if let Some(part) = sequence.split(id, t, frame) {
-                        *selected = Some(part);
+                        selection.pick(sequence, Some(part));
                     }
                     changed = true;
                     ui.close_menu();
@@ -1024,21 +1046,46 @@ impl Timeline {
                         ui.close_menu();
                     }
                 }
-                if ui.button("Duplicate").on_hover_text("A copy right after it (Ctrl+D)").clicked() {
-                    *selected = Some(sequence.duplicate(id));
+                let count = picked.len();
+                let (duplicate, hint) = if many {
+                    (format!("Duplicate {count} clips"), "Copies right after the last of them, as far apart as they are (Ctrl+D)")
+                } else {
+                    ("Duplicate".to_owned(), "A copy right after it (Ctrl+D)")
+                };
+                if ui.button(duplicate).on_hover_text(hint).clicked() {
+                    if many {
+                        let copies = sequence.duplicate_clips(&picked);
+                        selection.set(sequence, &copies);
+                    } else {
+                        let copy = sequence.duplicate(id);
+                        selection.pick(sequence, Some(copy));
+                    }
                     changed = true;
                     ui.close_menu();
                 }
-                if ui.button("Delete").clicked() {
-                    sequence.remove_clip(id);
-                    *selected = None;
+                let delete = if many { format!("Delete {count} clips") } else { "Delete".to_owned() };
+                if ui.button(delete).clicked() {
+                    if many {
+                        sequence.remove_clips(&picked);
+                    } else {
+                        sequence.remove_clip(id);
+                    }
+                    selection.clear();
                     changed = true;
                     ui.close_menu();
                 }
-                let ripple = ui.button("Delete and close the gap").on_hover_text("The clips after it on this track move back by its length (Shift+Delete)");
-                if ripple.clicked() {
-                    sequence.ripple_delete(id);
-                    *selected = None;
+                let (ripple, hint) = if many {
+                    (format!("Delete {count} clips and close the gaps"), "The clips after each of them on its track move back by its length")
+                } else {
+                    ("Delete and close the gap".to_owned(), "The clips after it on this track move back by its length")
+                };
+                if ui.button(ripple).on_hover_text(hint).clicked() {
+                    if many {
+                        sequence.ripple_delete_clips(&picked);
+                    } else {
+                        sequence.ripple_delete(id);
+                    }
+                    selection.clear();
                     changed = true;
                     ui.close_menu();
                 }
@@ -1059,7 +1106,7 @@ impl Timeline {
         // A double click on a clip folds or unfolds its row.
         if response.double_clicked() && self.tool == Tool::Select {
             let clicked = response.interact_pointer_pos().filter(|p| layout.rows_area.contains(*p) && p.x >= layout.body.left());
-            if let Some(id) = clicked.and_then(|p| hit(p, &layout, view(pos), sequence, *selected)).and_then(Drag::clip) {
+            if let Some(id) = clicked.and_then(|p| hit(p, &layout, view(pos), sequence, selection.main(sequence))).and_then(Drag::clip) {
                 self.toggle(sequence.tracks[id.track].id);
                 out.edit_started = true;
             }
@@ -1069,7 +1116,7 @@ impl Timeline {
         self.ruler_hover = pointer.filter(|p| self.drag.is_none() && layout.ruler.contains(*p)).map(|p| p.x);
 
         let hover = response.hover_pos().filter(|p| p.x >= layout.body.left());
-        let hovered = hover.and_then(|p| hit(p, &layout, view, sequence, *selected));
+        let hovered = hover.and_then(|p| hit(p, &layout, view, sequence, selection.main(sequence)));
         // With the Blade, a line shows where a click would cut.
         self.cut = None;
         if let (Tool::Blade, Some(p), None) = (self.tool, hover, self.drag) {
@@ -1104,7 +1151,7 @@ impl Timeline {
                 let (place, start) = drop_place(&layout, view, sequence, p, clip.span().len(), frame, *has);
                 let clip = Clip { start, ..clip.clone() };
                 if let Some(id) = put(sequence, place, clip) {
-                    *selected = Some(id);
+                    selection.pick(sequence, Some(id));
                     out.edit_started = true;
                 }
             }
@@ -1133,8 +1180,8 @@ impl Timeline {
         };
         *position = pos;
         self.pps = Some(pps);
-        self.paint(ui, &layout, view, sequence, *selected, self.drag.or(hovered), env);
-        if self.headers(ui, &layout, sequence, selected) {
+        self.paint(ui, &layout, view, sequence, selection, self.drag.or(hovered), env);
+        if self.headers(ui, &layout, sequence, selection.main(sequence)) {
             out.edit_started = true;
             self.drag = None;
         }
@@ -1153,7 +1200,9 @@ impl Timeline {
 
     /// The buttons over the headers and the header of each row: its name, Hide, Mute and a menu.
     /// Returns whether a track changed.
-    fn headers(&mut self, ui: &mut egui::Ui, layout: &Layout, sequence: &mut Sequence, selected: &mut Option<ClipId>) -> bool {
+    /// The headers of the rows, and the buttons over them; the track of the `selected` clip is what
+    /// some of them are about. Returns whether the tracks changed.
+    fn headers(&mut self, ui: &mut egui::Ui, layout: &Layout, sequence: &mut Sequence, selected: Option<ClipId>) -> bool {
         let count = sequence.tracks.len();
         let mut changed = false;
         let mut action = None;
@@ -1293,9 +1342,6 @@ impl Timeline {
                 if let (Some(from), Some(to)) = (from, to) {
                     if from != to {
                         sequence.move_track_to(from, to);
-                        if let Some(id) = selected.as_mut() {
-                            id.track = after_move(id.track, from, to);
-                        }
                         changed = true;
                     }
                 }
@@ -1303,38 +1349,25 @@ impl Timeline {
             _ => self.row_drag = None,
         }
 
+        // The selection goes by the clips, wherever their tracks go.
         match action {
             Some(TrackAction::Add(index, kind)) => {
-                let index = sequence.add_track(index, kind);
-                if let Some(id) = selected.as_mut() {
-                    id.track = after_insert(id.track, index);
-                }
+                sequence.add_track(index, kind);
             }
             Some(TrackAction::Move { track, up }) => {
-                let to = sequence.move_track(track, up);
-                if let Some(id) = selected.as_mut() {
-                    if id.track == track {
-                        id.track = to;
-                    } else if id.track == to {
-                        id.track = track;
-                    }
-                }
+                sequence.move_track(track, up);
             }
-            Some(TrackAction::Delete(track)) => {
-                sequence.remove_track(track);
-                *selected = selected.and_then(|id| match id.track {
-                    t if t == track => None,
-                    t if t > track => Some(ClipId { track: t - 1, ..id }),
-                    _ => Some(id),
-                });
-            }
+            Some(TrackAction::Delete(track)) => sequence.remove_track(track),
             None => {}
         }
         changed || action.is_some()
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint(&self, ui: &egui::Ui, layout: &Layout, view: View, sequence: &Sequence, selected: Option<ClipId>, active: Option<Drag>, env: &TimelineEnv) {
+    fn paint(&self, ui: &egui::Ui, layout: &Layout, view: View, sequence: &Sequence, selection: &Selection, active: Option<Drag>, env: &TimelineEnv) {
+        // The main one has handles; the other picked clips are outlined.
+        let picked = selection.ids(sequence);
+        let selected = picked.last().copied();
         let painter = ui.painter_at(layout.rect);
         let visuals = ui.visuals();
         let tick_color = visuals.weak_text_color();
@@ -1555,6 +1588,9 @@ impl Timeline {
             }
             if self.chaining == Some(id) {
                 rows_painter.rect_stroke(block.expand(1.0), 4.0, Stroke::new(2.0, LINK_COLOR));
+            }
+            if !is_selected && picked.contains(&id) {
+                rows_painter.rect_stroke(block, 4.0, Stroke::new(2.0, HANDLE_COLOR));
             }
             if is_selected {
                 rows_painter.rect_stroke(block, 4.0, Stroke::new(2.0, HANDLE_COLOR));
@@ -1975,19 +2011,6 @@ fn after_insert(t: usize, index: usize) -> usize {
     }
 }
 
-/// Where track `t` is once the track at `from` has moved to `to`.
-fn after_move(t: usize, from: usize, to: usize) -> usize {
-    if t == from {
-        to
-    } else if from < to && t > from && t <= to {
-        t - 1
-    } else if to < from && t >= to && t < from {
-        t + 1
-    } else {
-        t
-    }
-}
-
 /// A small button with a plus, and an arrow up or down after it when `arrow` says which. They are
 /// drawn: the font has no arrows.
 fn add_track_button(ui: &mut egui::Ui, arrow: Option<bool>, enabled: bool) -> egui::Response {
@@ -2079,8 +2102,9 @@ fn slowed_of(sequence: &Sequence, id: ClipId, effect: usize) -> Option<Slowed> {
 }
 
 /// Moves an edge (or the start of what is moved whole) to `t`. Returns the snap target used.
-fn edit(sequence: &mut Sequence, drag: Drag, t: f64, playhead: f64, snap_range: f64, frame: f64) -> Option<f64> {
-    let targets = snap_targets(sequence, drag, playhead);
+/// Clips `along` move with a clip moved whole.
+fn edit(sequence: &mut Sequence, drag: Drag, t: f64, playhead: f64, snap_range: f64, frame: f64, along: &[ClipId]) -> Option<f64> {
+    let targets = snap_targets(sequence, drag, playhead, along);
     // Snapped to a target, or else to the nearest frame.
     let place = |t: f64| match snap(t, &targets, snap_range) {
         Some(target) => (target, Some(target)),
@@ -2125,7 +2149,11 @@ fn edit(sequence: &mut Sequence, drag: Drag, t: f64, playhead: f64, snap_range: 
         }
         Drag::ClipMove(id) => {
             let (start, snapped) = place_whole(t, sequence.clip(id).span().len());
-            sequence.move_clip(id, start);
+            if along.is_empty() {
+                sequence.move_clip(id, start);
+            } else {
+                sequence.move_clips(id, along, start);
+            }
             snapped
         }
         Drag::Fade(id, edge) => {
@@ -2173,11 +2201,11 @@ fn edit(sequence: &mut Sequence, drag: Drag, t: f64, playhead: f64, snap_range: 
 }
 
 /// Times a dragged edge sticks to: the playhead, clip edges and the export range, except what is
-/// being dragged and what moves along with it.
-fn snap_targets(sequence: &Sequence, drag: Drag, playhead: f64) -> Vec<f64> {
+/// being dragged and what moves along with it, clips `along` and what is chained to them too.
+fn snap_targets(sequence: &Sequence, drag: Drag, playhead: f64, along: &[ClipId]) -> Vec<f64> {
     let mut targets = vec![playhead];
     let moving: Vec<ClipId> = match drag {
-        Drag::ClipMove(id) => sequence.group_of(id),
+        Drag::ClipMove(id) => std::iter::once(id).chain(along.iter().copied()).flat_map(|clip| sequence.group_of(clip)).collect(),
         // A mark moves the clip's own picture, and a longer one the clips after it, each with what is
         // chained to it: the clips of other tracks that stay are what it sticks to.
         Drag::HoldFrame(id, _) | Drag::HoldLength(id, _) | Drag::SlowFrom(id, _) | Drag::SlowTo(id, _) => {
@@ -2301,16 +2329,16 @@ mod tests {
         let mut sequence = Sequence::new(Clip::new("a".into(), 30.0));
         let frame = 0.04;
         // Near the playhead at 12.03: sticks to it.
-        assert_eq!(edit(&mut sequence, Drag::ExportStart, 12.1, 12.03, 0.1, frame), Some(12.03));
+        assert_eq!(edit(&mut sequence, Drag::ExportStart, 12.1, 12.03, 0.1, frame, &[]), Some(12.03));
         assert_eq!(sequence.export.start, 12.03);
         // Nothing near: the nearest frame.
-        assert_eq!(edit(&mut sequence, Drag::ClipEnd(CLIP), 20.33, 5.0, 0.1, frame), None);
+        assert_eq!(edit(&mut sequence, Drag::ClipEnd(CLIP), 20.33, 5.0, 0.1, frame, &[]), None);
         assert!((sequence.clip(CLIP).end() - 20.32).abs() < 1e-9);
         // The export end sticks to the trimmed clip end.
-        assert_eq!(edit(&mut sequence, Drag::ExportEnd, 20.4, 5.0, 0.1, frame), Some(sequence.clip(CLIP).end()));
+        assert_eq!(edit(&mut sequence, Drag::ExportEnd, 20.4, 5.0, 0.1, frame, &[]), Some(sequence.clip(CLIP).end()));
         // Moving the range keeps its length; here its start sticks to the clip start.
         let len = sequence.export.len();
-        assert_eq!(edit(&mut sequence, Drag::ExportMove, 0.05, 30.0, 0.1, frame), Some(0.0));
+        assert_eq!(edit(&mut sequence, Drag::ExportMove, 0.05, 30.0, 0.1, frame, &[]), Some(0.0));
         assert_eq!(sequence.export.start, 0.0);
         assert!((sequence.export.len() - len).abs() < 1e-9);
     }
@@ -2483,14 +2511,9 @@ mod tests {
     }
 
     #[test]
-    fn tracks_keep_track_of_each_other_when_one_comes_or_moves() {
+    fn tracks_keep_track_of_each_other_when_one_comes() {
         assert_eq!([0, 1, 2, 3].map(|t| after_insert(t, 2)), [0, 1, 3, 4]);
         assert_eq!([0, 1, 2, 3].map(|t| after_insert(t, 0)), [1, 2, 3, 4]);
-        // The track at 1 goes to 3: the ones it passes come down by one.
-        assert_eq!([0, 1, 2, 3, 4].map(|t| after_move(t, 1, 3)), [0, 3, 1, 2, 4]);
-        // And back up.
-        assert_eq!([0, 1, 2, 3, 4].map(|t| after_move(t, 3, 1)), [0, 2, 3, 1, 4]);
-        assert_eq!([0, 1, 2].map(|t| after_move(t, 1, 1)), [0, 1, 2]);
     }
 
     #[test]
@@ -2588,11 +2611,11 @@ mod tests {
         assert_eq!(fade_handle(narrow, sequence.clip(CLIP), Edge::In, view()), None);
 
         // Dragged to 33.01 s: 3 s, on the frame. The fade out leaves no more than 19 s for it.
-        edit(&mut sequence, Drag::Fade(CLIP, Edge::In), 33.01, 100.0, 0.0, 0.04);
+        edit(&mut sequence, Drag::Fade(CLIP, Edge::In), 33.01, 100.0, 0.0, 0.04, &[]);
         assert!((sequence.clip(CLIP).fade_lengths().0 - 3.0).abs() < 1e-9);
-        edit(&mut sequence, Drag::Fade(CLIP, Edge::In), 80.0, 100.0, 0.0, 0.04);
+        edit(&mut sequence, Drag::Fade(CLIP, Edge::In), 80.0, 100.0, 0.0, 0.04, &[]);
         assert!((sequence.clip(CLIP).fade_lengths().0 - 19.0).abs() < 1e-9);
-        edit(&mut sequence, Drag::Fade(CLIP, Edge::Out), 45.0, 100.0, 0.0, 0.04);
+        edit(&mut sequence, Drag::Fade(CLIP, Edge::Out), 45.0, 100.0, 0.0, 0.04, &[]);
         assert!((sequence.clip(CLIP).fade_lengths().1 - 1.0).abs() < 1e-9, "no room left for more");
         assert_eq!(cursor(Some(Drag::Fade(CLIP, Edge::Out))), CursorIcon::ResizeHorizontal);
     }
@@ -2623,19 +2646,39 @@ mod tests {
 
         // Longer to 39.01 s: 4 s, on the frame; the clip with it.
         assert_eq!(edge_time(&sequence, Drag::HoldLength(CLIP, effect)), Some(37.0));
-        edit(&mut sequence, Drag::HoldLength(CLIP, effect), 39.01, 100.0, 0.0, 0.04);
+        edit(&mut sequence, Drag::HoldLength(CLIP, effect), 39.01, 100.0, 0.0, 0.04, &[]);
         assert!((sequence.clip(CLIP).holds()[0].span.len() - 4.0).abs() < 1e-9);
         assert!((sequence.clip(CLIP).end() - 54.0).abs() < 1e-9);
         // Not shorter than a frame.
-        edit(&mut sequence, Drag::HoldLength(CLIP, effect), 30.0, 100.0, 0.0, 0.04);
+        edit(&mut sequence, Drag::HoldLength(CLIP, effect), 30.0, 100.0, 0.0, 0.04, &[]);
         assert!((sequence.clip(CLIP).holds()[0].span.len() - 0.04).abs() < 1e-9);
         // The frame: dragged to 40 s, it holds what the clip shows there without it, 10 s of its source.
-        edit(&mut sequence, Drag::HoldFrame(CLIP, effect), 40.0, 100.0, 0.0, 0.04);
+        edit(&mut sequence, Drag::HoldFrame(CLIP, effect), 40.0, 100.0, 0.0, 0.04, &[]);
         let hold = sequence.clip(CLIP).holds()[0];
         assert!((hold.at - 10.0).abs() < 1e-9 && (hold.span.start - 40.0).abs() < 1e-9, "{hold:?}");
         // It sticks to the playhead.
-        edit(&mut sequence, Drag::HoldFrame(CLIP, effect), 41.1, 41.0, 0.2, 0.04);
+        edit(&mut sequence, Drag::HoldFrame(CLIP, effect), 41.1, 41.0, 0.2, 0.04, &[]);
         assert!((sequence.clip(CLIP).holds()[0].span.start - 41.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn picked_clips_are_dragged_together() {
+        // a 0..10, b 10..20 and c 30..40 on one track, d 0..10 on another.
+        let mut sequence = Sequence::new(Clip::new("a".into(), 10.0));
+        sequence.tracks[0].clips.push(Clip { start: 10.0, ..Clip::new("b".into(), 10.0) });
+        sequence.tracks[0].clips.push(Clip { start: 30.0, ..Clip::new("c".into(), 10.0) });
+        let other = sequence.add_track(1, TrackKind::Video);
+        let d = sequence.place_clip(Some(other), Clip::new("d".into(), 10.0)).unwrap();
+        let (b, c) = (ClipId { track: 0, index: 1 }, ClipId { track: 0, index: 2 });
+        // c by its body to 35 s, b and d picked with it: they go 5 s later too.
+        edit(&mut sequence, Drag::ClipMove(c), 35.0, 100.0, 0.0, 0.04, &[b, d]);
+        assert_eq!((sequence.clip(b).start, sequence.clip(c).start, sequence.clip(d).start), (15.0, 35.0, 5.0));
+        // Back: as far as all of them can go, which is up to a.
+        edit(&mut sequence, Drag::ClipMove(c), 0.0, 100.0, 0.0, 0.04, &[b, d]);
+        assert_eq!((sequence.clip(b).start, sequence.clip(c).start, sequence.clip(d).start), (10.0, 30.0, 0.0));
+        // What moves along is nothing to stick to; what stays is.
+        let targets = snap_targets(&sequence, Drag::ClipMove(c), 100.0, &[b, d]);
+        assert!(!targets.contains(&20.0) && targets.contains(&0.0), "{targets:?}");
     }
 
     #[test]
@@ -2662,20 +2705,20 @@ mod tests {
 
         // Its end to 39 s: 2 s of its source, 4 s long; the clip with it.
         assert_eq!(edge_time(&sequence, Drag::SlowTo(CLIP, effect)), Some(37.0));
-        edit(&mut sequence, Drag::SlowTo(CLIP, effect), 39.0, 100.0, 0.0, 0.04);
+        edit(&mut sequence, Drag::SlowTo(CLIP, effect), 39.0, 100.0, 0.0, 0.04, &[]);
         let part = sequence.clip(CLIP).slowed()[0];
         assert!((part.to - 7.0).abs() < 1e-9 && (part.span.end - 39.0).abs() < 1e-9, "{part:?}");
         assert!((sequence.clip(CLIP).end() - 52.0).abs() < 1e-9);
         // Not shorter than a frame.
-        edit(&mut sequence, Drag::SlowTo(CLIP, effect), 30.0, 100.0, 0.0, 0.04);
+        edit(&mut sequence, Drag::SlowTo(CLIP, effect), 30.0, 100.0, 0.0, 0.04, &[]);
         assert!((sequence.clip(CLIP).slowed()[0].span.len() - 0.04).abs() < 1e-9);
         // Its start to 33 s: from 3 s of its source, as slow; what comes before it stays.
-        edit(&mut sequence, Drag::SlowFrom(CLIP, effect), 33.0, 100.0, 0.0, 0.04);
+        edit(&mut sequence, Drag::SlowFrom(CLIP, effect), 33.0, 100.0, 0.0, 0.04, &[]);
         let part = sequence.clip(CLIP).slowed()[0];
         assert!((part.from - 3.0).abs() < 1e-9 && (part.span.start - 33.0).abs() < 1e-9 && part.rate == 0.5, "{part:?}");
         assert_eq!(sequence.clip(CLIP).start, 30.0);
         // It sticks to the playhead.
-        edit(&mut sequence, Drag::SlowFrom(CLIP, effect), 34.1, 34.0, 0.2, 0.04);
+        edit(&mut sequence, Drag::SlowFrom(CLIP, effect), 34.1, 34.0, 0.2, 0.04, &[]);
         assert!((sequence.clip(CLIP).slowed()[0].span.start - 34.0).abs() < 1e-9);
     }
 
@@ -2764,16 +2807,16 @@ mod tests {
         let export = sequence.export;
 
         // Free on both sides of the timeline's zero. The export range stays where it was.
-        assert_eq!(edit(&mut sequence, Drag::ClipMove(CLIP), -7.0, 100.0, 0.1, frame), None);
+        assert_eq!(edit(&mut sequence, Drag::ClipMove(CLIP), -7.0, 100.0, 0.1, frame, &[]), None);
         assert!((sequence.clip(CLIP).start + 7.0).abs() < 1e-9);
-        assert_eq!(edit(&mut sequence, Drag::ClipMove(CLIP), 300.0, 100.0, 0.1, frame), None);
+        assert_eq!(edit(&mut sequence, Drag::ClipMove(CLIP), 300.0, 100.0, 0.1, frame, &[]), None);
         assert!((sequence.clip(CLIP).start - 300.0).abs() < 1e-9);
         assert_eq!(sequence.export, export);
 
         // By its start, to the export start; by its end, to the export end.
-        assert_eq!(edit(&mut sequence, Drag::ClipMove(CLIP), 0.05, 100.0, 0.1, frame), Some(0.0));
+        assert_eq!(edit(&mut sequence, Drag::ClipMove(CLIP), 0.05, 100.0, 0.1, frame, &[]), Some(0.0));
         assert_eq!(sequence.clip(CLIP).start, 0.0);
-        assert_eq!(edit(&mut sequence, Drag::ClipMove(CLIP), 15.03, 100.0, 0.1, frame), Some(25.0));
+        assert_eq!(edit(&mut sequence, Drag::ClipMove(CLIP), 15.03, 100.0, 0.1, frame, &[]), Some(25.0));
         assert!((sequence.clip(CLIP).end() - 25.0).abs() < 1e-9);
     }
 
@@ -2783,7 +2826,7 @@ mod tests {
         let sequence = Sequence::new(Clip { start: 2.0, source_out: 8.0, ..Clip::new("a".into(), 30.0) });
         let export = Span { start: 2.0, end: 10.0 };
         assert_eq!(sequence.export, export);
-        let targets = |drag| snap_targets(&sequence, drag, 100.0);
+        let targets = |drag| snap_targets(&sequence, drag, 100.0, &[]);
         // Moved whole, the clip has only the export range to stick to.
         assert_eq!(targets(Drag::ClipMove(CLIP)), [100.0, 2.0, 10.0]);
         // A trimmed edge takes the export edge along, and has the other edges to stick to.
@@ -2801,7 +2844,7 @@ mod tests {
         let mut t = 0.0;
         while t < 1.0 {
             t += frame;
-            assert_eq!(edit(&mut sequence, Drag::ClipStart(CLIP), t, 100.0, 0.2, frame), None);
+            assert_eq!(edit(&mut sequence, Drag::ClipStart(CLIP), t, 100.0, 0.2, frame, &[]), None);
             assert!((sequence.clip(CLIP).start - t).abs() < frame, "at {t}");
             assert_eq!(sequence.export.start, sequence.clip(CLIP).start);
         }
