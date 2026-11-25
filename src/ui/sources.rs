@@ -1,8 +1,9 @@
-//! The Sources button and the list it opens: the project's videos, each with what can be done with
-//! it, and ways to add more. A source is only a link to a file somewhere on the disk. The list shows
-//! the sources as lines or as thumbnails, in the order the user chose.
+//! The Sources button and the list it opens: the project's videos and ways to add more. A source is
+//! only a link to a file somewhere on the disk. The list shows the sources as lines or as
+//! thumbnails, in the order the user chose; next to them the viewer shows the chosen one as it is,
+//! whole, with its sound, and what can be done with it.
 
-use crate::core::edit::SourceId;
+use crate::core::edit::{SourceId, Span};
 use crate::core::plugins::{Plugin, PluginKind};
 use crate::core::project::{Source, SourcesOrder, SourcesSort, SourcesView};
 use crate::media::cache::MediaCache;
@@ -11,6 +12,7 @@ use crate::media::probe::MediaInfo;
 use crate::media::timecode;
 use crate::media::waveform::Peaks;
 use crate::media::Notify;
+use crate::ui::picture::Picture;
 use crate::ui::{grip_dots, paint_arrow};
 use crate::ui::thumbnails::{Shown, Thumbnails};
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
@@ -21,16 +23,26 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
-/// The room for the sources until the list's corner is dragged, the same in both views: four
-/// thumbnails in a row and the scroll bar, three rows of them.
-const DEFAULT_ROOM: [f32; 2] = [640.0, 380.0];
-/// The least room: the choices at the top fit in one line, and a thumbnail with the line about it.
-const MIN_ROOM: [f32; 2] = [430.0, 170.0];
-/// What the screen has to have besides the room for the sources: the frame around the list, the
-/// choices above the sources and the buttons under them.
+/// The room for the sources and the viewer until the list's corner is dragged, the same in both
+/// views: four thumbnails in a row and the scroll bar, three rows of them, and the viewer.
+const DEFAULT_ROOM: [f32; 2] = [1080.0, 400.0];
+/// The least room: the choices at the top fit in one line, a thumbnail fits beside the viewer, and
+/// the viewer's picture with what is under it.
+const MIN_ROOM: [f32; 2] = [560.0, 300.0];
+/// What the screen has to have besides that room: the frame around the list, the choices above the
+/// sources and the buttons under them.
 const AROUND_ROOM: [f32; 2] = [16.0, 110.0];
-/// The line about the chosen thumbnail under the thumbnails, with the line that parts them.
-const CHOSEN_LINE_HEIGHT: f32 = 48.0;
+/// The viewer's share of the room's width, and how wide it gets at least and at most.
+const VIEWER_SHARE: f32 = 0.4;
+const VIEWER_MIN_WIDTH: f32 = 300.0;
+const VIEWER_MAX_WIDTH: f32 = 640.0;
+/// What the viewer has under its picture: the bar, Play and the time, the name, what is known about
+/// the source and the buttons.
+const VIEWER_BELOW_PICTURE: f32 = 140.0;
+const VIEWER_MIN_PICTURE_HEIGHT: f32 = 80.0;
+/// The bar along the whole source, and the parts on it that are on the timeline.
+const BAR_HEIGHT: f32 = 14.0;
+const MARK_COLOR: Color32 = Color32::from_rgb(60, 170, 160);
 /// The corner the list is made larger or smaller by.
 const SIZE_GRIP: f32 = 16.0;
 const ERROR: Color32 = Color32::from_rgb(230, 80, 70);
@@ -47,7 +59,7 @@ const BADGE_BACKGROUND: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 170)
 const WAVE_COLOR: Color32 = Color32::from_rgb(110, 170, 210);
 /// The line under the picture that shows where in the video the pointer is.
 const SCRUB_COLOR: Color32 = Color32::from_rgb(230, 70, 60);
-const NO_THUMBNAIL_TEXT: &str = "Click a thumbnail to see what it is. Drag it onto the timeline, or double click it.";
+const NO_CHOICE_TEXT: &str = "Click a source to see it here as it is. Drag it onto the timeline, or double click it.";
 /// The two drawn buttons at the top left that choose how the sources are shown.
 const VIEW_BUTTON_WIDTH: f32 = 22.0;
 /// The small button at the top right with the arrow that turns the order round.
@@ -66,6 +78,11 @@ pub enum SourceAction {
     AddVideo,
     /// A plugin that brings in a video, by its place among the plugins.
     Plugin(usize),
+    /// The viewer plays the chosen source from where it is, with its sound; the timeline waits.
+    PlaySource(SourceId),
+    PauseSource,
+    /// The viewer went to another moment of the chosen source, in its seconds.
+    SeekSource(SourceId, f64),
 }
 
 /// A source as the list shows it.
@@ -79,6 +96,25 @@ pub struct SourceRow<'a> {
     pub cache: Option<&'a MediaCache>,
     /// Its sound, for a source of sound only.
     pub sound: Option<Arc<OnceLock<Peaks>>>,
+    /// The parts of it that clips play, in its seconds: the viewer marks them.
+    pub parts: Vec<Span>,
+}
+
+/// The viewer of the chosen source: where it is in it, whether it plays, and the frame there.
+pub struct Viewer {
+    /// In the source's own seconds.
+    pub position: f64,
+    pub playing: bool,
+    /// The source the position is in: another one chosen starts at its beginning.
+    source: Option<SourceId>,
+    picture: Picture,
+}
+
+impl Viewer {
+    /// Forgets a source whose frames are gone or are being made again.
+    pub fn forget(&mut self, id: SourceId) {
+        self.picture.forget(id);
+    }
 }
 
 /// What the list keeps from one frame to the next: how it shows the sources and in what order, how
@@ -88,8 +124,11 @@ pub struct SourcesPanel {
     pub sort: SourcesSort,
     /// After files were added: how many of them were in the project already.
     pub note: Option<String>,
-    /// The thumbnail clicked last: the line under the thumbnails is about it.
+    /// The source clicked last: the viewer shows it, and its buttons are about it.
     selected: Option<SourceId>,
+    pub viewer: Viewer,
+    /// The list is open: the playing keys are the viewer's then.
+    pub open: bool,
     thumbnails: Thumbnails,
     /// When each source's file was changed, as of the file the source had when it was looked at.
     modified: HashMap<SourceId, (PathBuf, Option<SystemTime>)>,
@@ -99,7 +138,18 @@ pub struct SourcesPanel {
 
 impl SourcesPanel {
     pub fn new(view: SourcesView, sort: SourcesSort, size: Option<[f32; 2]>, notify: Notify) -> Self {
-        Self { view, sort, note: None, selected: None, thumbnails: Thumbnails::new(notify), modified: HashMap::new(), size }
+        let viewer = Viewer { position: 0.0, playing: false, source: None, picture: Picture::new("sources viewer frame", notify.clone()) };
+        Self { view, sort, note: None, selected: None, viewer, open: false, thumbnails: Thumbnails::new(notify), modified: HashMap::new(), size }
+    }
+
+    /// The source the viewer shows.
+    pub fn chosen(&self) -> Option<SourceId> {
+        self.selected
+    }
+
+    /// Chooses a source, as a click on it does: one just added, say.
+    pub fn choose(&mut self, id: SourceId) {
+        self.selected = Some(id);
     }
 
     /// When the file was changed. Looked at once for each file a source has.
@@ -139,36 +189,12 @@ impl SourcesPanel {
         });
     }
 
-    /// The line about the chosen thumbnail and what can be done with it, or how to choose one.
-    fn chosen_line(&mut self, ui: &mut egui::Ui, rows: &[SourceRow]) -> Option<SourceAction> {
-        let Some(row) = self.selected.and_then(|id| rows.iter().find(|row| row.source.id == id)) else {
-            ui.label(RichText::new(NO_THUMBNAIL_TEXT).weak().small());
-            return None;
-        };
-        let mut action = None;
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.set_max_width(ui.available_width() - 300.0);
-                ui.add(egui::Label::new(RichText::new(row.source.label()).strong()).truncate()).on_hover_text(row.source.path.display().to_string());
-                if let Some(details) = details(row, None) {
-                    ui.label(RichText::new(details).weak().small());
-                }
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Right to left: the first one goes rightmost.
-                if let Some(chosen) = actions(ui, row) {
-                    action = Some(chosen);
-                }
-            });
-        });
-        action
-    }
 }
 
 /// The button, and the list under it while it is open. `open` opens it from outside, as when a
-/// video has just been added.
+/// video has just been added. Next to the sources is the viewer of the chosen one.
 pub fn sources_button(ui: &mut egui::Ui, rows: &[SourceRow], plugins: &[Plugin], open: bool, panel: &mut SourcesPanel) -> Option<SourceAction> {
-    let button = ui.button(format!("Sources ({})", rows.len())).on_hover_text("The videos of this project. Put them on the timeline from here");
+    let button = ui.button(format!("Sources ({})", rows.len())).on_hover_text("The videos of this project: see each as it is, and put them on the timeline from here");
     let popup = ui.make_persistent_id("sources_list");
     if button.clicked() || (open && !ui.memory(|memory| memory.is_popup_open(popup))) {
         ui.memory_mut(|memory| memory.toggle_popup(popup));
@@ -176,6 +202,7 @@ pub fn sources_button(ui: &mut egui::Ui, rows: &[SourceRow], plugins: &[Plugin],
     let mut action = None;
     egui::popup_below_widget(ui, popup, &button, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
         panel.thumbnails.poll(ui.ctx());
+        panel.viewer.picture.poll(ui.ctx());
         panel.thumbnails.keep(|id| rows.iter().any(|row| row.source.id == id));
         let thumbnails = panel.view == SourcesView::Thumbnails;
         // As much as the screen has to the right of the list and below it.
@@ -185,44 +212,47 @@ pub fn sources_button(ui: &mut egui::Ui, rows: &[SourceRow], plugins: &[Plugin],
         panel.header(ui);
         ui.separator();
         let order = panel.order(rows);
-        // The same room in both views: the list keeps its size when the view changes. Under the
-        // thumbnails, the line about the chosen one takes a part of it.
-        ui.allocate_ui_with_layout(room, egui::Layout::top_down(egui::Align::Min), |ui| {
+        // The sources at the left, the viewer at the right. The same room in both views: the list
+        // keeps its size when the view changes.
+        let viewer_width = viewer_width(room.x);
+        // The line between them is 6 points wide, with the spacing on both sides.
+        let gap = 2.0 * ui.spacing().item_spacing.x + 6.0;
+        let sources_width = (room.x - viewer_width - gap).max(TILE_WIDTH);
+        // As tall as the room: the line between them goes no further.
+        ui.allocate_ui_with_layout(room, egui::Layout::left_to_right(egui::Align::Min), |ui| {
             ui.set_min_size(room);
-            let chosen_line = thumbnails && !rows.is_empty();
-            let height = if chosen_line { room.y - CHOSEN_LINE_HEIGHT } else { room.y };
-            egui::ScrollArea::vertical().max_height(height).auto_shrink([false, false]).show(ui, |ui| {
-                if rows.is_empty() {
-                    ui.label(RichText::new("No videos yet.").weak());
-                }
-                if thumbnails {
-                    ui.spacing_mut().item_spacing = vec2(TILE_GAP, TILE_GAP);
-                    ui.horizontal_wrapped(|ui| {
+            ui.allocate_ui_with_layout(vec2(sources_width, room.y), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_min_size(vec2(sources_width, room.y));
+                egui::ScrollArea::vertical().max_height(room.y).auto_shrink([false, false]).show(ui, |ui| {
+                    if rows.is_empty() {
+                        ui.label(RichText::new("No videos yet.").weak());
+                    }
+                    if thumbnails {
+                        ui.spacing_mut().item_spacing = vec2(TILE_GAP, TILE_GAP);
+                        ui.horizontal_wrapped(|ui| {
+                            for &i in &order {
+                                if let Some(chosen) = tile(ui, &rows[i], panel) {
+                                    action = Some(chosen);
+                                }
+                            }
+                        });
+                    } else {
                         for &i in &order {
-                            if let Some(chosen) = tile(ui, &rows[i], panel) {
+                            let changed = (panel.sort.by == SourcesOrder::Modified).then(|| panel.modified(rows[i].source)).flatten();
+                            if let Some(chosen) = source_row(ui, &rows[i], changed, &mut panel.selected) {
                                 action = Some(chosen);
                             }
                         }
-                    });
-                } else {
-                    for &i in &order {
-                        let changed = (panel.sort.by == SourcesOrder::Modified).then(|| panel.modified(rows[i].source)).flatten();
-                        if let Some(chosen) = source_row(ui, &rows[i], changed) {
-                            action = Some(chosen);
-                        }
-                        ui.separator();
-                    }
-                }
-            });
-            if chosen_line {
-                ui.separator();
-                // In the middle of what is left, whether it is one line or two.
-                ui.allocate_ui_with_layout(ui.available_size(), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    if let Some(chosen) = panel.chosen_line(ui, rows) {
-                        action = Some(chosen);
                     }
                 });
-            }
+            });
+            ui.separator();
+            ui.allocate_ui_with_layout(vec2(viewer_width, room.y), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_min_size(vec2(viewer_width, room.y));
+                if let Some(chosen) = viewer(ui, rows, panel, room.y) {
+                    action = Some(chosen);
+                }
+            });
         });
         if let Some(note) = &panel.note {
             ui.label(RichText::new(note).weak().small());
@@ -240,7 +270,129 @@ pub fn sources_button(ui: &mut egui::Ui, rows: &[SourceRow], plugins: &[Plugin],
         });
         size_grip(ui, panel, room, most);
     });
+    panel.open = ui.memory(|memory| memory.is_popup_open(popup));
+    // Another source chosen: the viewer starts at its beginning, and stops if it played.
+    if panel.viewer.source != panel.selected {
+        panel.viewer.source = panel.selected;
+        panel.viewer.position = 0.0;
+        if panel.viewer.playing && action.is_none() {
+            action = Some(SourceAction::PauseSource);
+        }
+    }
     action
+}
+
+/// How wide the viewer is in a room `room_width` wide.
+fn viewer_width(room_width: f32) -> f32 {
+    (room_width * VIEWER_SHARE).clamp(VIEWER_MIN_WIDTH, VIEWER_MAX_WIDTH)
+}
+
+/// The chosen source as it is: whole and in its own proportions, a bar along all of it with the
+/// parts on the timeline marked, Play and the time; under them its name, what is known about it and
+/// what can be done with it. `height` is all the room it has.
+fn viewer(ui: &mut egui::Ui, rows: &[SourceRow], panel: &mut SourcesPanel, height: f32) -> Option<SourceAction> {
+    let Some(row) = panel.selected.and_then(|id| rows.iter().find(|row| row.source.id == id)) else {
+        ui.add_space(height / 3.0);
+        ui.vertical_centered(|ui| ui.label(RichText::new(NO_CHOICE_TEXT).weak()));
+        return None;
+    };
+    let (id, info, width) = (row.source.id, row.info, ui.available_width());
+    let duration = info.map_or(0.0, |info| info.duration);
+    let image = info.is_some_and(|info| info.image);
+    let sound_only = info.is_some_and(|info| !info.has_video());
+    let position = panel.viewer.position.clamp(0.0, duration);
+    let mut action = None;
+
+    // The picture, as large as the width allows and the room under it leaves.
+    let picture_height = (width * 9.0 / 16.0).min(height - VIEWER_BELOW_PICTURE).max(VIEWER_MIN_PICTURE_HEIGHT);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, picture_height), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, PICTURE_BACKGROUND);
+    let small = TextStyle::Small.resolve(ui.style());
+    if sound_only {
+        let wave = rect.shrink(6.0);
+        if let Some(peaks) = row.sound.as_ref().and_then(|sound| sound.get()) {
+            paint_sound(&painter, wave, peaks, duration);
+        }
+        let x = wave.left() + wave.width() * (position / duration.max(1e-9)) as f32;
+        painter.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], Stroke::new(1.5, SCRUB_COLOR));
+    } else {
+        if let Some(cache) = row.cache {
+            panel.viewer.picture.want(id, if image { 0.0 } else { position }, cache);
+        }
+        // Until its own frame is there, the thumbnail's.
+        let pixels = ui.ctx().pixels_per_point();
+        let max = [(width * pixels).round() as u32, (picture_height * pixels).round() as u32];
+        let frame = panel.viewer.picture.of(id).map(|texture| Shown { texture: texture.id(), size: texture.size_vec2() });
+        match frame.or_else(|| panel.thumbnails.poster(id, &row.source.path, info, row.cache, max)) {
+            Some(shown) => paint_picture(&painter, rect, shown),
+            None => {
+                let text = state_text(row).map_or_else(|| "No frame yet".to_owned(), |(text, _)| text);
+                painter.text(rect.center(), Align2::CENTER_CENTER, text, small.clone(), ui.visuals().weak_text_color());
+            }
+        }
+    }
+
+    if !image && duration > 0.0 {
+        ui.add_space(4.0);
+        let (bar, response) = ui.allocate_exact_size(vec2(width, BAR_HEIGHT), Sense::click_and_drag());
+        paint_bar(ui.painter(), bar, duration, position, &row.parts);
+        let response = response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Click or drag to go there. Marked: the parts on the timeline");
+        if let Some(p) = response.interact_pointer_pos().filter(|_| response.is_pointer_button_down_on()) {
+            let t = bar_time(p.x, bar, duration);
+            panel.viewer.position = t;
+            action = Some(SourceAction::SeekSource(id, t));
+        }
+        ui.horizontal(|ui| {
+            let playing = panel.viewer.playing;
+            let play = egui::Button::new(RichText::new(if playing { "⏸" } else { "▶" }).size(16.0)).min_size(vec2(40.0, 0.0));
+            let hint = "Play or pause it here, with its sound (Space while Sources is open): the timeline waits";
+            if ui.add_enabled(row.cache.is_some(), play).on_hover_text(hint).clicked() {
+                action = Some(if playing { SourceAction::PauseSource } else { SourceAction::PlaySource(id) });
+            }
+            ui.label(RichText::new(format!("{} / {}", timecode::format(position), timecode::format(duration))).monospace());
+        });
+    }
+
+    ui.add_space(2.0);
+    ui.add(egui::Label::new(RichText::new(row.source.label()).strong()).truncate()).on_hover_text(row.source.path.display().to_string());
+    if let Some(details) = details(row, None) {
+        ui.label(RichText::new(details).weak().small());
+    }
+    match state_text(row) {
+        Some((text, true)) => {
+            ui.colored_label(ERROR, text);
+        }
+        Some((text, false)) if row.info.is_none() => {
+            ui.label(RichText::new(text).weak().small());
+        }
+        _ => {}
+    }
+    ui.horizontal_wrapped(|ui| {
+        if let Some(chosen) = actions(ui, row) {
+            action = Some(chosen);
+        }
+    });
+    action
+}
+
+/// The bar along all of a source: the parts on the timeline marked on it, and where the viewer is.
+fn paint_bar(painter: &egui::Painter, bar: Rect, duration: f64, position: f64, parts: &[Span]) {
+    let x = |t: f64| bar.left() + bar.width() * (t / duration).clamp(0.0, 1.0) as f32;
+    let track = Rect::from_center_size(bar.center(), vec2(bar.width(), 6.0));
+    painter.rect_filled(track, 3.0, Color32::from_gray(55));
+    for part in parts {
+        // A moment held is marked as wide as a line can be seen.
+        let (from, to) = (x(part.start), x(part.end).max(x(part.start) + 2.0));
+        painter.rect_filled(Rect::from_min_max(pos2(from, track.top()), pos2(to, track.bottom())), 1.0, MARK_COLOR);
+    }
+    let at = x(position);
+    painter.line_segment([pos2(at, bar.top()), pos2(at, bar.bottom())], Stroke::new(2.0, SCRUB_COLOR));
+}
+
+/// The moment of the source at `x` on its bar.
+fn bar_time(x: f32, bar: Rect, duration: f64) -> f64 {
+    f64::from((x - bar.left()) / bar.width().max(1.0)).clamp(0.0, 1.0) * duration
 }
 
 /// What the list says after files were added, when some of them were in the project already: a
@@ -274,29 +426,28 @@ fn actions(ui: &mut egui::Ui, row: &SourceRow) -> Option<SourceAction> {
     action
 }
 
-fn source_row(ui: &mut egui::Ui, row: &SourceRow, changed: Option<SystemTime>) -> Option<SourceAction> {
+/// A line of the list. A click chooses the source for the viewer, which has its buttons; a double
+/// click puts it on the timeline, and one that has been read is dragged there by any part of it:
+/// the dots, its name, the lines under it.
+fn source_row(ui: &mut egui::Ui, row: &SourceRow, changed: Option<SystemTime>, chosen: &mut Option<SourceId>) -> Option<SourceAction> {
     let id = row.source.id;
-    let mut action = None;
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.set_max_width(ui.available_width() - 150.0);
-            let path = row.source.path.display().to_string();
-            // A source that has been read is dragged onto the timeline by any part of it: the dots,
-            // its name, the lines under it.
-            if row.info.is_some() {
-                let dragged = ui.dnd_drag_source(egui::Id::new(("source", id)), id, |ui| source_text(ui, row, true, changed)).response;
-                dragged.on_hover_cursor(egui::CursorIcon::Grab).on_hover_text(format!("{path}\nDrag it onto the timeline"));
-            } else {
-                ui.scope(|ui| source_text(ui, row, false, changed)).response.on_hover_text(path);
-            }
-        });
-        ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
-            if let Some(chosen) = actions(ui, row) {
-                action = Some(chosen);
-            }
-        });
+    let fill = if *chosen == Some(id) { ui.visuals().selection.bg_fill.gamma_multiply(0.4) } else { Color32::TRANSPARENT };
+    let framed = egui::Frame::none().fill(fill).rounding(4.0).inner_margin(egui::Margin::symmetric(4.0, 3.0)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let path = row.source.path.display().to_string();
+        if row.info.is_some() {
+            let dragged = ui.dnd_drag_source(egui::Id::new(("source", id)), id, |ui| source_text(ui, row, true, changed)).response;
+            dragged.on_hover_cursor(egui::CursorIcon::Grab).on_hover_text(format!("{path}\nClick to see it, double click to put it on the timeline, or drag it there"))
+        } else {
+            ui.scope(|ui| source_text(ui, row, false, changed)).response.on_hover_text(path)
+        }
     });
-    action
+    let response = framed.inner.interact(Sense::click());
+    if response.clicked() {
+        *chosen = Some(id);
+    }
+    ui.separator();
+    (response.double_clicked() && row.info.is_some()).then_some(SourceAction::AddToTimeline(id))
 }
 
 /// What is known about a source, in one line; with `changed`, when its file was changed too.
@@ -757,6 +908,24 @@ mod tests {
         assert_eq!(fitted_room(Some([100.0, 50.0]), screen), Vec2::from(MIN_ROOM), "no less than the least");
         assert_eq!(fitted_room(Some([3000.0, 2000.0]), screen), screen, "no more than the screen has");
         assert_eq!(fitted_room(None, vec2(300.0, 100.0)), Vec2::from(MIN_ROOM), "the least, even on a small screen");
+    }
+
+    #[test]
+    fn the_viewer_takes_its_share_of_the_room() {
+        assert_eq!(viewer_width(1080.0), 432.0);
+        assert_eq!(viewer_width(MIN_ROOM[0]), VIEWER_MIN_WIDTH);
+        assert_eq!(viewer_width(4000.0), VIEWER_MAX_WIDTH);
+        // Beside it, at least one thumbnail.
+        assert!(MIN_ROOM[0] - viewer_width(MIN_ROOM[0]) > TILE_WIDTH + 30.0);
+    }
+
+    #[test]
+    fn the_bar_goes_along_all_of_the_source() {
+        let bar = Rect::from_min_size(pos2(100.0, 0.0), vec2(400.0, BAR_HEIGHT));
+        assert_eq!(bar_time(100.0, bar, 60.0), 0.0);
+        assert_eq!(bar_time(300.0, bar, 60.0), 30.0);
+        assert_eq!(bar_time(600.0, bar, 60.0), 60.0, "past the end, the end");
+        assert_eq!(bar_time(20.0, bar, 60.0), 0.0);
     }
 
     #[test]

@@ -189,7 +189,7 @@ fn whole_picture(info: &MediaInfo, output: Output) -> Transform {
     if outline.mask == Mask::Rect && (width / height / outline.aspect).ln().abs() < SAME_PROPORTIONS {
         return Transform::default();
     }
-    Transform::default().showing_whole_picture(width, height, outline)
+    Transform { bars: true, ..Transform::default() }.showing_whole_picture(width, height, outline)
 }
 
 /// The part of a recording `duration` seconds long that `from` and `to` ask for, each of them as in

@@ -16,7 +16,7 @@ pub const RENDERS_FOLDER: &str = "renders";
 /// hold one picture. 9: frames held inside a clip, the Freeze effect. 10: parts of a clip in slow
 /// motion, the SlowMotion effect. An editor that knows less can't open such a file, and so can't
 /// lose what it does not know by saving it.
-pub const VERSION: u32 = 10;
+pub const VERSION: u32 = 11;
 
 /// A video the project uses. It is not copied: the project remembers where it is.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -69,8 +69,6 @@ pub struct ViewState {
     pub loop_export: bool,
     /// The tracks whose rows show their clips' effects and sound.
     pub expanded_tracks: Vec<TrackId>,
-    /// How tall the clip's panel is, once its border has been dragged.
-    pub clip_panel_height: Option<f32>,
     /// How tall the timeline is, once its border has been dragged.
     pub timeline_height: Option<f32>,
     /// How the Sources list shows the sources, and in what order.
@@ -221,7 +219,7 @@ mod tests {
         sequence.settings.rate = Rate::Bitrate(4000);
         sequence.settings.fades = (0.5, 2.0);
         let clip = sequence.clip_mut(id);
-        clip.transform = Transform { cx: 0.25, cy: 0.75, zoom: 1.5, angle_deg: -33.5, mirror: true, bars: true };
+        clip.transform = Transform { cx: 0.25, cy: 0.75, zoom: 1.5, angle_deg: -33.5, mirror: true, bars: true, anchor: crate::media::geometry::Anchor::TopRight };
         clip.volume = 0.5;
         clip.muted = true;
         clip.add_fade(crate::core::edit::Edge::Out);
@@ -234,7 +232,6 @@ mod tests {
             export_shown_frames: true,
             loop_export: true,
             expanded_tracks: vec![0],
-            clip_panel_height: Some(280.0),
             timeline_height: Some(360.0),
             sources_view: SourcesView::Thumbnails,
             sources_sort: SourcesSort { by: SourcesOrder::Modified, descending: true },

@@ -1,11 +1,14 @@
-//! The editor: source view, output preview with transform controls, timeline and transport.
+//! The editor: the preview with the pictures on the frame, the clip's panel, the timeline and the
+//! transport.
 //!
 //! A project has sources, videos linked from the disk, and clips of them on tracks. Clips are picked
-//! as in a file manager, one or several; the main one is shown: the middle shows its source with its
-//! frame, the side panel its transform, sound and effects, and what is set there goes to all the
-//! picked clips. The output preview shows what goes into the file: the clip seen at the playhead.
+//! as in a file manager, one or several; the main one is shown: the side panel shows its timing,
+//! transform, sound and effects, and what is set there goes to all the picked clips. The preview in
+//! the middle shows what goes into the file at the playhead, every clip seen there where it is on the
+//! frame, and the main clip's whole picture with its handles: there pictures are picked, moved,
+//! resized and turned.
 
-use crate::core::edit::{speed_text, Clip, ClipId, ClipKey, Color, Copied, Curve, Edge, Effect, Run, Sequence, SourceId, Span, Speed, TrackKind, FREEZE_LENGTH, SLOW_MOTION_FACTOR, SLOW_MOTION_SECONDS};
+use crate::core::edit::{speed_text, Clip, ClipId, ClipKey, Color, Copied, Curve, Edge, Effect, Run, Sequence, SourceId, Span, Speed, TrackId, TrackKind, FREEZE_LENGTH, SLOW_MOTION_FACTOR, SLOW_MOTION_SECONDS};
 use crate::core::selection::Selection;
 use crate::core::history::History;
 use crate::core::lock::EditorLock;
@@ -15,7 +18,8 @@ use crate::core::settings::Settings;
 use crate::core::workspace::Workspace;
 use crate::media::audio::{PlayRange, Segment, Sound};
 use crate::media::cache::Pcm;
-use crate::media::geometry::{self, Transform};
+use crate::core::preset::Output;
+use crate::media::geometry::{self, Anchor, Outline, Transform};
 use crate::media::library::{Library, SourceState};
 use crate::media::player::Player;
 use crate::media::render;
@@ -30,20 +34,15 @@ use crate::ui::{curve_choice, grip_dots, paint_curve, pick_media, pick_media_fil
 use crate::ui::plugins::PublishEnv;
 use crate::ui::sources::{self, SourceAction, SourceRow, SourcesPanel};
 use crate::ui::timeline::{Has, Section, SourceSound, Timeline, TimelineEnv, Tool};
-use crate::ui::viewer::{Layer, OutputView, SourceView};
-use egui::{Color32, Key, Modifiers, RichText, TextureHandle};
+use crate::ui::viewer::{self, Canvas, Layer, Scene};
+use egui::{Color32, Key, Modifiers, RichText};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 const SIDE_PANEL_WIDTH: f32 = 380.0;
-/// The clip's panel before the timeline has been laid out once, and the least either panel of the
-/// right column keeps.
-const CLIP_PANEL_FIRST_HEIGHT: f32 = 320.0;
-const CLIP_PANEL_MIN_HEIGHT: f32 = 160.0;
-const OUTPUT_PANEL_MIN_HEIGHT: f32 = 200.0;
-/// The border between the result's panel and the clip's, dragged by its dots.
+/// The border above the timeline, dragged by its dots.
 const PANEL_BORDER_HEIGHT: f32 = 10.0;
 /// The timeline before its border is dragged: about four rows. The least it keeps is one row with
 /// the ruler and the buttons under it, and the pictures above it keep this much.
@@ -67,16 +66,16 @@ enum PlayMode {
     Export,
 }
 
-/// What the top of the right column shows: the result, then writing it. Under it is the selected clip.
+/// What the right column shows: the selected clip, or writing the result.
 #[derive(Clone, Copy, Default, PartialEq)]
 enum SideTab {
     #[default]
-    Output,
+    Clip,
     Export,
 }
 
-/// What the output preview drew last. When the clip at the playhead becomes one of another source,
-/// this stays on the screen until that source's frame is there, instead of a black flash.
+/// What the preview drew last of a track. When its clip at the playhead becomes one of another
+/// source, this stays on the screen until that source's frame is there, instead of a flash.
 #[derive(Clone, Copy)]
 struct Drawn {
     source: SourceId,
@@ -98,15 +97,16 @@ pub struct Editor {
     changed_since: Option<f64>,
     pub save_error: Option<String>,
     player: Player,
-    /// The selected clip's source, in the middle.
-    center: Picture,
-    /// The clip seen at the playhead, when it is not the selected one at the same frame.
-    output: Picture,
-    /// The output shows the same frame as the middle, and takes it from there.
-    output_shares_center: bool,
-    /// The clip under the one at the playhead, while that one fades and this shows through.
-    under: Picture,
-    drawn: Option<Drawn>,
+    /// What the preview shows of each video track: the frame of its clip seen at the playhead.
+    layers: BTreeMap<TrackId, Picture>,
+    /// The selected clip's frame, when it is not seen at the playhead: the preview shows it in its
+    /// place all the same.
+    apart: Picture,
+    drawn: BTreeMap<TrackId, Drawn>,
+    /// A picture was moved by hand: once the gesture is over, the picked clips get the anchor of where
+    /// their pictures are. Resizing and turning keep the anchor.
+    anchor_pending: bool,
+    notify: Notify,
     /// The playhead, in timeline seconds.
     position: f64,
     /// While an edge is dragged on the timeline: the time the previews show instead of the playhead.
@@ -122,15 +122,9 @@ pub struct Editor {
     side_tab: SideTab,
     export: ExportPanel,
     timeline: Timeline,
-    /// Where the timeline began last frame: the clip's panel starts there too, until its border is
-    /// dragged.
-    timeline_top: Option<f32>,
-    /// How tall the clip's panel is, once its border has been dragged.
-    clip_panel_height: Option<f32>,
     /// How tall the timeline is, once its border has been dragged.
     timeline_height: Option<f32>,
-    source_view: SourceView,
-    output_view: OutputView,
+    canvas: Canvas,
     /// The result's frame rate: the grid of the timeline. Updated every frame.
     fps: f64,
     /// The files that can be rendered from, as of this frame.
@@ -189,11 +183,11 @@ impl Editor {
             changed_since: None,
             save_error: None,
             player: Player::new(),
-            center: Picture::new("source frame", notify.clone()),
-            output: Picture::new("output frame", notify.clone()),
-            output_shares_center: false,
-            under: Picture::new("frame under", notify.clone()),
-            drawn: None,
+            layers: BTreeMap::new(),
+            apart: Picture::new("selected clip frame", notify.clone()),
+            drawn: BTreeMap::new(),
+            anchor_pending: false,
+            notify: notify.clone(),
             position: view.playhead,
             peek: None,
             playing: false,
@@ -206,11 +200,8 @@ impl Editor {
             side_tab: SideTab::default(),
             export,
             timeline: Timeline::new(view.timeline_scale, &view.expanded_tracks),
-            timeline_top: None,
-            clip_panel_height: view.clip_panel_height,
             timeline_height: view.timeline_height,
-            source_view: SourceView::default(),
-            output_view: OutputView,
+            canvas: Canvas::default(),
             fps: 30.0,
             files: SourceFiles::new(),
             show_sources: false,
@@ -244,7 +235,6 @@ impl Editor {
                 loop_export: self.loop_export,
                 // Of the tracks that are there: a deleted one may come back with Undo, folded then.
                 expanded_tracks: self.timeline.expanded().filter(|id| self.sequence.tracks.iter().any(|track| track.id == *id)).collect(),
-                clip_panel_height: self.clip_panel_height,
                 timeline_height: self.timeline_height,
                 sources_view: self.sources_panel.view,
                 sources_sort: self.sources_panel.sort,
@@ -305,17 +295,22 @@ impl Editor {
             self.position = t;
             self.playing = still_playing;
         }
-        self.center.poll(ctx);
-        self.output.poll(ctx);
-        self.under.poll(ctx);
+        self.apart.poll(ctx);
+        for picture in self.layers.values_mut() {
+            picture.poll(ctx);
+        }
         self.check_selection();
 
         self.handle_keys(ctx);
         self.export.poll(ctx, settings);
         self.side_panel(ctx, plugins, workspace, settings);
         self.timeline_panel(ctx);
-        self.source_panel(ctx);
+        self.preview_panel(ctx);
 
+        if self.anchor_pending && !ctx.input(|i| i.pointer.any_down()) {
+            self.anchor_pending = false;
+            self.anchor_picked();
+        }
         let busy = ctx.input(|i| i.pointer.any_down()) || ctx.wants_keyboard_input();
         let now = ctx.input(|i| i.time);
         if self.history.track(&self.sequence, now, busy) {
@@ -368,45 +363,73 @@ impl Editor {
         }
     }
 
-    /// Asks for the frames the views will need: the selected clip's for the middle, the one seen at
-    /// the playhead for the output, unless it is the same frame.
+    /// Asks for the frames the preview will need: of every clip seen at the playhead, and of the
+    /// selected clip when it is not one of them.
     fn request_frames(&mut self) {
         let t = self.shown_time();
-        let framed = self.selected().filter(|id| self.sequence.tracks[id.track].kind == TrackKind::Video);
-        let center = framed.map(|id| self.sequence.clip(id)).map(|clip| (clip.source, clip.picture_time(t)));
-        let mut center_frame = None;
-        if let Some((source, time)) = center {
-            if let Some(cache) = self.library.cache(source) {
-                center_frame = Some((source, self.center.want(source, time, cache)));
-            }
+        let stack = self.sequence.stack_at(t, &sizes(&self.library));
+        for &id in &stack {
+            let clip = self.sequence.clip(id);
+            let track = self.sequence.tracks[id.track].id;
+            let Some(cache) = self.library.cache(clip.source) else { continue };
+            let notify = &self.notify;
+            let picture = self.layers.entry(track).or_insert_with(|| Picture::new("output frame", notify.clone()));
+            picture.set_color(clip.graded());
+            picture.want(clip.source, clip.picture_time(t), cache);
         }
-        self.output_shares_center = false;
-        if let Some((clip, cache)) = self.under_at(t).and_then(|id| Some((self.sequence.clip(id), self.library.cache(self.sequence.clip(id).source)?))) {
-            self.under.set_color(clip.graded());
-            self.under.want(clip.source, clip.picture_time(t), cache);
-        }
-        if let Some(clip) = self.sequence.shown_at(t).map(|id| self.sequence.clip(id)) {
-            let graded = clip.graded();
-            self.output.set_color(graded);
+        if let Some((id, _)) = self.apart_clip(&stack) {
+            let clip = self.sequence.clip(id);
             if let Some(cache) = self.library.cache(clip.source) {
-                let time = clip.picture_time(t);
-                // In its own colour it is a picture of its own: the middle shows the source as it is.
-                self.output_shares_center = graded.is_none() && center_frame == Some((clip.source, frame_at(cache, time)));
-                if !self.output_shares_center {
-                    self.output.want(clip.source, time, cache);
-                }
+                self.apart.set_color(clip.graded());
+                self.apart.want(clip.source, clip.picture_time(t), cache);
             }
         }
+        // A track that is gone takes its pictures along.
+        let tracks: BTreeSet<TrackId> = self.sequence.tracks.iter().map(|track| track.id).collect();
+        self.layers.retain(|id, _| tracks.contains(id));
+        self.drawn.retain(|id, _| tracks.contains(id));
+    }
+
+    /// The selected clip when it is a picture at the playhead that is not seen there, and why: its
+    /// track is hidden, or a clip above it covers the frame. Before or after it, it is not in the
+    /// result, and the preview does not show it.
+    fn apart_clip(&self, stack: &[ClipId]) -> Option<(ClipId, &'static str)> {
+        let id = self.selected().filter(|id| self.sequence.tracks[id.track].kind == TrackKind::Video && !stack.contains(id))?;
+        if !self.sequence.clip(id).span().contains(self.shown_time()) {
+            return None;
+        }
+        let note = if self.sequence.tracks[id.track].hidden { "Its track is hidden" } else { "Under a clip above it" };
+        Some((id, note))
     }
 
     fn frame(&self) -> f64 {
         1.0 / self.fps
     }
 
-    /// The clip that shows through at `t` while the clip seen there fades.
-    fn under_at(&self, t: f64) -> Option<ClipId> {
-        let top = self.sequence.shown_at(t).filter(|&id| self.sequence.clip(id).opacity(t) < 1.0)?;
-        self.sequence.shown_under(t, top.track)
+    /// The picked clips whose pictures were moved by hand get the anchor of where they are now.
+    fn anchor_picked(&mut self) {
+        let outline = self.sequence.output.outline();
+        for id in self.selection.ids(&self.sequence) {
+            if self.sequence.tracks[id.track].kind != TrackKind::Video {
+                continue;
+            }
+            let Some([w, h]) = self.size_of(self.sequence.clip(id).source) else { continue };
+            let t = &mut self.sequence.clip_mut(id).transform;
+            *t = t.anchored(w, h, outline);
+        }
+    }
+
+    /// The output's proportions were those of `before`: the pictures that stay against a point of the
+    /// frame move to where that is now. All but `except`, whose frame is being dragged into them.
+    fn follow_output(&mut self, before: Output, except: Option<ClipId>) {
+        if before.outline() == self.sequence.output.outline() {
+            return;
+        }
+        let kept = except.map(|id| (id, self.sequence.clip(id).transform));
+        self.sequence.keep_anchors(before.outline(), &sizes(&self.library));
+        if let Some((id, transform)) = kept {
+            self.sequence.clip_mut(id).transform = transform;
+        }
     }
 
     /// Start of the frame shown at `t`: where I, O and the trim keys put an edge.
@@ -428,9 +451,9 @@ impl Editor {
         self.content().union(self.sequence.export)
     }
 
-    /// The picture size of a source, once its file has been read.
+    /// The picture size of a source, once its file has been read; none for sound only.
     fn size_of(&self, source: SourceId) -> Option<[f64; 2]> {
-        self.library.info(source).map(|info| [info.width as f64, info.height as f64])
+        sizes(&self.library)(source)
     }
 
     /// Has the sound of every clip heard at another speed made for playing, or kept: of the whole
@@ -513,11 +536,84 @@ impl Editor {
         self.play_mode = mode;
         self.player.play(self.position, self.play_range(mode));
         self.playing = true;
+        // The player plays the timeline now, not the viewer in Sources.
+        self.sources_panel.viewer.playing = false;
     }
 
+    /// Stops the player: the timeline, or the viewer in Sources, whichever plays.
     fn pause(&mut self) {
         self.player.pause();
         self.playing = false;
+        self.sources_panel.viewer.playing = false;
+    }
+
+    /// What the viewer in Sources plays: all of a source, its sound as it is.
+    fn source_range(&self, id: SourceId) -> Option<PlayRange> {
+        let info = self.library.info(id).filter(|info| !info.image)?;
+        let sounds: Arc<[Sound]> = match self.library.cache(id).filter(|cache| cache.info.has_audio) {
+            Some(cache) => {
+                let segment = Segment { start: 0.0, end: info.duration, gain: 1.0, ..Segment::default() };
+                Arc::from([Sound { segment, pcm: cache.audio.clone() }])
+            }
+            None => Arc::from([]),
+        };
+        Some(PlayRange { start: 0.0, end: info.duration, looping: false, fades: None, sounds })
+    }
+
+    /// Plays the chosen source in the viewer from where it is, from its start once it has reached
+    /// its end; the timeline waits.
+    fn play_source(&mut self, id: SourceId) {
+        let Some(range) = self.source_range(id) else { return };
+        self.pause();
+        let viewer = &mut self.sources_panel.viewer;
+        if viewer.position >= range.end - 1.0 / self.fps {
+            viewer.position = 0.0;
+        }
+        self.player.play(viewer.position, range);
+        viewer.playing = true;
+    }
+
+    fn pause_source(&mut self) {
+        if self.sources_panel.viewer.playing {
+            self.pause();
+        }
+    }
+
+    /// The viewer goes to `t` of the chosen source, and plays on from there if it played.
+    fn seek_source(&mut self, id: SourceId, t: f64) {
+        let Some(range) = self.source_range(id) else { return };
+        let viewer = &mut self.sources_panel.viewer;
+        viewer.position = t.clamp(0.0, range.end);
+        if viewer.playing {
+            self.player.play(viewer.position, range);
+        }
+    }
+
+    /// While Sources is open, Space, K, L and the arrows are the viewer's: they play the chosen
+    /// source and step through it, and the timeline stays as it is.
+    fn viewer_keys(&mut self, ctx: &egui::Context) {
+        let pressed = |modifiers: Modifiers, key: Key| ctx.input_mut(|i| i.consume_key(modifiers, key));
+        let (none, shift) = (Modifiers::NONE, Modifiers::SHIFT);
+        let (space, k, l) = (pressed(none, Key::Space), pressed(none, Key::K), pressed(none, Key::L));
+        let left = if pressed(shift, Key::ArrowLeft) { Some(-1.0) } else { pressed(none, Key::ArrowLeft).then_some(0.0) };
+        let right = if pressed(shift, Key::ArrowRight) { Some(1.0) } else { pressed(none, Key::ArrowRight).then_some(0.0) };
+        let Some(id) = self.sources_panel.chosen() else { return };
+        let Some(fps) = self.library.info(id).filter(|info| !info.image).map(|info| self.library.cache(id).map_or(info.fps.as_f64(), |cache| cache.format.fps.as_f64())) else { return };
+        let playing = self.sources_panel.viewer.playing;
+        if (space && playing) || k {
+            self.pause_source();
+        } else if (space || l) && !playing {
+            self.play_source(id);
+        }
+        // A second with Shift, else a frame.
+        let position = self.sources_panel.viewer.position;
+        let step = |seconds: f64, frames: i64| if seconds != 0.0 { position + seconds } else { (timecode::frame_index(position, fps) + frames) as f64 / fps };
+        if let Some(seconds) = left {
+            self.seek_source(id, step(seconds, -1));
+        }
+        if let Some(seconds) = right {
+            self.seek_source(id, step(seconds, 1));
+        }
     }
 
     fn toggle_play(&mut self) {
@@ -791,7 +887,9 @@ impl Editor {
             self.library.add(id, &path);
         }
         self.sources_panel.note = None;
+        // The list opens to show it, and the viewer shows it.
         self.show_sources = true;
+        self.sources_panel.choose(id);
         new
     }
 
@@ -824,8 +922,11 @@ impl Editor {
         let Some(path) = pick_media() else { return };
         let Some(source) = self.sources.iter_mut().find(|source| source.id == id) else { return };
         source.path = path;
-        self.center.forget(id);
-        self.output.forget(id);
+        self.apart.forget(id);
+        self.sources_panel.viewer.forget(id);
+        for picture in self.layers.values_mut() {
+            picture.forget(id);
+        }
         self.library.add(id, &source.path);
     }
 
@@ -836,8 +937,11 @@ impl Editor {
         if let Some(i) = self.sources.iter().position(|source| source.id == id) {
             self.removed.push(self.sources.remove(i));
             self.library.remove(id);
-            self.center.forget(id);
-            self.output.forget(id);
+            self.apart.forget(id);
+            self.sources_panel.viewer.forget(id);
+            for picture in self.layers.values_mut() {
+                picture.forget(id);
+            }
         }
     }
 
@@ -857,6 +961,17 @@ impl Editor {
     /// Returns the plugin to bring a video in with, when the user asked for one.
     pub fn top_bar(&mut self, ui: &mut egui::Ui, plugins: &[Plugin]) -> Option<usize> {
         ui.label(RichText::new(&self.name).strong()).on_hover_text(self.dir.display().to_string());
+        if self.sources_panel.viewer.playing {
+            let (t, still_playing) = self.player.poll();
+            self.sources_panel.viewer.position = t;
+            self.sources_panel.viewer.playing = still_playing;
+            ui.ctx().request_repaint();
+        }
+        // Taken before the list is drawn, so that a button there that has the focus does not take
+        // Space as well.
+        if self.sources_panel.open && !ui.ctx().wants_keyboard_input() {
+            self.viewer_keys(ui.ctx());
+        }
         let rows: Vec<SourceRow> = self
             .sources
             .iter()
@@ -867,9 +982,14 @@ impl Editor {
                 uses: self.sequence.uses(source.id),
                 cache: self.library.cache(source.id),
                 sound: self.library.sound_graph(source.id),
+                parts: self.sequence.used_parts(source.id),
             })
             .collect();
         let action = sources::sources_button(ui, &rows, plugins, std::mem::take(&mut self.show_sources), &mut self.sources_panel);
+        // Sources closed: its viewer stops.
+        if !self.sources_panel.open {
+            self.pause_source();
+        }
         if let Some((count, progress)) = self.library.preparing() {
             let more = if count > 1 { format!(", {} more waiting", count - 1) } else { String::new() };
             let text = format!("Preparing frames {:.0}%{more}", progress * 100.0);
@@ -890,6 +1010,9 @@ impl Editor {
                 }
             }
             SourceAction::Plugin(i) => return Some(i),
+            SourceAction::PlaySource(id) => self.play_source(id),
+            SourceAction::PauseSource => self.pause_source(),
+            SourceAction::SeekSource(id, t) => self.seek_source(id, t),
         }
         None
     }
@@ -992,9 +1115,17 @@ impl Editor {
         if pressed(none, Key::S) {
             self.slow_motion_at_playhead();
         }
+        // In the preview: the selected picture's menu round the pointer, and what the wheel does.
+        if pressed(none, Key::Q) {
+            self.canvas.toggle_menu();
+        }
+        if pressed(none, Key::Z) {
+            self.canvas.toggle_wheel();
+        }
         if pressed(none, Key::V) || pressed(none, Key::Escape) {
             self.timeline.tool = Tool::Select;
             self.timeline.cancel_chaining();
+            self.canvas.close_menu();
         }
     }
 
@@ -1023,7 +1154,7 @@ impl Editor {
         // As tall as its border was dragged to, leaving the pictures above it some room.
         let most = (ctx.available_rect().height() - PREVIEW_MIN_HEIGHT).max(TIMELINE_MIN_HEIGHT);
         let height = self.timeline_height.unwrap_or(TIMELINE_FIRST_HEIGHT).clamp(TIMELINE_MIN_HEIGHT, most);
-        let panel = egui::TopBottomPanel::bottom("timeline").exact_height(height).show_separator_line(false).show(ctx, |ui| {
+        egui::TopBottomPanel::bottom("timeline").exact_height(height).show_separator_line(false).show(ctx, |ui| {
             if let Some(dragged) = panel_border(ui) {
                 self.timeline_height = Some((height - dragged).clamp(TIMELINE_MIN_HEIGHT, most));
             }
@@ -1083,9 +1214,10 @@ impl Editor {
                     if freeze.clicked() {
                         self.freeze_at_playhead();
                     }
-                    let slow = ui.button("Slow motion (S)").on_hover_text(
-                        "Play a second of the recording from the playhead half as fast, of the selected clip or the one seen there, \
-                         its sound at its pitch: the rest of it and the clips after it on its track move later",
+                    let slow = ui.button("Tempo (S)").on_hover_text(
+                        "Play a second of the recording from the playhead at a tempo of its own, of the selected clip or the one seen \
+                         there, its sound at its pitch: half as fast to start with, and its block in Effects makes it slower or faster. \
+                         The rest of the clip and the clips after it on its track move along",
                     );
                     if slow.clicked() {
                         self.slow_motion_at_playhead();
@@ -1137,59 +1269,40 @@ impl Editor {
                 if let Some(section) = response.open {
                     self.flash = Some((section, ui.input(|i| i.time)));
                     self.scroll_to = Some(section);
+                    self.side_tab = SideTab::Clip;
                     ui.ctx().request_repaint();
                 }
             });
         });
-        // The clip's panel follows it on the next frame.
-        let top = panel.response.rect.top();
-        if self.timeline_top != Some(top) {
-            self.timeline_top = Some(top);
-            ctx.request_repaint();
-        }
     }
 
     fn side_panel(&mut self, ctx: &egui::Context, plugins: &[Plugin], workspace: Option<&Workspace>, settings: &Settings) {
         let shown = self.framing.shown_presets(self.sequence.output);
-        // The whole height of the window: the result on top, the selected clip under it.
+        // The whole height of the window, one tab at a time. It keeps the name it had when it showed
+        // the result: egui remembers its width by it.
         egui::SidePanel::right("output").resizable(true).default_width(SIDE_PANEL_WIDTH).min_width(SIDE_PANEL_MIN_WIDTH).show(ctx, |ui| {
-            // The clip's panel is as tall as its border was dragged to. Until then it starts where the
-            // timeline does, as if the timeline's top went on across.
-            let area = ui.max_rect();
-            let top = self.timeline_top.unwrap_or(area.bottom() - CLIP_PANEL_FIRST_HEIGHT);
-            let most = (area.height() - OUTPUT_PANEL_MIN_HEIGHT).max(CLIP_PANEL_MIN_HEIGHT);
-            let height = self.clip_panel_height.unwrap_or(area.bottom() - top).clamp(CLIP_PANEL_MIN_HEIGHT, most);
-            let clip_panel = egui::TopBottomPanel::bottom("clip").exact_height(height).frame(egui::Frame::none()).show_separator_line(false);
-            clip_panel.show_inside(ui, |ui| {
-                if let Some(dragged) = panel_border(ui) {
-                    self.clip_panel_height = Some((height - dragged).clamp(CLIP_PANEL_MIN_HEIGHT, most));
-                }
-                ui.horizontal(|ui| {
-                    let _ = ui.selectable_label(true, RichText::new("Clip").size(TAB_TEXT_SIZE));
-                });
-                ui.separator();
-                egui::ScrollArea::vertical().id_salt("clip tab").auto_shrink([false, false]).show(ui, |ui| self.clip_tab(ui));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.side_tab, SideTab::Clip, RichText::new("Clip").size(TAB_TEXT_SIZE));
+                ui.selectable_value(&mut self.side_tab, SideTab::Export, RichText::new(self.export.tab_text()).size(TAB_TEXT_SIZE));
             });
-            egui::CentralPanel::default().frame(egui::Frame::none()).show_inside(ui, |ui| {
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.side_tab, SideTab::Output, RichText::new("Output").size(TAB_TEXT_SIZE));
-                    ui.selectable_value(&mut self.side_tab, SideTab::Export, RichText::new(self.export.tab_text()).size(TAB_TEXT_SIZE));
-                });
-                ui.separator();
-                match self.side_tab {
-                    SideTab::Output => self.output_tab(ui),
-                    SideTab::Export => {
-                        // What the plugins are told about the result: the video it is mostly made of.
-                        let no_meta = BTreeMap::new();
-                        let main = self.sequence.main_source();
-                        let meta = self.sources.iter().find(|source| Some(source.id) == main).map_or(&no_meta, |source| &source.meta);
-                        let publish = workspace.map(|workspace| PublishEnv { workspace, settings, name: &self.name, meta });
-                        let env = ExportEnv { files: &self.files, shown: &shown, position: self.position, plugins, publish };
-                        self.export.show(ui, &mut self.sequence, &env);
-                    }
+            ui.separator();
+            match self.side_tab {
+                SideTab::Clip => {
+                    egui::ScrollArea::vertical().id_salt("clip tab").auto_shrink([false, false]).show(ui, |ui| self.clip_tab(ui));
                 }
-            });
+                SideTab::Export => {
+                    // What the plugins are told about the result: the video it is mostly made of.
+                    let no_meta = BTreeMap::new();
+                    let main = self.sequence.main_source(&sizes(&self.library));
+                    let meta = self.sources.iter().find(|source| Some(source.id) == main).map_or(&no_meta, |source| &source.meta);
+                    let publish = workspace.map(|workspace| PublishEnv { workspace, settings, name: &self.name, meta });
+                    let env = ExportEnv { files: &self.files, shown: &shown, position: self.position, plugins, publish };
+                    let before = self.sequence.output;
+                    self.export.show(ui, &mut self.sequence, &env);
+                    self.follow_output(before, None);
+                }
+            }
         });
 
         // Whatever the tab: a preset on the other one can change the frame the pictures have to fill.
@@ -1205,85 +1318,40 @@ impl Editor {
         }
     }
 
-    /// The texture with the frame the output shows, the clip it is of if that is still the clip at
-    /// the playhead, and how to draw it.
-    fn output_picture(&self) -> (Option<&TextureHandle>, Option<ClipId>, Drawn) {
-        let Some(id) = self.sequence.shown_at(self.shown_time()) else {
-            return (None, None, Drawn { source: 0, transform: Transform::default(), size: NO_SIZE });
-        };
-        let clip = self.sequence.clip(id);
-        let picture = if self.output_shares_center { &self.center } else { &self.output };
-        let size = self.size_of(clip.source);
-        if let (Some(texture), Some(size)) = (picture.of(clip.source), size) {
-            return (Some(texture), Some(id), Drawn { source: clip.source, transform: clip.transform, size });
-        }
-        // The frame of the new clip is on its way: what was there stays meanwhile. Only when it is
-        // just being decoded, not while that video's frames are still being prepared: then the old
-        // picture would stand for another clip.
-        let ready = self.library.cache(clip.source).is_some_and(|cache| cache.frames.get(frame_at(cache, clip.picture_time(self.shown_time()))).is_some());
-        if let Some(drawn) = self.drawn.filter(|_| ready) {
-            if let Some(texture) = self.output.of(drawn.source).or(self.center.of(drawn.source)) {
-                return (Some(texture), None, drawn);
+    /// The preview's pictures at the playhead, the lowest first, each with the clip it is of, and the
+    /// selected clip's on top when it is not seen there. A clip whose frame is not there yet shows
+    /// what its track showed last, while that frame is just being decoded: not while its video's
+    /// frames are still being prepared, when the old picture would stand for another clip.
+    fn preview_layers(&mut self) -> Vec<(Layer, Option<ClipId>)> {
+        let t = self.shown_time();
+        let stack = self.sequence.stack_at(t, &sizes(&self.library));
+        let mut layers = Vec::new();
+        for &id in &stack {
+            let clip = self.sequence.clip(id);
+            let track = self.sequence.tracks[id.track].id;
+            let (opacity, size) = (clip.opacity(t) as f32, self.size_of(clip.source));
+            if let (Some(texture), Some(size)) = (self.layers.get(&track).and_then(|picture| picture.of(clip.source)).cloned(), size) {
+                self.drawn.insert(track, Drawn { source: clip.source, transform: clip.transform, size });
+                layers.push((Layer { texture: Some(texture), size, transform: clip.transform, opacity, live: true, apart: None, key: Some(clip.key()) }, Some(id)));
+                continue;
             }
+            let ready = self.library.cache(clip.source).is_some_and(|cache| cache.frames.get(frame_at(cache, clip.picture_time(t))).is_some());
+            let kept = self.drawn.get(&track).copied().filter(|_| ready).and_then(|drawn| {
+                let texture = self.layers.get(&track).and_then(|picture| picture.of(drawn.source))?;
+                Some((drawn, texture.clone()))
+            });
+            layers.push(match kept {
+                Some((drawn, texture)) => (Layer { texture: Some(texture), size: drawn.size, transform: drawn.transform, opacity, live: false, apart: None, key: None }, None),
+                None => (Layer { texture: None, size: size.unwrap_or(NO_SIZE), transform: clip.transform, opacity, live: true, apart: None, key: Some(clip.key()) }, Some(id)),
+            });
         }
-        (None, Some(id), Drawn { source: clip.source, transform: clip.transform, size: size.unwrap_or(NO_SIZE) })
-    }
-
-    /// The result: the frame at the playhead as it will be in the file, as large as the panel allows.
-    fn output_tab(&mut self, ui: &mut egui::Ui) {
-        let output = self.sequence.output;
-        let settings = self.sequence.settings;
-        let outline = output.outline();
-        // Under the picture: its caption, and why there is no sound, if so.
-        let below = 28.0 + if self.player.audio_error.is_some() { 22.0 } else { 0.0 };
-        let [box_w, box_h] = outline.fit(ui.available_width() as f64, (ui.available_height() - below).max(80.0) as f64);
-        let box_size = egui::vec2(box_w as f32, box_h as f32);
-
-        let (texture, live, drawn) = self.output_picture();
-        let texture = texture.cloned();
-        if texture.is_some() && live.is_some() {
-            self.drawn = Some(drawn);
+        if let Some((id, note)) = self.apart_clip(&stack) {
+            let clip = self.sequence.clip(id);
+            let texture = self.apart.of(clip.source).cloned();
+            let size = self.size_of(clip.source).unwrap_or(NO_SIZE);
+            layers.push((Layer { texture, size, transform: clip.transform, opacity: 1.0, live: true, apart: Some(note), key: Some(clip.key()) }, Some(id)));
         }
-        // While the clip fades: how much of it shows, and what shows through.
-        let now = self.shown_time();
-        let opacity = live.map_or(1.0, |id| self.sequence.clip(id).opacity(now) as f32);
-        let under_clip = self.under_at(now).map(|id| self.sequence.clip(id).clone());
-        let under_texture = under_clip.as_ref().and_then(|clip| self.under.of(clip.source)).cloned();
-        let under = match (&under_clip, &under_texture) {
-            (Some(clip), Some(texture)) => self.size_of(clip.source).map(|size| Layer { texture, size, transform: clip.transform, opacity: clip.opacity(now) as f32 }),
-            _ => None,
-        };
-        ui.vertical_centered(|ui| {
-            // Dragging or zooming the output edits the clip it shows: when it is picked, the other
-            // picked clips that are seen too; when not, it alone is picked then.
-            let before = live.map(|id| self.sequence.clip(id).transform);
-            let touched = match live {
-                Some(id) => {
-                    let t = &mut self.sequence.clip_mut(id).transform;
-                    self.output_view.show(ui, texture.as_ref(), drawn.size, outline, t, box_size, opacity, under)
-                }
-                None => {
-                    // What was there before stays only to look at.
-                    let mut still = drawn.transform;
-                    self.output_view.show(ui, texture.as_ref(), drawn.size, outline, &mut still, box_size, 1.0, None);
-                    false
-                }
-            };
-            if let (true, Some(id), Some(before)) = (touched, live, before) {
-                if self.selection.contains(&self.sequence, id) {
-                    self.selection.focus(&self.sequence, id);
-                    self.carry_transform(id, before);
-                } else {
-                    self.selection.pick(&self.sequence, Some(id));
-                }
-            }
-            let [px_w, px_h] = settings.pixels(output);
-            let caption = format!("{} · {} · {px_w}×{px_h}", output.preset().name, output.ratio().label());
-            ui.label(RichText::new(caption).weak());
-        });
-        if let Some(error) = &self.player.audio_error {
-            ui.colored_label(Color32::from_rgb(230, 120, 60), format!("No sound: {error}"));
-        }
+        layers
     }
 
     /// The main picked clip: where it is, its frame, its sound, its effects and its source. What is
@@ -1362,7 +1430,7 @@ impl Editor {
                 match slowed.as_slice() {
                     [] => {}
                     [part] => at += &format!(", {} to {} of it at {}", timecode::format(part.from), timecode::format(part.to), speed_text(part.rate)),
-                    parts => at += &format!(", {} parts of it in slow motion", parts.len()),
+                    parts => at += &format!(", {} parts of it at a tempo of their own", parts.len()),
                 }
                 format!("From its source {} to {}{at}. Delete removes the clip.", timecode::format(source_in), timecode::format(source_out))
             }
@@ -1377,9 +1445,9 @@ impl Editor {
         }
         if let Some((_, why)) = self.slow_refused.filter(|(clip, _)| *clip == id) {
             let why = match why {
-                SlowRefused::InOne => "No slow motion: the playhead is on a part in slow motion already. Its block in Effects changes it.",
-                SlowRefused::AtEnd => "No slow motion: its recording ends at the playhead.",
-                SlowRefused::NoRoom => "No slow motion: the clips after the playhead can't move that much later, one chained to them has no room.",
+                SlowRefused::InOne => "No new Tempo: the playhead is on a part at a tempo of its own already. Its block in Effects changes it.",
+                SlowRefused::AtEnd => "No new Tempo: its recording ends at the playhead.",
+                SlowRefused::NoRoom => "No new Tempo: the clips after the playhead can't move that much later, one chained to them has no room.",
             };
             ui.label(RichText::new(why).color(ERROR).small());
         }
@@ -1393,56 +1461,26 @@ impl Editor {
         let (frame_flash, sound_flash, effects_flash) = (flash_of(Section::Frame), flash_of(Section::Sound), flash_of(Section::Effects));
         // A sound clip is not seen: nothing to frame.
         if kind == TrackKind::Video {
+        let outline = self.sequence.output.outline();
+        let pixels = self.sequence.settings.pixels(self.sequence.output).map(f64::from);
+        let size = self.size_of(source);
         let t = &mut self.sequence.clip_mut(id).transform;
         let frame_section = flash::frame(ui, frame_flash, false).show(ui, |ui| {
             ui.heading("Transform");
-            let (mut x, mut y) = (t.cx * 100.0, t.cy * 100.0);
-            egui::Grid::new("transform").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                ui.label("X");
-                if ui.add(egui::DragValue::new(&mut x).speed(0.1).fixed_decimals(1).suffix(" %")).changed() {
-                    t.cx = x / 100.0;
+            match size {
+                Some(size) => transform_editor(ui, t, size, outline, pixels),
+                None => {
+                    ui.label(RichText::new("Its place on the frame is here once its video is open.").weak());
                 }
-                ui.end_row();
-                ui.label("Y");
-                if ui.add(egui::DragValue::new(&mut y).speed(0.1).fixed_decimals(1).suffix(" %")).changed() {
-                    t.cy = y / 100.0;
-                }
-                ui.end_row();
-                ui.label("Zoom");
-                ui.add(egui::DragValue::new(&mut t.zoom).speed(0.01).range(geometry::MIN_ZOOM_WITH_BARS..=geometry::MAX_ZOOM).fixed_decimals(2).prefix("×"));
-                ui.end_row();
-                ui.label("Angle");
-                ui.add(egui::DragValue::new(&mut t.angle_deg).speed(0.2).fixed_decimals(1).suffix("°"));
-                ui.end_row();
-            });
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Center").clicked() {
-                    t.cx = 0.5;
-                    t.cy = 0.5;
-                }
-                if ui.button("−90°").clicked() {
-                    t.angle_deg -= 90.0;
-                }
-                if ui.button("+90°").clicked() {
-                    t.angle_deg += 90.0;
-                }
-                if ui.button("0°").clicked() {
-                    t.angle_deg = 0.0;
-                }
-                let mirror = ui.add(egui::Button::new("Mirror").selected(t.mirror));
-                if mirror.on_hover_text("Flip the output left to right").clicked() {
-                    t.mirror = !t.mirror;
-                }
-                if ui.button("Reset").clicked() {
-                    *t = Transform::default();
-                }
-            });
+            }
             ui.label(
                 RichText::new(
-                    "Drag inside the frame to move it (Alt: no snapping). Drag a side to resize it \
-                     (Ctrl: the opposite side stays); with the lock open that changes the proportions \
-                     (Shift: the opposite of the lock). Drag an arrow to rotate it (Shift: 15° steps). \
-                     Rest on the mark at its top for Fit, Fill, Bars and Reset; click it for 0°. Wheel to zoom.",
+                    "In the preview: drag the picture to move it (Alt: no snapping). A corner or the middle \
+                     of a side resizes it, the opposite one staying; an arrow at a corner turns it (Shift: \
+                     15° steps). The dot above it: rest on it for Fit, Fill, Bars and Reset, or press Q for \
+                     them round the pointer; click it for 0°. The wheel changes its Scale from its anchor, or \
+                     zooms the view when switched to Zoom (Z). Ctrl+wheel or a pinch zooms the view, the \
+                     right or the middle button moves it.",
                 )
                 .weak()
                 .small(),
@@ -1564,52 +1602,64 @@ impl Editor {
         });
     }
 
-    fn source_panel(&mut self, ctx: &egui::Context) {
-        let sound_clip = self.selected().filter(|id| self.sequence.tracks[id.track].kind == TrackKind::Audio);
-        let selected = self.selected().filter(|_| sound_clip.is_none()).map(|id| (id, self.sequence.clip(id).source));
-        let size = selected.and_then(|(_, source)| self.size_of(source).filter(|[w, h]| *w > 0.0 && *h > 0.0));
+    /// The preview in the middle, with the frames menu, the proportions and Undo above it.
+    fn preview_panel(&mut self, ctx: &egui::Context) {
+        let (layers, ids): (Vec<Layer>, Vec<Option<ClipId>>) = self.preview_layers().into_iter().unzip();
+        let selected = self.selected().and_then(|id| ids.iter().position(|&shown| shown == Some(id)));
+        // The selected picture's proportions, for the button that gives them to the frame.
+        let picture = self.selected().filter(|id| self.sequence.tracks[id.track].kind == TrackKind::Video);
+        let size = picture.and_then(|id| self.size_of(self.sequence.clip(id).source)).filter(|[w, h]| *w > 0.0 && *h > 0.0);
         let aspect = size.map_or(NO_SIZE[0] / NO_SIZE[1], |[w, h]| w / h);
-        let note = selected.filter(|(id, _)| !self.sequence.clip(*id).span().contains(self.shown_time())).map(|_| "Outside the clip");
-        let frame = egui::Frame::none().fill(Color32::from_gray(16));
+        let empty = self.preview_empty();
         let (mut undo, mut redo) = (false, false);
-        egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(viewer::BACKGROUND)).show(ctx, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
+                let before = self.sequence.output;
                 self.framing.menu(ui, &mut self.sequence.output);
                 self.framing.ratio_controls(ui, &mut self.sequence.output, aspect);
+                self.follow_output(before, None);
                 ui.separator();
                 let can_undo = self.history.can_undo(&self.sequence);
                 undo = ui.add_enabled(can_undo, egui::Button::new("Undo")).on_hover_text("Ctrl+Z").clicked();
                 let can_redo = self.history.can_redo(&self.sequence);
                 redo = ui.add_enabled(can_redo, egui::Button::new("Redo")).on_hover_text("Ctrl+Y or Ctrl+Shift+Z").clicked();
+                if let Some(error) = &self.player.audio_error {
+                    ui.separator();
+                    ui.colored_label(Color32::from_rgb(230, 120, 60), "No sound").on_hover_text(error.as_str());
+                }
             });
 
-            match (selected, size) {
-                (Some((id, source)), Some(size)) => {
-                    let frames = self.framing.overlays(self.sequence.output);
-                    let texture = self.center.of(source);
-                    let before = self.sequence.clip(id).transform;
-                    let transform = &mut self.sequence.clip_mut(id).transform;
-                    if let Some(aspect) = self.source_view.show(ui, texture, size, &frames, note, transform) {
-                        self.framing.set_dragged_ratio(&mut self.sequence.output, aspect);
-                    }
-                    // The frame set here goes to the other picked clips that are seen too.
-                    self.carry_transform(id, before);
+            let output = self.sequence.output;
+            let frames = self.framing.overlays(output);
+            let [px_w, px_h] = self.sequence.settings.pixels(output);
+            let caption = format!("{} · {} · {px_w}×{px_h}", output.preset().name, output.ratio().label());
+            let pixels = [f64::from(px_w), f64::from(px_h)];
+            let scene = Scene { layers: &layers, selected, frames: &frames, pixels, playing: self.playing, caption: &caption, empty: empty.as_deref() };
+            let change = self.canvas.show(ui, &scene);
+            if change.began && self.playing {
+                self.pause();
+            }
+            if let Some(id) = change.picked.and_then(|i| ids[i]) {
+                if self.selection.contains(&self.sequence, id) {
+                    self.selection.focus(&self.sequence, id);
+                } else {
+                    self.selection.pick(&self.sequence, Some(id));
                 }
-                _ => {
-                    let text = match selected {
-                        _ if sound_clip.is_some() => "A sound clip: there is nothing to frame. Its volume and fades are in the Clip panel".to_owned(),
-                        Some((_, source)) => match self.library.state(source) {
-                            SourceState::Missing => "The file of this clip is not there. Sources: Locate file".to_owned(),
-                            SourceState::Failed(error) => format!("The file of this clip can't be read: {error}"),
-                            _ => "Opening the video…".to_owned(),
-                        },
-                        None if self.sequence.clips().next().is_some() => "Select a clip on the timeline".to_owned(),
-                        None => "Add a video from Sources, then put it on the timeline".to_owned(),
-                    };
-                    ui.centered_and_justified(|ui| ui.label(RichText::new(text).weak()));
-                }
+            }
+            if let Some((id, transform)) = change.changed.and_then(|(i, transform)| Some((ids[i]?, transform))) {
+                let before = self.sequence.clip(id).transform;
+                self.sequence.clip_mut(id).transform = transform;
+                // What was done to it goes to the other picked clips that are seen too.
+                self.carry_transform(id, before);
+                self.anchor_pending |= change.moved;
+            }
+            if let Some(aspect) = change.aspect {
+                // The pictures that stay against a point of the frame follow its new proportions.
+                let before = self.sequence.output;
+                self.framing.set_dragged_ratio(&mut self.sequence.output, aspect);
+                self.follow_output(before, None);
             }
         });
         if undo {
@@ -1619,6 +1669,155 @@ impl Editor {
             self.redo();
         }
     }
+
+    /// What the preview says in the middle when there is nothing to see there.
+    fn preview_empty(&self) -> Option<String> {
+        if self.sequence.clips().next().is_none() {
+            return Some("Add a video from Sources, then put it on the timeline".to_owned());
+        }
+        let id = self.selected().filter(|id| self.sequence.tracks[id.track].kind == TrackKind::Video)?;
+        let source = self.sequence.clip(id).source;
+        match self.library.state(source) {
+            SourceState::Missing => Some("The file of this clip is not there. Sources: Locate file".to_owned()),
+            SourceState::Failed(error) => Some(format!("The file of this clip can't be read: {error}")),
+            _ if self.size_of(source).is_none() => Some("Opening the video…".to_owned()),
+            _ => None,
+        }
+    }
+}
+
+
+
+/// The size of each source's picture, once its file has been read; none for sound only, which has
+/// no picture to place.
+fn sizes(library: &Library) -> impl Fn(SourceId) -> Option<[f64; 2]> + '_ {
+    |source| library.info(source).filter(|info| info.has_video()).map(|info| [info.width as f64, info.height as f64])
+}
+
+/// The picture's place on the result, in the result's pixels, its anchor, scale, size and angle,
+/// and quick ways to set them: for a picture `w`×`h` on a frame of `outline`, `pixels` large.
+fn transform_editor(ui: &mut egui::Ui, t: &mut Transform, [w, h]: [f64; 2], outline: Outline, pixels: [f64; 2]) {
+    let place = t.placement(w, h, outline, pixels);
+    let mut offsets = place.offsets(t.anchor, pixels);
+    let scale = t.picture_scale(w, h, outline, pixels);
+    let (mut percent, mut size, mut angle) = (scale * 100.0, place.size, t.angle_deg);
+    let (mut moved, mut factor, mut turned) = (false, None, false);
+    egui::Grid::new("transform").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label("Anchor").on_hover_text(
+            "Where the picture stays when the frame's proportions change, in other formats too, and what it grows from. \
+             Moving it in the preview sets it to where it is",
+        );
+        ui.horizontal(|ui| {
+            let frame = ui.add(egui::Button::new("Frame").selected(t.anchor.is_frame()));
+            if frame.on_hover_text("It follows the frame: in other proportions the frame keeps its middle, as frames always did").clicked() {
+                t.anchor = Anchor::Frame;
+            }
+            if let Some(anchor) = anchor_grid(ui, t.anchor) {
+                t.anchor = anchor;
+            }
+        });
+        ui.end_row();
+        let sides = t.anchor.sides().unwrap_or([0.0, 0.0]);
+        let names = [["Left", "X", "Right"], ["Top", "Y", "Bottom"]];
+        let hints = [
+            ["From the frame's left edge to the picture's", "From the frame's middle to the picture's, to the right", "From the frame's right edge to the picture's"],
+            ["From the frame's top edge to the picture's", "From the frame's middle to the picture's, down", "From the frame's bottom edge to the picture's"],
+        ];
+        for axis in 0..2 {
+            let side = (sides[axis] + 1.0) as usize;
+            ui.label(names[axis][side]).on_hover_text(format!("{}, in pixels of the result", hints[axis][side]));
+            moved |= ui.add(egui::DragValue::new(&mut offsets[axis]).speed(1.0).fixed_decimals(0).suffix(" px")).changed();
+            ui.end_row();
+        }
+        ui.label("Scale").on_hover_text("How large the picture is against its own pixels: at 100% a pixel of it is a pixel of the result. It grows from its anchor");
+        if ui.add(egui::DragValue::new(&mut percent).speed(0.5).range(0.1..=100_000.0).fixed_decimals(1).suffix(" %")).changed() {
+            factor = Some(percent / (scale * 100.0));
+        }
+        ui.end_row();
+        ui.label("Size").on_hover_text("Its width and height on the result, in its pixels, before it is turned. They change together: the picture keeps its proportions");
+        ui.horizontal(|ui| {
+            let width = ui.add(egui::DragValue::new(&mut size[0]).speed(1.0).range(1.0..=pixels[0] * 100.0).fixed_decimals(0)).on_hover_text("Width");
+            ui.label("×");
+            let height = ui.add(egui::DragValue::new(&mut size[1]).speed(1.0).range(1.0..=pixels[1] * 100.0).fixed_decimals(0).suffix(" px")).on_hover_text("Height");
+            if width.changed() {
+                factor = Some(size[0] / place.size[0]);
+            } else if height.changed() {
+                factor = Some(size[1] / place.size[1]);
+            }
+        });
+        ui.end_row();
+        ui.label("Angle");
+        turned = ui.add(egui::DragValue::new(&mut angle).speed(0.2).fixed_decimals(1).suffix("°")).changed();
+        ui.end_row();
+    });
+    if moved {
+        *t = t.placed(w, h, outline, pixels, place.center_for(t.anchor, pixels, offsets), place.size[0]);
+    } else if let Some(factor) = factor {
+        // From its anchor: the offsets stay.
+        *t = t.scaled(w, h, outline, pixels, factor);
+    } else if turned {
+        *t = t.turned(w, h, angle);
+    }
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Center").on_hover_text("The picture in the middle of the frame").clicked() {
+            t.cx = 0.5;
+            t.cy = 0.5;
+            if !t.anchor.is_frame() {
+                t.anchor = Anchor::Center;
+            }
+        }
+        if ui.button("Fill").on_hover_text("The picture covers the whole frame, turned as it is").clicked() {
+            *t = t.filling_frame(w, h, outline);
+        }
+        if ui.button("Fit").on_hover_text("The whole picture in the frame: around it the clips under this one show, or black").clicked() {
+            *t = t.showing_whole_picture(w, h, outline);
+        }
+        if ui.button("−90°").clicked() {
+            *t = t.turned(w, h, t.angle_deg - 90.0);
+        }
+        if ui.button("+90°").clicked() {
+            *t = t.turned(w, h, t.angle_deg + 90.0);
+        }
+        if ui.button("0°").clicked() {
+            *t = t.turned(w, h, 0.0);
+        }
+        let mirror = ui.add(egui::Button::new("Mirror").selected(t.mirror));
+        if mirror.on_hover_text("Flip the picture left to right: one that follows the frame flips with all of it").clicked() {
+            *t = t.flipped(w, h);
+        }
+        let bars = ui.add(egui::Button::new("Bars").selected(t.bars));
+        if bars.on_hover_text("Black around the picture: the clips under this one are hidden there").clicked() {
+            t.bars = !t.bars;
+        }
+        if ui.button("Reset").on_hover_text("Back to the start: covering the frame, centered, no turn, no mirror, no bars").clicked() {
+            *t = Transform::default();
+        }
+    });
+}
+
+/// The frame's points in a grid of 3×3, the one `anchor` names filled. Returns the point clicked.
+fn anchor_grid(ui: &mut egui::Ui, anchor: Anchor) -> Option<Anchor> {
+    const CELL: f32 = 12.0;
+    const GAP: f32 = 3.0;
+    let side = 3.0 * CELL + 2.0 * GAP;
+    let (grid, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+    let mut clicked = None;
+    for (i, point) in Anchor::POINTS.into_iter().enumerate() {
+        let at = grid.min + egui::vec2((i % 3) as f32 * (CELL + GAP), (i / 3) as f32 * (CELL + GAP));
+        let cell = egui::Rect::from_min_size(at, egui::vec2(CELL, CELL));
+        let response = ui.interact(cell, ui.id().with(("anchor", i)), egui::Sense::click());
+        let fill = match (point == anchor, response.hovered()) {
+            (true, _) => flash::COLOR,
+            (false, true) => Color32::from_gray(95),
+            (false, false) => Color32::from_gray(45),
+        };
+        ui.painter().rect(cell, 2.0, fill, egui::Stroke::new(1.0, Color32::from_gray(120)));
+        let response = response.on_hover_text(format!("{}: in other proportions it keeps its distance from there and its size against the frame", point.name()));
+        if response.clicked() {
+            clicked = Some(point);
+        }
+    }
+    clicked
 }
 
 /// The border between the panels of the right column: a line with dots in its middle, dragged up and
@@ -1846,7 +2045,7 @@ fn effects_editor(ui: &mut egui::Ui, clip: &mut Clip, picture: bool, sound: bool
                 Effect::SlowMotion(part) => {
                     let factor = part.played();
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Slow motion").strong());
+                        ui.label(RichText::new("Tempo").strong());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("Remove").clicked() {
                                 change = Some((i, EffectChange::SlowMotionOff));

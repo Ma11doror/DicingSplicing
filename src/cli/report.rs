@@ -38,6 +38,9 @@ pub struct Line {
     pub holds: Vec<(f64, f64)>,
     /// All of its picture is in the frame, with black bars around it, as Fit makes it.
     pub bars: bool,
+    /// The point of the frame its picture keeps to, when the editor made it smaller than the frame
+    /// and put it there.
+    pub anchor: Option<&'static str>,
 }
 
 /// What `show` tells, and every command after a change.
@@ -74,6 +77,7 @@ pub fn summary(project: &Project) -> Summary {
                     slow_motion: clip.slowed().iter().map(|part| (part.from, part.to, part.rate)).collect(),
                     holds: clip.holds().iter().map(|hold| (hold.at, hold.span.len())).collect(),
                     bars: clip.transform.bars && clip.transform.zoom < 1.0 - ROUNDING,
+                    anchor: (!clip.transform.anchor.is_frame()).then(|| clip.transform.anchor.name()),
                 })
                 .collect()
         })
@@ -131,12 +135,15 @@ impl Summary {
                 let file = file_label(Path::new(&line.file));
                 let mut at = if line.speed == 1.0 { String::new() } else { format!(", at {}", speed_text(line.speed)) };
                 for (from, to, speed) in &line.slow_motion {
-                    at += &format!(", {} to {} in slow motion at {}", format(*from), format(*to), speed_text(*speed));
+                    at += &format!(", {} to {} at tempo {}", format(*from), format(*to), speed_text(*speed));
                 }
                 for (moment, seconds) in &line.holds {
                     at += &format!(", holding its frame at {} for {}", format(*moment), format(*seconds));
                 }
-                let bars = if line.bars { ", with black bars" } else { "" };
+                let mut bars = if line.bars { ", with black bars".to_owned() } else { String::new() };
+                if let Some(anchor) = line.anchor {
+                    bars += &format!(", anchored to the {}", anchor.to_lowercase());
+                }
                 let plays = match (line.still, line.image) {
                     (true, true) => format!("{file}, an image"),
                     (true, false) => format!("{file}, its frame at {} held", format(line.from)),
@@ -167,6 +174,7 @@ impl Summary {
                 json!({
                     "number": line.number, "name": line.name, "start": line.start, "length": line.length, "file": line.file, "from": line.from, "to": line.to,
                     "speed": line.speed, "slow_motion": slow_motion, "holds": holds, "still": line.still, "image": line.image, "bars": line.bars,
+                    "anchor": line.anchor.map(str::to_lowercase),
                 })
             })
             .collect();
@@ -336,7 +344,7 @@ mod tests {
         let told = summary(&project);
         let text = told.text();
         assert!(text.contains("  00:12.50  03:54.00  "), "1 s longer: {text}");
-        assert!(text.contains("install.mp4 00:12.00 to 04:05.00, 00:19.50 to 00:20.50 in slow motion at ×0.5"), "{text}");
+        assert!(text.contains("install.mp4 00:12.00 to 04:05.00, 00:19.50 to 00:20.50 at tempo ×0.5"), "{text}");
         assert_eq!(told.json()["clips"][1]["slow_motion"], json!([{"from": 19.5, "to": 20.5, "speed": 0.5}]));
         assert_eq!(told.json()["clips"][0]["slow_motion"], json!([]));
         // A cut at 20 s of the recording, in it: each part has its part of it.

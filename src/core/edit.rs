@@ -6,7 +6,7 @@
 
 use crate::core::export::ExportSettings;
 use crate::core::preset::Output;
-use crate::media::geometry::Transform;
+use crate::media::geometry::{Outline, Transform};
 use crate::media::probe::MediaInfo;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -403,6 +403,10 @@ pub type ClipKey = u64;
 
 /// A clip as it is copied: with the track it is on and that track's kind.
 pub type Copied = (Clip, TrackId, TrackKind);
+
+/// The size of a source's picture, once its file has been read: what decides whether a clip's
+/// picture covers the frame.
+pub type Sizes<'a> = &'a dyn Fn(SourceId) -> Option<[f64; 2]>;
 
 /// A clip's key as a part of it: a new one for every clip made, a copy or a part of a cut too. Not
 /// saved, and no part of what the clip is: clips compare equal whatever their keys, so that an undo
@@ -968,6 +972,7 @@ impl Clip {
             set(&mut own.angle_deg, was.angle_deg, now.angle_deg);
             set(&mut own.mirror, was.mirror, now.mirror);
             set(&mut own.bars, was.bars, now.bars);
+            set(&mut own.anchor, was.anchor, now.anchor);
             match (before.color().copied(), after.color().copied()) {
                 (Some(_), None) => self.remove_color(),
                 (was, Some(now)) if was != Some(now) => {
@@ -1282,19 +1287,51 @@ impl Sequence {
         self.tracks.get(id.track).is_some_and(|track| id.index < track.clips.len())
     }
 
-    /// The clip whose picture is seen at `t`: the topmost one on a video track that is not hidden. It
-    /// covers the whole frame, bars included, so nothing under it shows.
+    /// The topmost clip seen at `t`: on a video track that is not hidden. Its picture may leave parts
+    /// of the frame to the clips under it: `stack_at` has all that are seen.
     pub fn shown_at(&self, t: f64) -> Option<ClipId> {
         let mut visible = self.tracks.iter().enumerate().rev().filter(|(_, track)| track.kind == TrackKind::Video && !track.hidden);
         visible.find_map(|(track, clips)| Some(ClipId { track, index: clips.clip_at(t)? }))
     }
 
-    /// The clip seen at `t` under the tracks from `track` up: what a clip on `track` shows through
-    /// while it fades.
-    pub fn shown_under(&self, t: f64, track: usize) -> Option<ClipId> {
-        let below = self.tracks[..track.min(self.tracks.len())].iter().enumerate().rev();
-        let mut visible = below.filter(|(_, track)| track.kind == TrackKind::Video && !track.hidden);
-        visible.find_map(|(track, clips)| Some(ClipId { track, index: clips.clip_at(t)? }))
+    /// Whether clip `id` hides everything under it at `t`: it does not fade there, and its picture,
+    /// or its black bars, cover all of the frame. A clip whose picture's size is not known yet covers
+    /// the frame.
+    pub fn hides_below(&self, id: ClipId, t: f64, sizes: Sizes) -> bool {
+        let clip = self.clip(id);
+        let outline = self.output.outline();
+        clip.opacity(t) >= 1.0 && (clip.transform.bars || sizes(clip.source).is_none_or(|[w, h]| clip.transform.covers(w, h, outline)))
+    }
+
+    /// The clips seen at `t`, the lowest first: from the topmost one down to the first that hides
+    /// everything under it.
+    pub fn stack_at(&self, t: f64, sizes: Sizes) -> Vec<ClipId> {
+        let mut stack = Vec::new();
+        let visible = self.tracks.iter().enumerate().rev().filter(|(_, track)| track.kind == TrackKind::Video && !track.hidden);
+        for (track, clips) in visible {
+            let Some(index) = clips.clip_at(t) else { continue };
+            let id = ClipId { track, index };
+            stack.push(id);
+            if self.hides_below(id, t, sizes) {
+                break;
+            }
+        }
+        stack.reverse();
+        stack
+    }
+
+    /// The output's proportions were `from`: the pictures that stay in place against a point of the
+    /// frame move to the frame there is now. Those that follow the frame stay as they are.
+    pub fn keep_anchors(&mut self, from: Outline, sizes: Sizes) {
+        let to = self.output.outline();
+        if from == to {
+            return;
+        }
+        for clip in self.tracks.iter_mut().flat_map(|track| &mut track.clips) {
+            if let Some([w, h]) = sizes(clip.source).filter(|_| !clip.transform.anchor.is_frame()) {
+                clip.transform = clip.transform.moved_to(w, h, from, to).clamped(w, h, to);
+            }
+        }
     }
 
     /// Whether the sound of a clip is heard: on a track that is not muted, not muted itself, and on
@@ -1330,11 +1367,35 @@ impl Sequence {
         pieces
     }
 
-    /// The source seen longest in the export range: what the result is mostly made of.
-    pub fn main_source(&self) -> Option<SourceId> {
+    /// What the picture is made of in `range`: pieces of it, each with the clips seen there, the
+    /// lowest first. Pieces that follow each other with the same clips are one.
+    pub fn layers(&self, range: Span, sizes: Sizes) -> Vec<(Span, Vec<ClipId>)> {
+        let mut cuts = vec![range.start, range.end];
+        for (_, clip) in self.seen_clips() {
+            let (fade_in, fade_out) = clip.fade_lengths();
+            let edges = [clip.start, clip.end(), clip.start + fade_in, clip.end() - fade_out];
+            cuts.extend(edges.into_iter().filter(|&t| t > range.start && t < range.end));
+        }
+        cuts.sort_by(f64::total_cmp);
+        cuts.dedup_by(|a, b| (*a - *b).abs() < SAME_TIME);
+        let mut pieces: Vec<(Span, Vec<ClipId>)> = Vec::new();
+        for pair in cuts.windows(2) {
+            let span = Span { start: pair[0], end: pair[1] };
+            let stack = self.stack_at((span.start + span.end) / 2.0, sizes);
+            match pieces.last_mut() {
+                Some((last, clips)) if *clips == stack => last.end = span.end,
+                _ => pieces.push((span, stack)),
+            }
+        }
+        pieces
+    }
+
+    /// The source seen longest in the export range at the bottom of what is seen: what the result is
+    /// mostly made of, a picture laid over it or not.
+    pub fn main_source(&self, sizes: Sizes) -> Option<SourceId> {
         let mut seen: Vec<(SourceId, f64)> = Vec::new();
-        for (span, id) in self.picture(self.export) {
-            let Some(id) = id else { continue };
+        for (span, stack) in self.layers(self.export, sizes) {
+            let Some(&id) = stack.first() else { continue };
             let source = self.clip(id).source;
             match seen.iter_mut().find(|(known, _)| *known == source) {
                 Some((_, time)) => *time += span.len(),
@@ -1347,6 +1408,28 @@ impl Sequence {
     /// How many clips play `source`.
     pub fn uses(&self, source: SourceId) -> usize {
         self.clips().filter(|(_, clip)| clip.source == source).count()
+    }
+
+    /// The parts of `source` that clips play, in its own seconds: in order, joined where they meet
+    /// or overlap. A still of a video marks the moment it holds; an image has no parts.
+    pub fn used_parts(&self, source: SourceId) -> Vec<Span> {
+        let mut parts: Vec<Span> = self
+            .clips()
+            .filter(|(_, clip)| clip.source == source && !clip.is_image())
+            .map(|(_, clip)| match clip.still {
+                Some(at) => Span { start: at, end: at },
+                None => Span { start: clip.source_in, end: clip.source_out },
+            })
+            .collect();
+        parts.sort_by(|a, b| a.start.total_cmp(&b.start));
+        let mut joined: Vec<Span> = Vec::new();
+        for part in parts {
+            match joined.last_mut() {
+                Some(last) if part.start <= last.end + SAME_TIME => last.end = last.end.max(part.end),
+                _ => joined.push(part),
+            }
+        }
+        joined
     }
 
     /// The source turned out to have another length: see `Clip::refit_source`. Returns whether a
@@ -2993,15 +3076,59 @@ mod tests {
     }
 
     #[test]
-    fn a_fading_clip_shows_what_is_under_it() {
+    fn the_stack_goes_down_to_the_first_clip_that_hides_what_is_under_it() {
+        use crate::core::preset::PresetId;
         let mut sequence = Sequence::new(Clip::new("a".into(), 10.0));
+        sequence.output = Output { preset: PresetId::Landscape, ..Output::default() };
         sequence.tracks.push(track_of(vec![Clip { start: 2.0, ..Clip::of(1, "b".into(), 4.0) }]));
         sequence.tracks.push(track_of(vec![Clip { start: 3.0, ..Clip::of(2, "c".into(), 1.0) }]));
-        assert_eq!(sequence.shown_under(3.5, 2), Some(ClipId { track: 1, index: 0 }));
-        assert_eq!(sequence.shown_under(3.5, 1), Some(ClipId { track: 0, index: 0 }));
-        assert_eq!(sequence.shown_under(3.5, 0), None);
+        let (a, b, c) = (ClipId { track: 0, index: 0 }, ClipId { track: 1, index: 0 }, ClipId { track: 2, index: 0 });
+        let full_hd: Sizes = &|_| Some([1920.0, 1080.0]);
+        assert_eq!(sequence.stack_at(3.5, full_hd), [c]);
+        assert_eq!(sequence.stack_at(1.0, full_hd), [a]);
+        // Smaller than the frame, or turned, a picture leaves the rest to what is under it.
+        sequence.clip_mut(c).transform.zoom = 0.5;
+        assert_eq!(sequence.stack_at(3.5, full_hd), [b, c]);
+        sequence.clip_mut(b).transform.angle_deg = 5.0;
+        assert_eq!(sequence.stack_at(3.5, full_hd), [a, b, c]);
+        // With black bars it hides everything under it again.
+        sequence.clip_mut(b).transform.bars = true;
+        assert_eq!(sequence.stack_at(3.5, full_hd), [b, c]);
+        // While it fades, what is under it shows.
+        sequence.clip_mut(b).add_fade(Edge::In);
+        sequence.clip_mut(b).fade_mut(Edge::In).unwrap().seconds = 2.0;
+        assert_eq!(sequence.stack_at(3.5, full_hd), [a, b, c]);
+        assert_eq!(sequence.stack_at(4.5, full_hd), [b]);
+        // A hidden track is not seen; a clip whose size is not known yet covers the frame.
         sequence.tracks[1].hidden = true;
-        assert_eq!(sequence.shown_under(3.5, 2), Some(ClipId { track: 0, index: 0 }));
+        assert_eq!(sequence.stack_at(3.5, full_hd), [a, c]);
+        assert_eq!(sequence.stack_at(3.5, &|_| None), [c]);
+        // The pieces of a range, each with what is seen there.
+        assert_eq!(sequence.layers(span(0.0, 10.0), full_hd), [(span(0.0, 3.0), vec![a]), (span(3.0, 4.0), vec![a, c]), (span(4.0, 10.0), vec![a])]);
+    }
+
+    #[test]
+    fn pinned_pictures_follow_the_output_and_the_rest_stays() {
+        use crate::core::preset::PresetId;
+        use crate::media::geometry::Anchor;
+        let mut sequence = Sequence::new(Clip::new("a".into(), 10.0));
+        sequence.output = Output { preset: PresetId::Landscape, ..Output::default() };
+        sequence.tracks.push(track_of(vec![Clip::of(1, "b".into(), 4.0)]));
+        let (a, b) = (ClipId { track: 0, index: 0 }, ClipId { track: 1, index: 0 });
+        sequence.clip_mut(a).transform.cx = 0.4;
+        sequence.clip_mut(b).transform = Transform { cx: -0.2, cy: 1.3, zoom: 0.3, anchor: Anchor::TopRight, ..Transform::default() };
+        let before = sequence.clone();
+        let from = sequence.output.outline();
+        sequence.output.preset = PresetId::Vertical;
+        let sizes: Sizes = &|_| Some([1920.0, 1080.0]);
+        sequence.keep_anchors(from, sizes);
+        assert_eq!(sequence.clip(a).transform, before.clip(a).transform);
+        let moved = before.clip(b).transform.moved_to(1920.0, 1080.0, from, sequence.output.outline());
+        assert_eq!(sequence.clip(b).transform, moved);
+        // The same proportions change nothing.
+        let again = sequence.clone();
+        sequence.keep_anchors(sequence.output.outline(), sizes);
+        assert_eq!(sequence, again);
     }
 
     #[test]
@@ -3087,14 +3214,21 @@ mod tests {
     #[test]
     fn the_main_source_is_the_one_seen_longest() {
         let mut sequence = Sequence::new(Clip::new("a".into(), 10.0));
-        assert_eq!(sequence.main_source(), Some(0));
+        let unknown: Sizes = &|_| None;
+        assert_eq!(sequence.main_source(unknown), Some(0));
         // Two clips of source 1 cover 7 s of the 10 s of source 0.
         sequence.tracks.push(track_of(vec![Clip { start: 1.0, ..Clip::of(1, "b".into(), 4.0) }, Clip { start: 6.0, ..Clip::of(1, "c".into(), 3.0) }]));
-        assert_eq!(sequence.main_source(), Some(1));
+        assert_eq!(sequence.main_source(unknown), Some(1));
+        // Pictures smaller than the frame lie over source 0: that is what the result is made of.
+        let full_hd: Sizes = &|_| Some([1920.0, 1080.0]);
+        for clip in &mut sequence.tracks[1].clips {
+            clip.transform.zoom = 0.5;
+        }
+        assert_eq!(sequence.main_source(full_hd), Some(0));
         sequence.tracks[1].hidden = true;
-        assert_eq!(sequence.main_source(), Some(0));
+        assert_eq!(sequence.main_source(unknown), Some(0));
         sequence.export = span(20.0, 30.0);
-        assert_eq!(sequence.main_source(), None);
+        assert_eq!(sequence.main_source(unknown), None);
     }
 
     #[test]
@@ -3286,6 +3420,22 @@ mod tests {
 
     fn names_and_starts(sequence: &Sequence, track: usize) -> Vec<(&str, f64)> {
         sequence.tracks[track].clips.iter().map(|clip| (clip.name.as_str(), clip.start)).collect()
+    }
+
+    #[test]
+    fn the_parts_of_a_source_on_the_timeline_are_joined_where_they_meet() {
+        // Of source 0: 2..12, 10..15 over it, 20..21, and a frame of it at 25 held as a still of its
+        // own; of source 1 all of it; source 2 is not on the timeline.
+        let mut sequence = Sequence::new(Clip { source_in: 2.0, source_out: 12.0, ..Clip::of(0, "a".into(), 30.0) });
+        sequence.tracks[0].clips.push(Clip { start: 20.0, source_in: 10.0, source_out: 15.0, ..Clip::of(0, "b".into(), 30.0) });
+        sequence.tracks.push(track_of(vec![
+            Clip { source_in: 20.0, source_out: 21.0, ..Clip::of(0, "c".into(), 30.0) },
+            Clip { start: 5.0, ..Clip::of(1, "d".into(), 4.0) },
+            Clip { start: 10.0, still: Some(25.0), source_out: 2.0, ..Clip::of(0, "e".into(), 30.0) },
+        ]));
+        assert_eq!(sequence.used_parts(0), [span(2.0, 15.0), span(20.0, 21.0), span(25.0, 25.0)]);
+        assert_eq!(sequence.used_parts(1), [span(0.0, 4.0)]);
+        assert!(sequence.used_parts(2).is_empty());
     }
 
     #[test]

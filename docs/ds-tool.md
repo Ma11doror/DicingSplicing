@@ -47,7 +47,8 @@ What they do:
   recording starts, without `--to` it ends where the recording ends. `--name` is what the clip is
   called on the timeline; without it, the file's name. The recording's sound comes with it. `--fit`
   shows all of the picture: a recording of other proportions than the frame, such as a 16:10 screen
-  in the 16:9 frame, gets black bars instead of losing its edges, as Fit does in the editor.
+  in the 16:9 frame, gets black bars instead of losing its edges: all of it is in the frame, as Fit
+  shows it in the editor.
 - **insert** puts a piece before clip `N`; clip `N` and the clips after it move on by its length.
 - **delete** takes clip `N` off; the clips after it move back by its length, so no gap is left.
 - **move** makes clip `N` the clip `M`; the clips stay one after another.
@@ -120,9 +121,11 @@ the command line, or numbers of seconds; `"fit": true` is `--fit`.
 - The text: what was done, then the project. With `--json`, the same as an object: `done`, and
   `project` with `name`, `frame`, `ratio`, `clips` (each with `number`, `name`, `start`, `length`,
   `file`, `from` and `to`, in seconds, `speed`, `slow_motion`, `holds`, `still`, `image`, and
-  `bars`, true for a picture shown whole with black bars), `length`, `export`, `other_tracks` and
+  `bars`, true for a picture shown whole with black bars, and `anchor`, the point of the frame that
+  a picture the editor made smaller than it keeps to, such as `top right`, or null), `length`,
+  `export`, `other_tracks` and
   `warnings`. `check` adds `problems`. `slow_motion` are the parts of the file the clip plays at a
-  speed of their own, each with `from` and `to` in the file and `speed`. `holds` are the frames the
+  speed of their own (Tempo, in the editor), each with `from` and `to` in the file and `speed`. `holds` are the frames the
   clip holds on the way, each with `at`, its moment in the file, and `seconds`, how long it is held.
   `still` is true for a clip that shows one picture all along, and `image` for one of an image;
   `from` and `to` of such a clip are both the moment of its picture in the file.
@@ -141,8 +144,8 @@ the command line, or numbers of seconds; `"fit": true` is `--fit`.
   much longer: `show` tells it after the part the clip plays, "holding its frame at 00:12.40 for
   00:02.00". `blade` cuts it with the clip, and `trim` keeps it while its moment stays in the part
   played.
-- So does a part in slow motion, made in the editor with Slow motion, which makes the clip longer
-  or shorter: `show` tells it as "00:19.50 to 00:20.50 in slow motion at ×0.5". `blade` cuts it with
+- So does a part at a tempo of its own, made in the editor with Tempo, which makes the clip longer
+  or shorter: `show` tells it as "00:19.50 to 00:20.50 at tempo ×0.5". `blade` cuts it with
   the clip, its `--at` being a moment of the file as ever, and `trim` keeps what of it stays in the
   part played.
 - A clip chained to another in the editor, as a picture to its detached sound, is left to the editor:
@@ -155,8 +158,9 @@ the command line, or numbers of seconds; `"fit": true` is `--fit`.
   editor included.
 - A recording of other proportions than the frame has its edges cut, as any new clip in the editor,
   unless it is put in with `--fit`. `show` marks a clip shown whole: "with black bars". In the editor,
-  Fit does the same to any clip: it is in the menu that opens when the pointer rests on the frame's
-  top mark.
+  Fit shows any clip whole and Bars makes the rest of the frame black: both are buttons of Transform in
+  the Clip panel. A clip the editor laid smaller than the frame, kept to a point of it, is "anchored to
+  the top right", say.
 - Recordings are linked, not copied: keep them where they are.
 - A clip can be made faster or slower in the editor (the Speed effect). `show` says so: "at ×2"; it
   is half as long then. `--from`, `--to` and `--at` are still times in its recording.

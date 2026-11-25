@@ -1,6 +1,6 @@
 //! Rendering the edit to a file with ffmpeg, always from the original source.
 
-use crate::core::edit::{Clip, ClipId, Curve, Edge, Run, Sequence, Span};
+use crate::core::edit::{Clip, ClipId, Curve, Edge, Run, Sequence, Sizes, SourceId, Span, TrackKind};
 use crate::core::export::{ExportSettings, FrameRate, Rate, VideoCodec, EVEN_LOUDNESS};
 use crate::core::preset::Preset;
 use crate::core::tools;
@@ -19,6 +19,9 @@ use std::thread::{self, JoinHandle};
 
 /// How far before the start the fast seek lands; decoding covers the rest exactly.
 const SEEK_MARGIN: f64 = 3.0;
+/// Windows takes command lines of up to 32767 characters: a filter graph longer than this goes to
+/// ffmpeg in a file.
+const GRAPH_INLINE_LIMIT: usize = 16_000;
 /// What Telegram accepts as a video note, from tgCircleGen and the Bot API limit.
 const TELEGRAM_MIN_SECONDS: f64 = 10.0;
 const TELEGRAM_MAX_SECONDS: f64 = 60.0;
@@ -73,6 +76,39 @@ fn frame_filter(w: f64, h: f64, t: &Transform, outline: Outline, pixels: [u32; 2
     steps.join(",")
 }
 
+/// The filters that make a picture `w`×`h` what it is on a frame of `pixels`: the part of it that
+/// the frame takes in, cut out and scaled, turned and mirrored, transparent around; and where its
+/// top left corner goes on the frame. None when none of it is on the frame.
+fn placed_filter(w: f64, h: f64, t: &Transform, outline: Outline, pixels: [u32; 2]) -> Option<(String, [i64; 2])> {
+    let [pw, ph] = pixels.map(f64::from);
+    let scale = pw / t.size(w, h, outline)[0];
+    // The part of the picture around the turned frame, in whole pixels.
+    let corners = t.corners(w, h, outline);
+    let low = |axis: usize| corners.iter().map(|corner| corner[axis]).fold(f64::INFINITY, f64::min).floor().max(0.0);
+    let high = |axis: usize, end: f64| corners.iter().map(|corner| corner[axis]).fold(f64::NEG_INFINITY, f64::max).ceil().min(end);
+    let (x0, y0, x1, y1) = (low(0), low(1), high(0, w), high(1, h));
+    if x1 - x0 < 1.0 || y1 - y0 < 1.0 {
+        return None;
+    }
+    let (sw, sh) = (((x1 - x0) * scale).round().max(1.0), ((y1 - y0) * scale).round().max(1.0));
+    let mut steps = vec![format!("format=rgba,crop={}:{}:{x0}:{y0}:exact=1,scale={sw}:{sh}:flags=lanczos,setsar=1", x1 - x0, y1 - y0)];
+    let (mut ow, mut oh) = (sw, sh);
+    if t.angle_deg.abs() > 1e-6 {
+        let angle = t.angle_deg.to_radians();
+        let (sin, cos) = (angle.sin().abs(), angle.cos().abs());
+        let even_up = |v: f64| (v.ceil() / 2.0).ceil() * 2.0;
+        (ow, oh) = (even_up(sw * cos + sh * sin), even_up(sw * sin + sh * cos));
+        steps.push(format!("rotate={angle:.8}:ow={ow}:oh={oh}:c=none"));
+    }
+    if t.mirror {
+        steps.push("hflip".to_owned());
+    }
+    // Where the middle of that part is on the frame; turning keeps it in the middle.
+    let [u, v] = t.source_to_output(w, h, [(x0 + x1) / 2.0, (y0 + y1) / 2.0]);
+    let at = [(pw / 2.0 + u * scale - ow / 2.0).round() as i64, (ph / 2.0 + v * scale - oh / 2.0).round() as i64];
+    Some((steps.join(","), at))
+}
+
 /// Rounding can put a box that fits the picture a pixel outside of it.
 fn pull_in(position: f64, max: f64) -> f64 {
     if (-1.0..0.0).contains(&position) {
@@ -84,58 +120,96 @@ fn pull_in(position: f64, max: f64) -> f64 {
     }
 }
 
-/// A run of the result's frames that come from one clip, or are black. While the clip fades, what
-/// is `under` it shows through; with nothing under it, it fades into black.
+/// A run of the result's frames with one clip at the bottom of what is seen, over black, or black.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Piece {
     first: u64,
     count: u64,
     clip: Option<ClipId>,
-    under: Option<ClipId>,
 }
 
-/// The result's picture, frame by frame: the clip each run of frames shows, and while it fades, the
-/// clip under it. Where one clip gives way to another, a fade begins or ends, or a clip starts or
-/// stops holding a frame or playing in slow motion, falls on the frame nearest to where it is on the
-/// timeline.
-fn pieces(sequence: &Sequence, fps: f64) -> Vec<Piece> {
+/// A run of the result's frames in which a clip is seen over what is under it: laid over the pieces,
+/// in the order of the tracks. It plays its source at one rate or holds a frame, all of it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Layer {
+    first: u64,
+    count: u64,
+    clip: ClipId,
+}
+
+/// The result's picture, frame by frame: what is at the bottom of each run of frames, and what is
+/// laid over it. A clip seen over others across cuts under it is one layer: one input, however
+/// many pieces it lies on. Where one clip gives way to another, a fade begins or ends, or a clip
+/// starts or stops holding a frame or playing in slow motion, falls on the frame nearest to where it
+/// is on the timeline.
+fn pieces(sequence: &Sequence, fps: f64, sizes: Sizes) -> (Vec<Piece>, Vec<Layer>) {
     let export = sequence.export;
     let frame_at = |t: f64| ((t - export.start) * fps).round().max(0.0) as u64;
     let mut cuts = vec![export.start, export.end];
-    for (span, _) in sequence.picture(export) {
-        cuts.extend([span.start, span.end]);
-    }
-    for (_, clip) in sequence.clips().filter(|(id, _)| !sequence.tracks[id.track].hidden) {
+    let seen = sequence.clips().filter(|(id, _)| sequence.tracks[id.track].kind == TrackKind::Video && !sequence.tracks[id.track].hidden);
+    for (_, clip) in seen {
         let (fade_in, fade_out) = clip.fade_lengths();
         let runs = clip.runs().into_iter().flat_map(|run| [run.span.start, run.span.end]);
-        cuts.extend([clip.start + fade_in, clip.end() - fade_out].into_iter().chain(runs).filter(|&t| export.contains(t)));
+        let edges = [clip.start, clip.end(), clip.start + fade_in, clip.end() - fade_out];
+        cuts.extend(edges.into_iter().chain(runs).filter(|&t| export.contains(t)));
     }
     cuts.sort_by(f64::total_cmp);
+    // Which run of a clip a moment is in.
+    let run_of = |id: ClipId, t: f64| sequence.clip(id).runs().iter().position(|run| run.span.contains(t));
     let mut pieces: Vec<Piece> = Vec::new();
-    // Which run of its clip, and of the clip under it, the last piece is in: a piece plays its
-    // source at one rate or holds a frame, all of it.
-    let mut last_runs = (None, None);
+    let mut last_run = None;
+    let mut layers: Vec<(Layer, Option<usize>)> = Vec::new();
+    // The layers that reach the frame where the last run of frames ended.
+    let mut open: Vec<usize> = Vec::new();
     for pair in cuts.windows(2) {
         let (first, end) = (frame_at(pair[0]), frame_at(pair[1]));
         if end <= first {
             continue;
         }
         let middle = (pair[0] + pair[1]) / 2.0;
-        let clip = sequence.shown_at(middle);
-        let fading = clip.filter(|&id| sequence.clip(id).opacity(middle) < 1.0);
-        let under = fading.and_then(|id| sequence.shown_under(middle, id.track));
-        let run_of = |id: Option<ClipId>| id.map(|id| sequence.clip(id).runs().iter().position(|run| run.span.contains(middle)));
-        let runs = (run_of(clip), run_of(under));
+        let stack = sequence.stack_at(middle, sizes);
+        let clip = stack.first().copied();
+        let run = clip.map(|id| run_of(id, middle));
         match pieces.last_mut() {
-            Some(last) if (last.clip, last.under) == (clip, under) && last_runs == runs => last.count = end - last.first,
-            _ => pieces.push(Piece { first, count: end - first, clip, under }),
+            Some(last) if last.clip == clip && last_run == run => last.count = end - last.first,
+            _ => pieces.push(Piece { first, count: end - first, clip }),
         }
-        last_runs = runs;
+        last_run = run;
+        let mut going_on = Vec::new();
+        for &id in stack.iter().skip(1) {
+            let run = run_of(id, middle);
+            match open.iter().copied().find(|&i| layers[i].0.clip == id && layers[i].1 == run) {
+                Some(i) => {
+                    layers[i].0.count = end - layers[i].0.first;
+                    going_on.push(i);
+                }
+                None => {
+                    layers.push((Layer { first, count: end - first, clip: id }, run));
+                    going_on.push(layers.len() - 1);
+                }
+            }
+        }
+        open = going_on;
     }
     if pieces.is_empty() {
-        pieces.push(Piece { first: 0, count: frame_at(export.end).max(1), clip: None, under: None });
+        pieces.push(Piece { first: 0, count: frame_at(export.end).max(1), clip: None });
     }
-    pieces
+    let mut layers: Vec<Layer> = layers.into_iter().map(|(layer, _)| layer).collect();
+    layers.sort_by_key(|layer| (layer.clip.track, layer.first));
+    (pieces, layers)
+}
+
+/// The size of each source's picture, as its file says.
+fn sizes_of(files: &SourceFiles) -> impl Fn(SourceId) -> Option<[f64; 2]> + '_ {
+    |source| files.get(&source).map(|file| [file.info.width as f64, file.info.height as f64])
+}
+
+/// Every clip seen somewhere in the export range, once each.
+fn seen_clips(sequence: &Sequence, files: &SourceFiles) -> Vec<ClipId> {
+    let mut seen: Vec<ClipId> = sequence.layers(sequence.export, &sizes_of(files)).into_iter().flat_map(|(_, stack)| stack).collect();
+    seen.sort_by_key(|id| (id.track, id.index));
+    seen.dedup();
+    seen
 }
 
 /// The clips whose sound is in the result, each with the parts of the timeline it sounds in and the
@@ -168,7 +242,7 @@ fn frame_rate(sequence: &Sequence, files: &SourceFiles) -> (String, f64) {
     match sequence.settings.frame_rate {
         FrameRate::Fixed(fps) => (fps.to_string(), fps),
         FrameRate::Source => {
-            let moving = sequence.picture(sequence.export).into_iter().filter_map(|(_, id)| id).map(|id| sequence.clip(id)).filter(|clip| clip.still.is_none());
+            let moving = seen_clips(sequence, files).into_iter().map(|id| sequence.clip(id)).filter(|clip| clip.still.is_none());
             let seen = moving.filter_map(|clip| files.get(&clip.source));
             let fastest = seen.map(|file| file.info.fps).max_by(|a, b| a.as_f64().total_cmp(&b.as_f64()));
             fastest.map_or_else(|| ("30".to_owned(), 30.0), |fps| (format!("{}/{}", fps.num, fps.den), fps.as_f64()))
@@ -227,6 +301,41 @@ pub struct RenderPlan {
     pub args: Vec<OsString>,
     /// Length of the result in seconds.
     pub total: f64,
+    /// The file the filter graph is in, when it is too long for the command line. It goes with the
+    /// plan.
+    graph_file: Option<PathBuf>,
+}
+
+impl RenderPlan {
+    fn new(args: Vec<OsString>, total: f64) -> Self {
+        Self { args, total, graph_file: None }
+    }
+
+    /// Hands the filter graph to ffmpeg: on the command line, or in a file when it is too long for it.
+    fn set_graph(&mut self, graph: &[String]) -> Result<()> {
+        let graph = graph.join(";");
+        if graph.len() <= GRAPH_INLINE_LIMIT {
+            self.args.push("-filter_complex".into());
+            self.args.push(graph.into());
+            return Ok(());
+        }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let file = std::env::temp_dir().join(format!("dicing_splicing_graph_{}_{n}.txt", std::process::id()));
+        fs::write(&file, graph).with_context(|| format!("Can't write the filter graph to {}", file.display()))?;
+        self.args.push("-/filter_complex".into());
+        self.args.push(file.as_os_str().into());
+        self.graph_file = Some(file);
+        Ok(())
+    }
+}
+
+impl Drop for RenderPlan {
+    fn drop(&mut self) {
+        if let Some(file) = &self.graph_file {
+            let _ = fs::remove_file(file);
+        }
+    }
 }
 
 /// Adds an input that starts a little before `start`, and not after `latest`: seeking before the
@@ -354,6 +463,24 @@ struct Frames<'a> {
     pixels: [u32; 2],
 }
 
+/// How `clip_frames` draws a clip.
+struct Look {
+    /// Its fades take it into transparency, for what is under it to show through; else into black.
+    alpha: bool,
+    /// Its fades are in the frames. Without, they are left to what is done with the frames after.
+    fades: bool,
+    /// Only its picture, as large as it is on the frame and transparent around: these filters make
+    /// it so. Without, the whole frame.
+    placed: Option<String>,
+}
+
+impl Look {
+    /// The whole frame, faded into transparency with `alpha`, else into black.
+    fn frame(alpha: bool) -> Self {
+        Self { alpha, fades: true, placed: None }
+    }
+}
+
 /// The filters of `fades` in a clip's picture, where its own time `zero` is 0: ffmpeg's `fade` for a
 /// straight one, the mask of one by its formula. `transparent`: they take the picture into
 /// transparency, else into black. `name` tells the mask's own labels apart.
@@ -379,14 +506,14 @@ fn fade_chain(fades: &[FadeAt], zero: f64, transparent: bool, name: &str) -> Str
 }
 
 /// The filters that make the frames of `clip` for the run of result frames `(first, count)`, ending
-/// in `label`. Its fades take its picture into black, or with `alpha` into transparency, for what is
-/// under it to show through. The frames are all of a part of the clip where it plays its source, or
-/// all of one where it holds a frame.
+/// in `label`, as `look` says: the whole frame, or only its picture where it is on the frame. Its
+/// fades take it into black, or into transparency, for what is under it to show through. The frames
+/// are all of a part of the clip where it plays its source, or all of one where it holds a frame.
 ///
 /// A straight fade is ffmpeg's `fade`. One by another curve, or one that started before the input
 /// did, is a mask of how much shows, made frame by frame by its formula; with nothing under the
 /// clip, it is laid over black.
-fn clip_frames(frames: &Frames, args: &mut Vec<OsString>, inputs: &mut usize, id: ClipId, (first, count): (u64, u64), alpha: bool, label: &str) -> Result<String> {
+fn clip_frames(frames: &Frames, args: &mut Vec<OsString>, inputs: &mut usize, id: ClipId, (first, count): (u64, u64), look: &Look, label: &str) -> Result<String> {
     let (sequence, rate, fps) = (frames.sequence, frames.rate, frames.fps);
     let clip = sequence.clip(id);
     let file = file_of(frames.files, clip)?;
@@ -397,7 +524,10 @@ fn clip_frames(frames: &Frames, args: &mut Vec<OsString>, inputs: &mut usize, id
     let middle = clip.start + (own.0 + own.1) / 2.0;
     let run = runs.iter().find(|run| run.span.contains(middle)).unwrap_or(&runs[runs.len() - 1]);
     let name = label.trim_matches(['[', ']']);
-    let frame = frame_filter(file.info.width as f64, file.info.height as f64, &clip.transform, sequence.output.outline(), frames.pixels);
+    let frame = match &look.placed {
+        Some(placed) => placed.clone(),
+        None => frame_filter(file.info.width as f64, file.info.height as f64, &clip.transform, sequence.output.outline(), frames.pixels),
+    };
     // The colour comes first: a fade into black ends in black whatever the contrast.
     let colored = clip.graded().map_or_else(String::new, |grade| color::filters(&grade));
     // Where the frames come from, up to their fades; the fades, by the time the frames have there and
@@ -407,7 +537,7 @@ fn clip_frames(frames: &Frames, args: &mut Vec<OsString>, inputs: &mut usize, id
         // timed by the clip's own time, from where they start in it, for its fades to go by; then
         // from 0, as the result's frames. What is transparent in an image is black.
         Some(at) => {
-            let (fades, _) = fade_filters_of(clip, own, (0.0, 1.0), false);
+            let (fades, _) = if look.fades { fade_filters_of(clip, own, (0.0, 1.0), false) } else { (Vec::new(), f64::INFINITY) };
             let (input, at) = add_frame_input(args, inputs, file, at);
             let flat = if file.info.image { format!(",{OVER_BLACK}") } else { String::new() };
             let source = format!(
@@ -426,7 +556,7 @@ fn clip_frames(frames: &Frames, args: &mut Vec<OsString>, inputs: &mut usize, id
             let start = run.source_time(at_first);
             let end = start + count as f64 / rate * speed;
             let a = run.source - (run.span.start - clip.start) * speed;
-            let (fades, latest) = fade_filters_of(clip, own, (a, speed), false);
+            let (fades, latest) = if look.fades { fade_filters_of(clip, own, (a, speed), false) } else { (Vec::new(), f64::INFINITY) };
             let (input, seek) = add_input(args, inputs, &file.path, start, end, latest);
             let (from, to) = (start - seek, end - seek);
             // From the source's moment `start` on, as fast as the clip plays.
@@ -436,9 +566,9 @@ fn clip_frames(frames: &Frames, args: &mut Vec<OsString>, inputs: &mut usize, id
         }
     };
     let masked = fades.iter().any(|fade| fade.by_formula(zero));
-    let transparent = alpha || masked;
+    let transparent = look.alpha || masked || look.placed.is_some();
     let format = if transparent { "yuva420p" } else { "yuv420p" };
-    let over_black = masked && !alpha;
+    let over_black = masked && !look.alpha;
     let out = if over_black { format!("[{name}o]") } else { label.to_owned() };
     let fade = fade_chain(&fades, zero, transparent, name);
     let mut filters = format!("{source}{fade}{rest},format={format}{out}");
@@ -452,29 +582,108 @@ fn clip_frames(frames: &Frames, args: &mut Vec<OsString>, inputs: &mut usize, id
     Ok(filters)
 }
 
-/// The picture of the edit as filters into `[v]`: its pieces one after another, a fading clip over
-/// the clip under it.
+/// The frames of `id` for the run of result frames `(first, count)`, ending in `label`: its picture
+/// laid on black where it is on the frame, then faded as a whole by its own time, into black, or
+/// with `alpha` into transparency. For a picture that leaves part of the frame empty: at the bottom
+/// of what is seen, with black around it, or with black bars over what is under it.
+fn canvas_frames(frames: &Frames, args: &mut Vec<OsString>, inputs: &mut usize, id: ClipId, (first, count): (u64, u64), alpha: bool, label: &str) -> Result<String> {
+    let (sequence, fps, rate) = (frames.sequence, frames.fps, frames.rate);
+    let clip = sequence.clip(id);
+    let file = file_of(frames.files, clip)?;
+    let [px, py] = frames.pixels;
+    let name = label.trim_matches(['[', ']']);
+    let black = |tag: &str| format!("color=c=black:s={px}x{py}:r={fps},trim=end_frame={count},format=yuv420p,setsar=1[{name}{tag}]");
+    let mut filters = vec![black("k")];
+    let placed = placed_filter(file.info.width as f64, file.info.height as f64, &clip.transform, sequence.output.outline(), frames.pixels);
+    let laid = match placed {
+        Some((chain, [x, y])) => {
+            let look = Look { alpha: true, fades: false, placed: Some(chain) };
+            filters.push(clip_frames(frames, args, inputs, id, (first, count), &look, &format!("[{name}p]"))?);
+            filters.push(format!("[{name}k][{name}p]overlay=x={x}:y={y}:format=auto,format=yuv420p[{name}v]"));
+            format!("[{name}v]")
+        }
+        None => format!("[{name}k]"),
+    };
+    // Its fades by its own time: these frames start at its moment `own.0`.
+    let at_first = sequence.export.start + first as f64 / rate;
+    let own = (at_first - clip.start, at_first - clip.start + count as f64 / rate);
+    let (fades, _) = fade_filters_of(clip, own, (-own.0, 1.0), false);
+    if fades.is_empty() {
+        filters.push(format!("{laid}null{label}"));
+    } else if alpha {
+        filters.push(format!("{laid}setpts=PTS-STARTPTS{},format=yuva420p{label}", fade_chain(&fades, 0.0, true, &format!("{name}f"))));
+    } else {
+        filters.push(format!("{laid}setpts=PTS-STARTPTS{},format=yuva420p[{name}g]", fade_chain(&fades, 0.0, true, &format!("{name}f"))));
+        filters.push(black("b"));
+        filters.push(format!("[{name}b][{name}g]overlay=format=auto,format=yuv420p{label}"));
+    }
+    Ok(filters.join(";"))
+}
+
+/// The frames of `layer`, timed to where they are in the result and ending in `[l{n}]`, and where
+/// their top left corner goes on the frame. None when none of its picture is on the frame.
+fn layer_frames(frames: &Frames, args: &mut Vec<OsString>, inputs: &mut usize, layer: &Layer, n: usize) -> Result<Option<(String, [i64; 2])>> {
+    let clip = frames.sequence.clip(layer.clip);
+    let file = file_of(frames.files, clip)?;
+    let (w, h) = (file.info.width as f64, file.info.height as f64);
+    let outline = frames.sequence.output.outline();
+    let part = (layer.first, layer.count);
+    let raw = format!("[l{n}r]");
+    let (filters, at) = if clip.transform.covers(w, h, outline) {
+        (clip_frames(frames, args, inputs, layer.clip, part, &Look::frame(true), &raw)?, [0, 0])
+    } else if clip.transform.bars {
+        (canvas_frames(frames, args, inputs, layer.clip, part, true, &raw)?, [0, 0])
+    } else {
+        let Some((chain, at)) = placed_filter(w, h, &clip.transform, outline, frames.pixels) else { return Ok(None) };
+        (clip_frames(frames, args, inputs, layer.clip, part, &Look { alpha: true, fades: true, placed: Some(chain) }, &raw)?, at)
+    };
+    // The frames count from the result's start: before and after them, what is under passes on.
+    Ok(Some((format!("{filters};{raw}setpts=PTS+{}[l{n}]", layer.first), at)))
+}
+
+/// Whether the picture of `id` covers the whole frame, as far as its file says.
+fn covers_frame(frames: &Frames, id: ClipId) -> bool {
+    let clip = frames.sequence.clip(id);
+    let outline = frames.sequence.output.outline();
+    frames.files.get(&clip.source).is_none_or(|file| clip.transform.covers(file.info.width as f64, file.info.height as f64, outline))
+}
+
+/// The picture of the edit as filters into `[v]`: what is at the bottom, its pieces one after
+/// another, and every clip seen over it laid on in its time and place, in the order of the tracks.
 fn picture_graph(frames: &Frames, args: &mut Vec<OsString>, inputs: &mut usize, graph: &mut Vec<String>) -> Result<()> {
     let [px, py] = frames.pixels;
-    let pieces = pieces(frames.sequence, frames.rate);
+    let (pieces, layers) = pieces(frames.sequence, frames.rate, &sizes_of(frames.files));
+    // Layers whose picture is not on the frame at all are left out.
+    let outline = frames.sequence.output.outline();
+    let on_frame = |layer: &&Layer| {
+        let clip = frames.sequence.clip(layer.clip);
+        let Some(file) = frames.files.get(&clip.source) else { return true };
+        let (w, h) = (file.info.width as f64, file.info.height as f64);
+        clip.transform.bars || clip.transform.covers(w, h, outline) || placed_filter(w, h, &clip.transform, outline, frames.pixels).is_some()
+    };
+    let layers: Vec<&Layer> = layers.iter().filter(on_frame).collect();
+    let bottom = if layers.is_empty() { "[v]".to_owned() } else { "[bottom]".to_owned() };
     let mut labels = String::new();
     for (n, piece) in pieces.iter().enumerate() {
         let count = piece.count;
-        let label = if pieces.len() == 1 { "[v]".to_owned() } else { format!("[p{n}]") };
-        match (piece.clip, piece.under) {
-            (None, _) => graph.push(format!("color=c=black:s={px}x{py}:r={},trim=end_frame={count},format=yuv420p,setsar=1{label}", frames.fps)),
-            (Some(id), None) => graph.push(clip_frames(frames, args, inputs, id, (piece.first, count), false, &label)?),
-            // The clip comes in or goes out over the one under it, which may be fading into black itself.
-            (Some(id), Some(under)) => {
-                graph.push(clip_frames(frames, args, inputs, under, (piece.first, count), false, &format!("[u{n}]"))?);
-                graph.push(clip_frames(frames, args, inputs, id, (piece.first, count), true, &format!("[o{n}]"))?);
-                graph.push(format!("[u{n}][o{n}]overlay=format=auto,format=yuv420p{label}"));
-            }
+        let label = if pieces.len() == 1 { bottom.clone() } else { format!("[p{n}]") };
+        match piece.clip {
+            None => graph.push(format!("color=c=black:s={px}x{py}:r={},trim=end_frame={count},format=yuv420p,setsar=1{label}", frames.fps)),
+            Some(id) if covers_frame(frames, id) => graph.push(clip_frames(frames, args, inputs, id, (piece.first, count), &Look::frame(false), &label)?),
+            Some(id) => graph.push(canvas_frames(frames, args, inputs, id, (piece.first, count), false, &label)?),
         }
         labels += &label;
     }
     if pieces.len() > 1 {
-        graph.push(format!("{labels}concat=n={}:v=1:a=0[v]", pieces.len()));
+        graph.push(format!("{labels}concat=n={}:v=1:a=0{bottom}", pieces.len()));
+    }
+    let mut under = bottom;
+    for (n, layer) in layers.iter().enumerate() {
+        let Some((filters, [x, y])) = layer_frames(frames, args, inputs, layer, n)? else { continue };
+        graph.push(filters);
+        let out = if n + 1 == layers.len() { "[v]".to_owned() } else { format!("[over{n}]") };
+        graph.push(format!("{under}[l{n}]overlay=x={x}:y={y}:eof_action=pass:format=auto,format=yuv420p{out}"));
+        under = out;
     }
     Ok(())
 }
@@ -552,8 +761,9 @@ pub fn plan(files: &SourceFiles, sequence: &Sequence, output: &Path) -> Result<R
         }
     }
 
-    args.push("-filter_complex".into());
-    args.push(graph.join(";").into());
+    let mut plan = RenderPlan::new(args, total);
+    plan.set_graph(&graph)?;
+    let args = &mut plan.args;
     args.extend(["-map", "[v]"].map(OsString::from));
     if has_sound {
         args.extend(["-map", "[a]"].map(OsString::from));
@@ -571,7 +781,7 @@ pub fn plan(files: &SourceFiles, sequence: &Sequence, output: &Path) -> Result<R
         args.extend(["-movflags", "+faststart"].map(OsString::from));
     }
     args.push(output.into());
-    Ok(RenderPlan { args, total })
+    Ok(plan)
 }
 
 /// How much of its input ffmpeg's `atempo` takes in before it gives anything: half of its window,
@@ -618,7 +828,8 @@ fn fade_filters(settings: &ExportSettings, total: f64) -> String {
 }
 
 /// The edit as the frame `preset` would see it when shown for comparison: the same center and angle,
-/// inside the main frame.
+/// inside the main frame. A picture that stays against a point of the frame is in the same place
+/// against that point of this one, as large against its shorter side.
 pub fn variant(sequence: &Sequence, files: &SourceFiles, preset: &Preset) -> Sequence {
     let main = sequence.output.outline();
     let outline = sequence.output.outline_of(preset);
@@ -627,6 +838,10 @@ pub fn variant(sequence: &Sequence, files: &SourceFiles, preset: &Preset) -> Seq
     for clip in out.tracks.iter_mut().flat_map(|track| &mut track.clips) {
         if let Some(file) = files.get(&clip.source) {
             let (w, h) = (file.info.width as f64, file.info.height as f64);
+            if !clip.transform.anchor.is_frame() {
+                clip.transform = clip.transform.moved_to(w, h, main, outline);
+                continue;
+            }
             let [fw, fh] = clip.transform.size(w, h, main);
             clip.transform.zoom = outline.fit(w, h)[0] / outline.fit(fw, fh)[0];
         }
@@ -662,11 +877,11 @@ pub fn frame_task(files: &SourceFiles, sequence: &Sequence, time: f64, output: &
     let mut graph = Vec::new();
     let frames = Frames { files, sequence: &moment, fps: &fps, rate, pixels: sequence.settings.pixels(sequence.output) };
     picture_graph(&frames, &mut args, &mut 0, &mut graph)?;
-    args.push("-filter_complex".into());
-    args.push(graph.join(";").into());
-    args.extend(["-map", "[v]", "-frames:v", "1", "-update", "1"].map(OsString::from));
-    args.push((&part).into());
-    Ok(RenderTask { plan: RenderPlan { args, total: 1.0 }, part, output: output.to_owned() })
+    let mut plan = RenderPlan::new(args, 1.0);
+    plan.set_graph(&graph)?;
+    plan.args.extend(["-map", "[v]", "-frames:v", "1", "-update", "1"].map(OsString::from));
+    plan.args.push((&part).into());
+    Ok(RenderTask { plan, part, output: output.to_owned() })
 }
 
 /// What is worth knowing before the render.
@@ -695,8 +910,7 @@ pub fn warnings(sequence: &Sequence, files: &SourceFiles) -> Vec<String> {
             export.len()
         ));
     }
-    let mut seen: Vec<ClipId> = picture.iter().filter_map(|(_, shown)| *shown).collect();
-    seen.dedup();
+    let seen = seen_clips(sequence, files);
     let [px, _] = sequence.settings.pixels(sequence.output);
     for id in seen {
         let clip = sequence.clip(id);
@@ -862,7 +1076,7 @@ mod tests {
     use crate::core::preset::{get, Output, PresetId, Ratio};
     use crate::core::edit::Track;
     use crate::media::geometry;
-    use crate::media::geometry::Transform;
+    use crate::media::geometry::{Anchor, Transform};
     use crate::media::probe::{self, MediaInfo, Rational};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -1008,28 +1222,33 @@ mod tests {
         let filter = frame_filter(1920.0, 1080.0, &middle, outline, [400, 400]);
         assert!(filter.contains("rotate=") && !filter.contains("pad="), "{filter}");
 
-        let corner = Transform { cx: 0.2, cy: 0.5, zoom: 1.0, angle_deg: 30.0, mirror: true, bars: false };
+        let corner = Transform { cx: 0.2, cy: 0.5, zoom: 1.0, angle_deg: 30.0, mirror: true, bars: false, anchor: Anchor::Frame };
         let filter = frame_filter(1920.0, 1080.0, &corner, outline, [400, 400]);
         assert!(filter.starts_with("pad="), "{filter}");
         assert!(filter.contains("hflip"), "{filter}");
+    }
+
+    /// What is at the bottom of the result's frames, with sources of `W`×`H`.
+    fn bottom(s: &Sequence, fps: f64) -> Vec<Piece> {
+        pieces(s, fps, &|_| Some([W as f64, H as f64])).0
     }
 
     #[test]
     fn pieces_follow_the_clips_on_the_frame_grid() {
         let id = ClipId { track: 0, index: 0 };
         let mut s = sequence(10.0);
-        assert_eq!(pieces(&s, 30.0), [Piece { first: 0, count: 300, clip: Some(id), under: None }]);
+        assert_eq!(bottom(&s, 30.0), [Piece { first: 0, count: 300, clip: Some(id) }]);
 
         // The clip trimmed to source 2..4 in place, the range around it: black on both sides.
         s.trim_start(id, 2.0, 0.1);
         s.trim_end(id, 4.0, 0.1);
         s.export = Span { start: 1.0, end: 5.0 };
-        let black = |first, count| Piece { first, count, clip: None, under: None };
-        assert_eq!(pieces(&s, 25.0), [black(0, 25), Piece { first: 25, count: 50, clip: Some(id), under: None }, black(75, 25)]);
+        let black = |first, count| Piece { first, count, clip: None };
+        assert_eq!(bottom(&s, 25.0), [black(0, 25), Piece { first: 25, count: 50, clip: Some(id) }, black(75, 25)]);
 
         // Out of the range: all black, and the warning says so.
         s.export = Span { start: 6.0, end: 8.0 };
-        assert_eq!(pieces(&s, 25.0), [black(0, 50)]);
+        assert_eq!(bottom(&s, 25.0), [black(0, 50)]);
         assert!(warnings(&s, &files(Path::new("a.mp4"), &info(10.0))).iter().any(|w| w.contains("all black")));
     }
 
@@ -1040,14 +1259,14 @@ mod tests {
         s.tracks.push(Track { id: 1, clips: vec![Clip { start: 4.01, source_out: 2.01, ..Clip::of(1, "b".into(), 5.0) }], ..Track::default() });
         s.export = Span { start: -1.0, end: 12.0 };
         let (below, above) = (Some(ClipId { track: 0, index: 0 }), Some(ClipId { track: 1, index: 0 }));
-        let piece = |first, count, clip| Piece { first, count, clip, under: None };
+        let piece = |first, count, clip| Piece { first, count, clip };
         let expected = [piece(0, 30, None), piece(30, 120, below), piece(150, 61, above), piece(211, 119, below), piece(330, 60, None)];
-        assert_eq!(pieces(&s, 30.0), expected);
-        assert_eq!(pieces(&s, 30.0).iter().map(|p| p.count).sum::<u64>(), 390);
+        assert_eq!(bottom(&s, 30.0), expected);
+        assert_eq!(bottom(&s, 30.0).iter().map(|p| p.count).sum::<u64>(), 390);
 
         // Hidden, it is not seen; muted, it is not heard.
         s.tracks[1].hidden = true;
-        assert_eq!(pieces(&s, 30.0), [piece(0, 30, None), piece(30, 300, below), piece(330, 60, None)]);
+        assert_eq!(bottom(&s, 30.0), [piece(0, 30, None), piece(30, 300, below), piece(330, 60, None)]);
         let files = SourceFiles::from([
             (0, SourceFile { path: "a.mp4".into(), info: info(10.0) }),
             (1, SourceFile { path: "b.mp4".into(), info: info(5.0) }),
@@ -1060,7 +1279,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fade_is_a_piece_of_its_own_with_what_shows_through() {
+    fn a_fading_clip_is_laid_over_what_shows_through() {
         // Below: 0..10 s. Above: 4..8 s, fading in over 1 s and out over 2 s. At 10 fps.
         let mut s = sequence(10.0);
         let mut above = Clip { start: 4.0, ..Clip::of(1, "b".into(), 4.0) };
@@ -1068,15 +1287,17 @@ mod tests {
         above.add_fade(Edge::Out);
         above.set_fade_length(Edge::Out, 2.0);
         s.tracks.push(Track { id: 1, clips: vec![above], ..Track::default() });
-        let (below, top) = (Some(ClipId { track: 0, index: 0 }), Some(ClipId { track: 1, index: 0 }));
-        let piece = |first, count, clip, under| Piece { first, count, clip, under };
-        let expected = [piece(0, 40, below, None), piece(40, 10, top, below), piece(50, 10, top, None), piece(60, 20, top, below), piece(80, 20, below, None)];
-        assert_eq!(pieces(&s, 10.0), expected);
+        let (below, top) = (Some(ClipId { track: 0, index: 0 }), ClipId { track: 1, index: 0 });
+        let sizes = |_: SourceId| Some([W as f64, H as f64]);
+        let piece = |first, count, clip| Piece { first, count, clip };
+        let layer = |first, count| Layer { first, count, clip: top };
+        // While it fades, the clip under it is at the bottom and it lies over it.
+        let expected = (vec![piece(0, 50, below), piece(50, 10, Some(top)), piece(60, 40, below)], vec![layer(40, 10), layer(60, 20)]);
+        assert_eq!(pieces(&s, 10.0, &sizes), expected);
 
         // Nothing under it: it fades into black, in one piece with the rest of it.
         s.tracks[0].hidden = true;
-        let black = |first, count| Piece { first, count, clip: None, under: None };
-        assert_eq!(pieces(&s, 10.0), [black(0, 40), piece(40, 40, top, None), black(80, 20)]);
+        assert_eq!(pieces(&s, 10.0, &sizes), (vec![piece(0, 40, None), piece(40, 40, Some(top)), piece(80, 20, None)], vec![]));
         // Only the sound fades: the picture is whole.
         s.tracks[0].hidden = false;
         for effect in &mut s.tracks[1].clips[0].effects {
@@ -1084,7 +1305,46 @@ mod tests {
                 fade.picture = false;
             }
         }
-        assert_eq!(pieces(&s, 10.0), [piece(0, 40, below, None), piece(40, 40, top, None), piece(80, 20, below, None)]);
+        assert_eq!(pieces(&s, 10.0, &sizes), (vec![piece(0, 40, below), piece(40, 40, Some(top)), piece(80, 20, below)], vec![]));
+    }
+
+    #[test]
+    fn a_picture_smaller_than_the_frame_is_laid_over_the_pieces_in_one_layer() {
+        // Below: 0..10 s. Above: 2..8 s, a third of the frame across. At 10 fps.
+        let mut s = sequence(10.0);
+        s.tracks.push(Track { id: 1, clips: vec![Clip { start: 2.0, ..Clip::of(1, "b".into(), 6.0) }], ..Track::default() });
+        let (below, above) = (ClipId { track: 0, index: 0 }, ClipId { track: 1, index: 0 });
+        s.clip_mut(above).transform.zoom = 0.33;
+        let sizes = |_: SourceId| Some([W as f64, H as f64]);
+        let piece = |first, count, clip| Piece { first, count, clip };
+        let laid = vec![Layer { first: 20, count: 60, clip: above }];
+        assert_eq!(pieces(&s, 10.0, &sizes), (vec![piece(0, 100, Some(below))], laid.clone()));
+        // A cut under it does not cut it: one input for all of it.
+        assert!(s.split(below, 5.0, 0.1).is_some());
+        let after = ClipId { track: 0, index: 1 };
+        assert_eq!(pieces(&s, 10.0, &sizes), (vec![piece(0, 50, Some(below)), piece(50, 50, Some(after))], laid));
+        // With nothing under it, it is at the bottom, over black.
+        s.tracks[0].hidden = true;
+        assert_eq!(pieces(&s, 10.0, &sizes), (vec![piece(0, 20, None), piece(20, 60, Some(above)), piece(80, 20, None)], vec![]));
+    }
+
+    #[test]
+    fn a_long_graph_goes_to_ffmpeg_in_a_file() {
+        // 400 pieces: far more filters than a command line holds.
+        let mut s = sequence(400.0);
+        for k in 1..400 {
+            assert!(s.split(ClipId { track: 0, index: k - 1 }, k as f64, 0.1).is_some());
+        }
+        let file = {
+            let plan = plan(&files(Path::new("a.mp4"), &info(400.0)), &s, Path::new("out.mp4")).unwrap();
+            let at = plan.args.iter().position(|arg| arg.as_os_str() == "-/filter_complex").expect("the graph in a file");
+            let file = PathBuf::from(&plan.args[at + 1]);
+            let graph = fs::read_to_string(&file).unwrap();
+            assert!(graph.contains("concat=n=400:v=1:a=0[v]"));
+            assert!(plan.args.iter().all(|arg| arg.len() < 2000));
+            file
+        };
+        assert!(!file.exists(), "the file goes with the plan");
     }
 
     #[test]
@@ -1446,8 +1706,8 @@ mod tests {
         let mut s = sequence(10.0);
         let id = ClipId { track: 0, index: 0 };
         assert!(s.freeze(id, 4.0, FREEZE_LENGTH));
-        let piece = |first, count| Piece { first, count, clip: Some(id), under: None };
-        assert_eq!(pieces(&s, 10.0), [piece(0, 40), piece(40, 20), piece(60, 60)]);
+        let piece = |first, count| Piece { first, count, clip: Some(id) };
+        assert_eq!(bottom(&s, 10.0), [piece(0, 40), piece(40, 20), piece(60, 60)]);
     }
 
     #[test]
@@ -1456,8 +1716,8 @@ mod tests {
         let mut s = sequence(10.0);
         let id = ClipId { track: 0, index: 0 };
         assert!(s.slow_motion(id, 4.0, SLOW_MOTION_SECONDS, SLOW_MOTION_FACTOR));
-        let piece = |first, count| Piece { first, count, clip: Some(id), under: None };
-        assert_eq!(pieces(&s, 10.0), [piece(0, 40), piece(40, 20), piece(60, 50)]);
+        let piece = |first, count| Piece { first, count, clip: Some(id) };
+        assert_eq!(bottom(&s, 10.0), [piece(0, 40), piece(40, 20), piece(60, 50)]);
         // Its picture goes through its source at half the speed, its sound too, at its pitch.
         let files = files(Path::new("a.mp4"), &info(10.0));
         let plan = plan(&files, &s, Path::new("out.mp4")).unwrap();
@@ -1693,16 +1953,16 @@ mod tests {
         let cases: [(PresetId, Ratio, Transform); 10] = [
             // With bars: the whole picture in a tall frame, then a frame reaching past the corner.
             (PresetId::Custom, rect(9.0, 16.0), Transform::default().showing_whole_picture(w, h, vertical)),
-            (PresetId::Custom, rect(16.0, 10.0), Transform { cx: 0.2, cy: 0.75, zoom: 0.7, angle_deg: 20.0, mirror: false, bars: true }),
-            (PresetId::TelegramCircle, rect(1.0, 1.0), Transform { cx: 0.1, cy: 0.5, zoom: 0.8, angle_deg: 0.0, mirror: true, bars: true }),
-            (PresetId::Custom, rect(9.0, 16.0), Transform { cx: 0.3, cy: 0.5, zoom: 1.4, angle_deg: 0.0, mirror: false, bars: false }),
-            (PresetId::Custom, rect(16.0, 10.0), Transform { cx: 0.55, cy: 0.45, zoom: 1.6, angle_deg: 25.0, mirror: false, bars: false }),
-            (PresetId::Custom, rect(9.0, 16.0), Transform { cx: 0.5, cy: 0.5, zoom: 2.2, angle_deg: -70.0, mirror: false, bars: false }),
-            (PresetId::Custom, rect(4.0, 3.0), Transform { cx: 0.5, cy: 0.5, zoom: 2.0, angle_deg: 12.0, mirror: true, bars: false }),
-            (PresetId::Custom, rect(16.0, 9.0), Transform { cx: 0.5, cy: 0.5, zoom: 1.0, angle_deg: 0.0, mirror: true, bars: false }),
-            (PresetId::TelegramCircle, rect(1.0, 1.0), Transform { cx: 0.5, cy: 0.5, zoom: 1.3, angle_deg: 45.0, mirror: false, bars: false }),
+            (PresetId::Custom, rect(16.0, 10.0), Transform { cx: 0.2, cy: 0.75, zoom: 0.7, angle_deg: 20.0, mirror: false, bars: true, anchor: Anchor::Frame }),
+            (PresetId::TelegramCircle, rect(1.0, 1.0), Transform { cx: 0.1, cy: 0.5, zoom: 0.8, angle_deg: 0.0, mirror: true, bars: true, anchor: Anchor::Frame }),
+            (PresetId::Custom, rect(9.0, 16.0), Transform { cx: 0.3, cy: 0.5, zoom: 1.4, angle_deg: 0.0, mirror: false, bars: false, anchor: Anchor::Frame }),
+            (PresetId::Custom, rect(16.0, 10.0), Transform { cx: 0.55, cy: 0.45, zoom: 1.6, angle_deg: 25.0, mirror: false, bars: false, anchor: Anchor::Frame }),
+            (PresetId::Custom, rect(9.0, 16.0), Transform { cx: 0.5, cy: 0.5, zoom: 2.2, angle_deg: -70.0, mirror: false, bars: false, anchor: Anchor::Frame }),
+            (PresetId::Custom, rect(4.0, 3.0), Transform { cx: 0.5, cy: 0.5, zoom: 2.0, angle_deg: 12.0, mirror: true, bars: false, anchor: Anchor::Frame }),
+            (PresetId::Custom, rect(16.0, 9.0), Transform { cx: 0.5, cy: 0.5, zoom: 1.0, angle_deg: 0.0, mirror: true, bars: false, anchor: Anchor::Frame }),
+            (PresetId::TelegramCircle, rect(1.0, 1.0), Transform { cx: 0.5, cy: 0.5, zoom: 1.3, angle_deg: 45.0, mirror: false, bars: false, anchor: Anchor::Frame }),
             // The square around this circle reaches outside the picture when turned.
-            (PresetId::TelegramCircle, rect(1.0, 1.0), Transform { cx: 0.0, cy: 0.5, zoom: 1.0, angle_deg: 33.0, mirror: true, bars: false }),
+            (PresetId::TelegramCircle, rect(1.0, 1.0), Transform { cx: 0.0, cy: 0.5, zoom: 1.0, angle_deg: 33.0, mirror: true, bars: false, anchor: Anchor::Frame }),
         ];
         for (n, (preset, ratio, transform)) in cases.into_iter().enumerate() {
             let output = Output { preset, custom: ratio };
@@ -1981,6 +2241,72 @@ mod tests {
         assert!((mean_level(&rgb) - 128.0).abs() < 30.0, "{}", mean_level(&rgb));
         let rms = |from: f64, to: f64| sound_level(&path, from, to);
         assert!(rms(0.5, 1.5) < 5.0 && rms(2.5, 3.5) > 100.0, "{} {}", rms(0.5, 1.5), rms(2.5, 3.5));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Pictures smaller than the frame, turned, past its edges, coming in: each lies over what is
+    /// under it, in the order of the tracks, where the preview draws it.
+    #[test]
+    fn pictures_smaller_than_the_frame_lie_over_what_is_under_them() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let dir = temp_dir("layers");
+        let paths = [("red.mp4", "0xff0000"), ("blue.mp4", "0x0000ff"), ("green.mp4", "0x00ff00")].map(|(name, color)| make_solid(&dir, name, color, 25, (320, 180), None));
+        let solid = MediaInfo { width: 320, height: 180, fps: Rational { num: 25, den: 1 }, has_audio: false, ..info(10.0) };
+        let files: SourceFiles = paths.iter().enumerate().map(|(id, path)| (id as SourceId, SourceFile { path: path.clone(), info: solid.clone() })).collect();
+        let mut s = Sequence::new(Clip::of(0, "red".into(), 4.0));
+        s.output = Output { preset: PresetId::Landscape, ..Output::default() };
+        s.settings.size = OutputSize::LongSide(640);
+        s.settings.rate = Rate::Quality(10);
+        s.settings.speed = Speed::Veryfast;
+        s.settings.audio_codec = AudioCodec::None;
+        s.settings.frame_rate = FrameRate::Fixed(25.0);
+        s.settings.fades = (0.0, 0.0);
+        let (outline, pixels, w, h) = (s.output.outline(), [640.0, 360.0], 320.0, 180.0);
+        // Blue: half the frame across, its middle 200 px right of the frame's and 100 px up, so past
+        // the top right corner; from 1 s to 3 s, coming in over half a second.
+        let mut blue = Clip { start: 1.0, ..Clip::of(1, "blue".into(), 2.0) };
+        blue.transform = Transform::default().placed(w, h, outline, pixels, [200.0, -100.0], 320.0);
+        blue.add_fade(Edge::In);
+        blue.set_fade_length(Edge::In, 0.5);
+        // Green: as wide, in the middle, turned by 45°, from 2 s to 4 s, over the blue one.
+        let mut green = Clip { start: 2.0, ..Clip::of(2, "green".into(), 2.0) };
+        green.transform = Transform { angle_deg: 45.0, ..Transform::default() }.placed(w, h, outline, pixels, [0.0, 0.0], 320.0);
+        s.tracks.push(Track { id: 1, clips: vec![blue], ..Track::default() });
+        s.tracks.push(Track { id: 2, clips: vec![green], ..Track::default() });
+        s.export = Span { start: 0.0, end: 4.0 };
+
+        let path = render_all(&files, &s, &dir.join("layers.mp4"));
+        let color_at = |t: f64, x: usize, y: usize| {
+            let rgb = rgb_at(&path, t, 640, 360);
+            let i = (y * 640 + x) * 3;
+            [rgb[i], rgb[i + 1], rgb[i + 2]]
+        };
+        let named = |rgb: [u8; 3]| {
+            let colors = [("red", [255, 0, 0]), ("green", [0, 255, 0]), ("blue", [0, 0, 255])];
+            colors.iter().find(|(_, want)| rgb.iter().zip(want).all(|(got, want)| (*got as i32 - want).abs() < 60)).map_or("mixed", |(name, _)| *name)
+        };
+        for (t, x, y, want) in [
+            (0.5, 520, 60, "red"),
+            (1.75, 520, 60, "blue"),
+            // Its part at the frame's corner: the rest of it is past the frame.
+            (1.75, 630, 5, "blue"),
+            (1.75, 340, 60, "red"),
+            (1.75, 520, 190, "red"),
+            (2.5, 320, 180, "green"),
+            // Where the green one lies over the blue one, and a corner of its box, empty when turned.
+            (2.5, 370, 140, "green"),
+            (2.5, 490, 20, "blue"),
+            (2.5, 160, 40, "red"),
+            (3.5, 520, 60, "red"),
+            (3.5, 320, 180, "green"),
+        ] {
+            assert_eq!(named(color_at(t, x, y)), want, "at {t} s, {x}, {y}: {:?}", color_at(t, x, y));
+        }
+        // Coming in, the blue one is part of the red one under it.
+        let [r, _, b] = color_at(1.25, 520, 60);
+        assert!((60..200).contains(&r) && (60..200).contains(&b), "{r} {b}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2357,7 +2683,7 @@ mod tests {
         let mut s = sequence(10.0);
         s.output = Output { preset: PresetId::Vertical, ..Output::default() };
         let id = crate::core::edit::ClipId { track: 0, index: 0 };
-        s.clip_mut(id).transform = Transform { cx: 0.4, cy: 0.5, zoom: 1.5, angle_deg: 20.0, mirror: false, bars: false };
+        s.clip_mut(id).transform = Transform { cx: 0.4, cy: 0.5, zoom: 1.5, angle_deg: 20.0, mirror: false, bars: false, anchor: Anchor::Frame };
         let main = s.clip(id).transform;
         let [fw, fh] = main.size(w, h, s.output.outline());
 
@@ -2370,6 +2696,29 @@ mod tests {
             let [vw, vh] = t.size(w, h, outline);
             let [ew, eh] = outline.fit(fw, fh);
             assert!((vw - ew).abs() < 1e-6 && (vh - eh).abs() < 1e-6, "{preset:?}: {vw}×{vh}, expected {ew}×{eh}");
+        }
+    }
+
+    #[test]
+    fn a_pinned_picture_stays_in_its_corner_in_other_formats() {
+        let i = MediaInfo { width: 1920, height: 1080, ..info(10.0) };
+        let (w, h) = (1920.0, 1080.0);
+        let mut s = sequence(10.0);
+        s.output = Output { preset: PresetId::Landscape, ..Output::default() };
+        let id = ClipId { track: 0, index: 0 };
+        let (outline, pixels) = (s.output.outline(), [1920.0, 1080.0]);
+        let start = Transform { zoom: 0.3, anchor: Anchor::TopRight, ..Transform::default() };
+        let place = start.placement(w, h, outline, pixels);
+        s.clip_mut(id).transform = start.placed(w, h, outline, pixels, place.center_for(Anchor::TopRight, pixels, [40.0, 40.0]), place.size[0]);
+        for preset in [PresetId::Vertical, PresetId::Square, PresetId::TelegramCircle] {
+            let v = variant(&s, &files(Path::new("a.mp4"), &i), get(preset));
+            let o = v.output.outline();
+            // A frame as long on its shorter side as the main one.
+            let pixels = if o.aspect >= 1.0 { [1080.0 * o.aspect, 1080.0] } else { [1080.0, 1080.0 / o.aspect] };
+            let moved = v.clip(id).transform.placement(w, h, o, pixels);
+            let [x, y] = moved.offsets(Anchor::TopRight, pixels);
+            assert!((x - 40.0).abs() < 1e-6 && (y - 40.0).abs() < 1e-6, "{preset:?}: {x}, {y}");
+            assert!((moved.size[0] - place.size[0]).abs() < 1e-6, "{preset:?}");
         }
     }
 

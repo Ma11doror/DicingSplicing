@@ -4,7 +4,7 @@ A simple video editor for short videos: Telegram circles, Reels, Shorts, TikTok 
 Cut a few clips together, frame them for the platform, add fades and a bit of color, and export.
 A finished circle can go straight to a Telegram channel.
 
-![The editor: the source with its frame in the middle, the result on the right, the timeline below](docs/screenshots/editor.png)
+![The editor: the result in the middle, the selected clip's whole picture faint around its frame, the Clip panel on the right, the timeline below](docs/screenshots/editor.png)
 
 ## Download
 
@@ -22,13 +22,14 @@ yt-dlp come along in the same folder.
 
 **Clips and tracks**
 
-- Several videos in one project, on as many tracks as you need. The top visible track is what is
-  seen; the sound of all of them is mixed.
+- Several videos in one project, on as many tracks as you need. Each track lies over the ones under
+  it: where its picture leaves the frame free, they show. The sound of all of them is mixed.
 - Videos are linked, not copied. Add them from a file, by dropping them on the window, or by a link
   (YouTube, song.link and whatever else [yt-dlp](https://github.com/yt-dlp/yt-dlp) understands).
 - Add many files at once, from the dialog or dropped on the window. The sources show as a list or as
   thumbnails, sorted by name, by when they were added or by the files' dates. Move the pointer across
-  a thumbnail to run through its video.
+  a thumbnail to run through its video. Click one to see it next to the list as it is: whole, with
+  its sound, the parts already on the timeline marked under it; Space plays it there.
 - Images too: PNG, JPEG, WebP, BMP, TIFF, or a GIF of one frame. An image lasts 5 s on the timeline;
   its **Length** in the Clip panel makes it longer or shorter, and the clips after it on its track
   move along. Photos stand the way they were taken, and what is transparent is black.
@@ -38,7 +39,7 @@ yt-dlp come along in the same folder.
 - Select several clips as in a file manager: Ctrl+click adds one or takes it out, Shift+click takes
   the ones from the clip clicked last to this one, Ctrl+A all of them. Dragged, they move together;
   Delete, Ctrl+D, Ctrl+C and Ctrl+V take all of them, as far apart as they are and on their tracks;
-  what is set in the Clip panel, or in Output, goes to all of them.
+  what is set in the Clip panel, or done in the preview, goes to all of them.
 - Unfold a track to see each clip's effects and the graph of its sound.
 
 **Sound**
@@ -55,17 +56,23 @@ Step by step, with pictures: [Working with sound](#working-with-sound).
 
 **Framing for the platform**
 
-![The Telegram circle frame: the circle on the source, and the circle that will be sent](docs/screenshots/circle.png)
+![The Telegram circle frame: what will be sent is inside the circle, the rest of the selected clip's picture shows faint around it](docs/screenshots/circle.png)
 
 - Frames for Telegram circle (1:1), Reels, Shorts and TikTok (9:16), landscape (16:9), tablet
   (16:10), photo (3:2), classic (4:3), square, Instagram post (4:5), cinema (21:9), or your own ratio.
-- Move, resize and rotate the frame right on the picture, with snapping; mirror the picture; fill
-  the frame or leave black bars. Thirds, center and safe-area guides.
+- One preview shows the result with its frame in the middle. Move, resize and turn the selected
+  clip's picture right there, with snapping; what of it is past the frame shows faint. Mirror it,
+  fill the frame or leave black bars. Zoom the preview in to place things exactly. Thirds, center
+  and safe-area guides.
+- Lay pictures over each other: a clip smaller than the frame lies anywhere on it, partly past its
+  edges too, over the clips on the tracks under it. Drag it and its corners in the preview, or type
+  its place, Scale and Size; its anchor keeps it at its corner or edge in other formats, and it
+  grows from there.
 - Show the frames of other platforms inside the main one, to make a cut that fits them all.
 
 **Effects on each clip**
 
-![The effects of a clip, and the export settings](docs/screenshots/panels.png)
+![The Clip panel with a clip's place, size and effects, and the Export tab](docs/screenshots/panels.png)
 
 - Fade in and fade out, of the picture, the sound or both: linear, ease in, ease out, ease in-out,
   and stronger versions of the eases. A clip fading out reveals the clip under it, or black.
@@ -77,14 +84,14 @@ Step by step, with pictures: [Working with sound](#working-with-sound).
   tinted blue, with a snowflake. The clips after it on its track move later, and so does the sound
   detached from it. The dots on the bottom edge of the selected clip drag it: the left ones to
   another frame, the right ones longer or shorter. The Clip panel has both too.
-- **Slow motion** (S, or the clip's menu): a second of the recording from the playhead plays half
-  as fast, its sound at its pitch, and the clip stays one. The part is tinted pink, with a gauge and
-  its speed. The dots on the bottom edge of the selected clip move where it starts and ends in the
-  recording; the Clip panel has that and how fast, from ×0.25 to ×16, whatever the speed of the
-  rest of the clip. The clips after it on its track move along, and the sound detached from it
-  plays it the same.
-- What the Output panel shows is what the file gets: the same formulas run in the preview and
-  in the export.
+- **Tempo** (S, or the clip's menu): a second of the recording from the playhead plays at a tempo
+  of its own, half as fast to start with, its sound at its pitch, and the clip stays one. The part
+  is tinted pink, with a gauge and its speed. The dots on the bottom edge of the selected clip move
+  where it starts and ends in the recording; the Clip panel has that and how fast, from ×0.25 to
+  ×16, slower or faster, whatever the speed of the rest of the clip. The clips after it on its
+  track move along, and the sound detached from it plays it the same.
+- What the preview shows is what the file gets: the same formulas run in the preview and in the
+  export.
 
 **Export**
 
@@ -98,18 +105,20 @@ Step by step, with pictures: [Working with sound](#working-with-sound).
 ## Quick start
 
 1. On the start screen, **New project from a video…**, or drop a video on the window.
-2. Open **Frames** at the top left and pick the main frame, such as *Telegram circle*. Move and
-   resize the frame on the picture.
+2. Open **Frames** at the top left and pick the main frame, such as *Telegram circle*. In the
+   preview, drag the picture to place it in the frame, and its corners to resize it.
 3. More videos, music or images: **Sources**, then **Add video, sound or image…** (as many files as
    you like) or **Download from a link…**. Drag a source onto the timeline; onto an audio track a
    video goes as its sound only, and an image to the video track nearest to it. At the top of
    Sources, the two buttons at the left show the sources as a list or as thumbnails. **Sorting:** at
    the right puts them in order; the arrow after it turns the order round. The dots at the bottom
-   right corner make the list larger or smaller.
+   right corner make the list larger or smaller. Click a source to see it as it is next to the
+   list, the parts of it on the timeline marked under it; Space plays it there.
 
-   ![Sources as thumbnails: the pointer over Fractal dive runs through its video](docs/screenshots/sources.png)
+   ![Sources as thumbnails, and the viewer: Fractal dive as it is, the part of it on the timeline marked under it](docs/screenshots/sources.png)
 
-4. Pick a clip to change it in the **Clip** panel on the right: timing, framing, volume, effects.
+4. Pick a clip on the timeline, or its picture in the preview, to change it in the **Clip** panel
+   on the right: timing, place and size, volume, effects.
    Right click a clip for its menu: detach its sound, chain it to another clip, fades, color, cut,
    duplicate, delete.
 5. Set the part to export with **I** and **O**, or **Fit to clips**.
@@ -157,7 +166,7 @@ Press **F1** in the editor for the list of keys.
 | [ / ] | Trim the selected clip's start / end to the playhead |
 | Ctrl+B | Cut the selected clip at the playhead |
 | F | Freeze frame: hold the frame at the playhead for 2 s |
-| S | Slow motion: play a second of the recording from the playhead half as fast |
+| S | Tempo: play a second of the recording from the playhead at a tempo of its own, half as fast to start with |
 | Ctrl+D | Duplicate the selected clips, right after them |
 | Ctrl+C / Ctrl+V | Copy the selected clips / paste them at the playhead, onto their tracks or the nearest one above with room |
 | Ctrl+Shift+V | Paste them where the mouse pointer is, onto the track under it |
@@ -169,7 +178,12 @@ Press **F1** in the editor for the list of keys.
 | Ctrl+Y, Ctrl+Shift+Z | Redo |
 | V or Esc | Select tool: pick, move and trim clips |
 | B | Blade tool: a click cuts a clip, with Shift every clip there |
+| Q | The picked picture's menu around the pointer: Fit, Fill, Bars, Reset |
+| Z | Switch what the wheel does over the preview: the picture's Scale or the view's Zoom |
 | F1 | The list of keys and mouse actions |
+
+While Sources is open, Space, K, L and the arrows play and step through the chosen source in its
+viewer, and the timeline waits.
 
 **Mouse**
 
@@ -181,14 +195,22 @@ Press **F1** in the editor for the list of keys.
 | Drag a clip | Moves it, also onto another track of its kind; chained clips go along. Several selected move together in time |
 | Drag an edge of the selected clip | Trims it |
 | Drag the dots on the top edge of the selected clip | Changes the length of its fade |
-| Drag the dots on the bottom edge of the selected clip | Holds another frame (left) or holds it longer or shorter (right); moves where a part in slow motion starts (left) or ends (right) |
+| Drag the dots on the bottom edge of the selected clip | Holds another frame (left) or holds it longer or shorter (right); moves where a part at a tempo of its own starts (left) or ends (right) |
 | Right click on a clip | Its menu |
 | Double click on a clip | Unfolds or folds its track |
 | Drag with the right or middle button | Moves along the time, and the tracks up and down |
 | Wheel | Zooms; over the track names, scrolls the tracks |
 | Drag the dots of a track | Moves the track up or down |
-| Drag the dots above the timeline, or above Clip | Resizes the panels |
-| Drag in Output | Moves the selected clip's picture; the wheel zooms it |
+| Drag the dots above the timeline | Makes it taller or lower |
+| Click a picture in the preview | Picks its clip |
+| Drag a picture in the preview | Moves it and picks its clip; its middle and edges snap to the frame's (Alt: no snapping) |
+| Drag a corner or the middle of a side of the picked picture | Resizes it, the opposite one staying |
+| Drag an arrow at a corner of the picked picture | Turns it (Shift: 15° steps) |
+| Rest the pointer on the dot above the picked picture | Its menu: Fit, Fill, Bars, Reset; a click on the dot turns it upright |
+| Wheel over the preview | Changes the picked picture's Scale from its anchor; switched to Zoom under the preview (or Z), zooms the view |
+| Ctrl+wheel or a pinch over the preview | Zooms the view at the pointer; the right or middle button moves it, the Zoom tag under it goes back to Fit |
+| Drag a side of the frame, with the lock open or with Shift | Changes the frame's proportions |
+| Click a source in Sources | Shows it in the viewer next to the list; a double click puts it on the timeline |
 
 ## Sending to Telegram
 

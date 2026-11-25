@@ -128,7 +128,7 @@ pub enum Tool {
     Blade,
 }
 
-/// A part of the Output tab that an effect's plaque leads to.
+/// A part of the Clip tab that an effect's plaque leads to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     Frame,
@@ -327,7 +327,7 @@ pub struct TimelineResponse {
     pub edit_started: bool,
     /// While an edge is dragged: the time whose frame the preview should show instead of the playhead's.
     pub peek: Option<f64>,
-    /// A plaque of an effect was clicked: the part of the Output tab it stands for.
+    /// A plaque of an effect was clicked: the part of the Clip tab it stands for.
     pub open: Option<Section>,
     /// This effect of this clip could not be taken off, its speed, a frame held or its slow motion:
     /// the clips after it could not move that far.
@@ -470,7 +470,7 @@ fn effects_of(clip: &Clip) -> Vec<Chip> {
             Effect::Color(_) => chips.push(chip("Color".to_owned(), Section::Effects)),
             Effect::Speed(speed) => chips.push(chip(format!("Speed {}", speed_text(speed.played())), Section::Effects)),
             Effect::Freeze(freeze) => chips.push(chip(format!("Freeze {}", seconds_text(freeze.seconds)), Section::Effects)),
-            Effect::SlowMotion(part) => chips.push(chip(format!("Slow motion {}", speed_text(part.played())), Section::Effects)),
+            Effect::SlowMotion(part) => chips.push(chip(format!("Tempo {}", speed_text(part.played())), Section::Effects)),
         }
     }
     if (t.cx, t.cy, t.zoom, t.angle_deg) != (plain.cx, plain.cy, plain.zoom, plain.angle_deg) {
@@ -924,7 +924,7 @@ impl Timeline {
                 }
                 if let Some(part) = slowed {
                     let text = "The clip plays that part at its own speed again: it, and the clips after it on its track, get as much shorter or longer";
-                    if ui.button(format!("Remove slow motion ({})", speed_text(part.rate))).on_hover_text(text).clicked() {
+                    if ui.button(format!("Remove tempo ({})", speed_text(part.rate))).on_hover_text(text).clicked() {
                         unslow = Some(part.effect);
                         changed = true;
                         ui.close_menu();
@@ -1029,16 +1029,17 @@ impl Timeline {
                 // Its picture and its sound: a sound clip too.
                 if !still {
                     let playhead = timecode::frame_index(pos, env.fps) as f64 / env.fps;
-                    let slow = "Play a second of its recording from the playhead half as fast, its sound at its pitch: the rest of it and the clips after it move later (S)";
+                    let slow = "Play a second of its recording from the playhead at a tempo of its own, half as fast to start with, its sound at \
+                                its pitch: the rest of it and the clips after it move along. Its block in the Clip panel makes it slower or faster (S)";
                     let clip = sequence.clip(id);
                     let slowed_there = clip.slowed().iter().any(|part| part.span.contains(playhead));
                     let why_not = if slowed_there {
-                        "The playhead is on a part of it in slow motion already: its block in the Clip panel changes it"
+                        "The playhead is on a part of it at a tempo of its own already: its block in the Clip panel changes it"
                     } else {
-                        "It slows down from the playhead, which is not on this clip"
+                        "The part starts at the playhead, which is not on this clip"
                     };
                     let button = ui
-                        .add_enabled(clip.span().contains(playhead) && !slowed_there, egui::Button::new("Slow motion"))
+                        .add_enabled(clip.span().contains(playhead) && !slowed_there, egui::Button::new("Tempo"))
                         .on_hover_text(slow)
                         .on_disabled_hover_text(why_not);
                     if button.clicked() {
