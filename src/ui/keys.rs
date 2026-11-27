@@ -56,7 +56,11 @@ const GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("Drag the dots on its top edge", "Change the length of its fade"),
             (
                 "Drag the dots on its bottom edge",
-                "A frame it holds: the left ones hold another frame, the right ones hold it longer or shorter. A part at a tempo of its own: they move where it starts and ends in the recording",
+                "Where a frame held or a part at a tempo of its own starts (left) or ends (right): longer or shorter. A frame held then holds the frame where it starts",
+            ),
+            (
+                "Drag the plaque of a frame held or a part at a tempo of its own",
+                "Move all of it along the clip, as long: it holds another frame, or plays another part of the recording",
             ),
             ("Right click on a clip", "Its menu: detach its sound, chain it to another clip, fades, color, speed, a cut there, a freeze frame, tempo, delete"),
             ("Right click on a frame held or a part at a tempo of its own", "Remove freeze or Remove tempo, as well as the clip's menu"),

@@ -82,13 +82,15 @@ Step by step, with pictures: [Working with sound](#working-with-sound).
 - **Freeze frame** (F, or the clip's menu): the frame at the playhead stays on screen for 2 s,
   without sound, then the clip plays on from it. The clip stays one: the frame held is a part of it
   tinted blue, with a snowflake. The clips after it on its track move later, and so does the sound
-  detached from it. The dots on the bottom edge of the selected clip drag it: the left ones to
-  another frame, the right ones longer or shorter. The Clip panel has both too.
+  detached from it. The dots on the bottom edge of the selected clip move its start and its end,
+  longer or shorter: it holds the frame where it starts. Its plaque, the snowflake, moves all of
+  it along the clip, as long, holding another frame. The Clip panel has both too.
 - **Tempo** (S, or the clip's menu): a second of the recording from the playhead plays at a tempo
   of its own, half as fast to start with, its sound at its pitch, and the clip stays one. The part
   is tinted pink, with a gauge and its speed. The dots on the bottom edge of the selected clip move
-  where it starts and ends in the recording; the Clip panel has that and how fast, from ×0.25 to
-  ×16, slower or faster, whatever the speed of the rest of the clip. The clips after it on its
+  where it starts and ends in the recording, and its plaque, the gauge, moves all of it along the
+  clip to another part of the recording, as long; the Clip panel has that and how fast, from ×0.25
+  to ×16, slower or faster, whatever the speed of the rest of the clip. The clips after it on its
   track move along, and the sound detached from it plays it the same.
 - What the preview shows is what the file gets: the same formulas run in the preview and in the
   export.
@@ -195,7 +197,8 @@ viewer, and the timeline waits.
 | Drag a clip | Moves it, also onto another track of its kind; chained clips go along. Several selected move together in time |
 | Drag an edge of the selected clip | Trims it |
 | Drag the dots on the top edge of the selected clip | Changes the length of its fade |
-| Drag the dots on the bottom edge of the selected clip | Holds another frame (left) or holds it longer or shorter (right); moves where a part at a tempo of its own starts (left) or ends (right) |
+| Drag the dots on the bottom edge of the selected clip | Moves where a frame held or a part at a tempo of its own starts (left) or ends (right): longer or shorter |
+| Drag the plaque of a frame held or a part at a tempo of its own | Moves all of it along the clip, as long: another frame held, another part of the recording played |
 | Right click on a clip | Its menu |
 | Double click on a clip | Unfolds or folds its track |
 | Drag with the right or middle button | Moves along the time, and the tracks up and down |

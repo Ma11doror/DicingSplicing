@@ -2100,6 +2100,42 @@ impl Sequence {
         let Some(part) = self.clip(id).slowed().into_iter().find(|part| part.effect == effect) else {
             return false;
         };
+        let (lo, hi) = self.slow_motion_room(id, &part);
+        let (from, to) = (clamp(from, lo, hi), clamp(to, lo, hi));
+        if to - from <= SAME_TIME {
+            return false;
+        }
+        let moved = |clip: &mut Clip, own: usize| {
+            if let Effect::SlowMotion(slow) = &mut clip.effects[own] {
+                (slow.from, slow.to) = (from, to);
+            }
+        };
+        let Some((changed, part)) = self.changed_slow_motions(id, effect, moved) else {
+            return false;
+        };
+        self.ripple(changed, part.span.end)
+    }
+
+    /// Makes clip `id`'s Tempo `effect` play the part of its source from `from` on instead, as much of
+    /// it and as fast, and its partners the same: as near `from` as there is room for, between the
+    /// parts before and after it and within what all of them play. Nothing else moves: the clip is as
+    /// long as it was. False if it has no such part.
+    pub fn shift_slow_motion(&mut self, id: ClipId, effect: usize, from: f64) -> bool {
+        if !self.has(id) {
+            return false;
+        }
+        let Some(part) = self.clip(id).slowed().into_iter().find(|part| part.effect == effect) else {
+            return false;
+        };
+        let (lo, hi) = self.slow_motion_room(id, &part);
+        let length = part.to - part.from;
+        let from = clamp(from, lo, (hi - length).max(lo));
+        self.move_slow_motion(id, effect, from, from + length)
+    }
+
+    /// Where clip `id`'s part `part` at a tempo of its own may lie in its source: within what it and
+    /// the partners that play it too play, and between the parts before and after it.
+    fn slow_motion_room(&self, id: ClipId, part: &Slowed) -> (f64, f64) {
         let (mut lo, mut hi) = (f64::NEG_INFINITY, f64::INFINITY);
         for member in std::iter::once(id).chain(self.partners(id, part.from)) {
             let clip = self.clip(member);
@@ -2115,19 +2151,7 @@ impl Sequence {
                 }
             }
         }
-        let (from, to) = (clamp(from, lo, hi), clamp(to, lo, hi));
-        if to - from <= SAME_TIME {
-            return false;
-        }
-        let moved = |clip: &mut Clip, own: usize| {
-            if let Effect::SlowMotion(slow) = &mut clip.effects[own] {
-                (slow.from, slow.to) = (from, to);
-            }
-        };
-        let Some((changed, part)) = self.changed_slow_motions(id, effect, moved) else {
-            return false;
-        };
-        self.ripple(changed, part.span.end)
+        (lo, hi)
     }
 
     /// Takes clip `id`'s slow motion `effect` off, and the same part of its partners: they play it at
@@ -3420,6 +3444,31 @@ mod tests {
 
     fn names_and_starts(sequence: &Sequence, track: usize) -> Vec<(&str, f64)> {
         sequence.tracks[track].clips.iter().map(|clip| (clip.name.as_str(), clip.start)).collect()
+    }
+
+    #[test]
+    fn a_part_at_a_tempo_of_its_own_is_shifted_whole() {
+        let clip = ClipId { track: 0, index: 0 };
+        // A clip 0..20 s of its source, playing 5..6 s half as fast and 12..13 s twice as fast.
+        let mut sequence = Sequence::new(Clip { source_out: 20.0, ..Clip::new("a".into(), 60.0) });
+        assert!(sequence.slow_motion(clip, 5.0, 1.0, 0.5) && sequence.slow_motion(clip, 13.0, 1.0, 2.0));
+        let parts = sequence.clip(clip).slowed();
+        let (first, second) = (parts[0], parts[1]);
+        let end = sequence.clip(clip).end();
+        // To 8 s: 8..9, as slow; the clip as long.
+        assert!(sequence.shift_slow_motion(clip, first.effect, 8.0));
+        let moved = sequence.clip(clip).slowed()[0];
+        assert!((moved.from - 8.0).abs() < 1e-9 && (moved.to - 9.0).abs() < 1e-9 && moved.rate == 0.5, "{moved:?}");
+        assert!((sequence.clip(clip).end() - end).abs() < 1e-9);
+        // Not into the next part: it stops against it.
+        assert!(sequence.shift_slow_motion(clip, first.effect, 12.5));
+        let moved = sequence.clip(clip).slowed()[0];
+        assert!((moved.to - second.from).abs() < 1e-9 && (moved.to - moved.from - 1.0).abs() < 1e-9, "{moved:?}");
+        // Nor past what the clip plays.
+        assert!(sequence.shift_slow_motion(clip, second.effect, 30.0));
+        let last = sequence.clip(clip).slowed()[1];
+        assert!((last.to - 20.0).abs() < 1e-9 && (last.to - last.from - 1.0).abs() < 1e-9, "{last:?}");
+        assert!(!sequence.shift_slow_motion(clip, 9, 1.0), "it has no such part");
     }
 
     #[test]
