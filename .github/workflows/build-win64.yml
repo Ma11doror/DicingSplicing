@@ -1,0 +1,98 @@
+# Builds DicingSplicing for Windows x64 the way it is built by hand: scripts/package.ps1, after
+# ffmpeg and yt-dlp are downloaded. The ready folder is the run's artifact: Actions, the run,
+# Artifacts. To build without a push: Actions, Build win64, Run workflow.
+name: Build win64
+
+on:
+  push:
+    branches: [main]
+    # A version tag builds always: paths-ignore is not for tags.
+    tags: ["v*"]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  workflow_dispatch:
+
+# A newer push to the same branch stops the build of the older one.
+concurrency:
+  group: build-win64-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Gyan's essentials build of ffmpeg, as in a folder packaged by hand, mirrored on GitHub:
+  # https://github.com/GyanD/codexffmpeg/releases. A new version needs its sha256 too: the
+  # "digest" of ffmpeg-<version>-essentials_build.zip in that release.
+  FFMPEG_VERSION: "9.0.2"
+  FFMPEG_SHA256: "60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+
+      # Rust is on the runner already; this makes it the newest stable one.
+      - name: Rust
+        id: rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          "version=$((rustc --version).Split(' ')[1])" >> $env:GITHUB_OUTPUT
+
+      # The libraries and what was built of them. A new Rust builds everything anew, so it is in
+      # the key: otherwise the cache of the old one would be restored and never replaced.
+      - name: Cargo cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/package/
+          key: win64-rust${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: win64-rust${{ steps.rust.outputs.version }}-
+
+      - name: ffmpeg and yt-dlp
+        run: |
+          $ProgressPreference = "SilentlyContinue"
+          $downloads = Join-Path $env:RUNNER_TEMP "downloads"
+          New-Item -ItemType Directory -Force -Path $downloads | Out-Null
+
+          $name = "ffmpeg-$env:FFMPEG_VERSION-essentials_build"
+          $zip = Join-Path $downloads "$name.zip"
+          Invoke-WebRequest "https://github.com/GyanD/codexffmpeg/releases/download/$env:FFMPEG_VERSION/$name.zip" -OutFile $zip
+          if ((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash -ne $env:FFMPEG_SHA256) {
+              throw "$name.zip is not the file it should be: its sha256 differs"
+          }
+          Expand-Archive -LiteralPath $zip -DestinationPath $downloads
+          $ffmpeg = (Get-ChildItem -LiteralPath $downloads -Recurse -Filter ffmpeg.exe | Select-Object -First 1).DirectoryName
+
+          # The newest yt-dlp: sites change, and an old one stops downloading from them.
+          $ytdlp = Join-Path $downloads "yt-dlp.exe"
+          Invoke-WebRequest "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" -OutFile $ytdlp
+
+          "FFMPEG_DIR=$ffmpeg" >> $env:GITHUB_ENV
+          "YT_DLP=$ytdlp" >> $env:GITHUB_ENV
+
+      # Without the zip: the artifact is zipped anyway, and a zip in a zip is one too many.
+      - name: Package
+        id: package
+        run: |
+          ./scripts/package.ps1 -FFmpegDir $env:FFMPEG_DIR -YtDlp $env:YT_DLP -NoZip
+          "name=$((Get-ChildItem -LiteralPath dist -Directory | Select-Object -First 1).Name)" >> $env:GITHUB_OUTPUT
+
+      # dist/ itself, so that the downloaded zip holds the folder DicingSplicing-<version>.
+      - name: Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.name }}-win64
+          path: dist/
+          if-no-files-found: error
